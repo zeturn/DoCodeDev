@@ -1,0 +1,5 @@
+.venv/
+.docode/
+.docode_artifacts/
+__pycache__/
+*.py[cod]
