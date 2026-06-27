@@ -47,7 +47,8 @@ class CodingJob:
     dobox_sandbox_id: str | None = None
     dobox_agent_session_id: str | None = None
     provider: str = "openai"
-    model: str = "gpt-4o"
+    model: str = "gpt-5.4"
+    apicred_access_token: str | None = field(default=None, repr=False)
     status: JobStatus = JobStatus.QUEUED
     max_iterations: int = 50
     max_runtime_seconds: int = 1800
@@ -62,6 +63,13 @@ class CodingJob:
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
     completed_at: datetime | None = None
+
+
+SENSITIVE_JOB_FIELDS = frozenset({"apicred_access_token"})
+
+
+def public_job_dict(job: CodingJob) -> dict[str, Any]:
+    return {field_name: getattr(job, field_name) for field_name in job.__dataclass_fields__ if field_name not in SENSITIVE_JOB_FIELDS}
 
 
 @dataclass(slots=True)

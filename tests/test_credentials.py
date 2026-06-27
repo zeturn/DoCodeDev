@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest import IsolatedAsyncioTestCase
 
+import httpx
+
 from docode.llm.credentials import APICredCredentialResolver, RuntimeAuthorization
 
 
@@ -19,6 +21,14 @@ class ResponseResolver(APICredCredentialResolver):
     async def _post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
         self.calls.append({"method": "POST", "path": path, "payload": dict(payload)})
         return dict(self.response)
+
+
+class MissingRuntimeResolver(APICredCredentialResolver):
+    async def _post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append({"method": "POST", "path": path, "payload": dict(payload)})
+        request = httpx.Request("POST", f"{self.base_url}{path}")
+        response = httpx.Response(404, request=request)
+        raise httpx.HTTPStatusError("not found", request=request, response=response)
 
 
 class CredentialResolverTests(IsolatedAsyncioTestCase):
@@ -95,6 +105,40 @@ class CredentialResolverTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(credential.api_key, "provider-runtime-token")
         self.assertNotIn("provider-runtime-token", repr(credential))
+
+    async def test_proxy_mode_skips_runtime_credit_and_uses_apicred_token(self) -> None:
+        resolver = APICredCredentialResolver("https://apicred.example/v1", "apicred-api-token", mode="proxy")
+
+        authorization = await resolver.authorize(user_id="user-1", provider="openai", model="gpt-5.4", job_id="job_1", max_iterations=5)
+        credential = await resolver.resolve(user_id="user-1", provider="openai", model="gpt-5.4")
+        await resolver.report_usage(user_id="user-1", provider="openai", model="gpt-5.4", tokens=12, cost=0.0)
+
+        self.assertTrue(authorization.allowed)
+        self.assertEqual(authorization.reason, "apicred_proxy_chat_completions")
+        self.assertEqual(credential.api_key, "apicred-api-token")
+        self.assertEqual(credential.base_url, "https://apicred.example/v1")
+        self.assertEqual(credential.model, "gpt-5.4")
+        self.assertEqual(resolver.calls[0]["method"], "SKIP")
+        self.assertEqual(resolver.calls[0]["reason"], "apicred_proxy_chat_completions_bills_usage")
+
+    async def test_auto_mode_falls_back_to_proxy_when_runtime_endpoint_is_missing(self) -> None:
+        resolver = MissingRuntimeResolver("https://apicred.example/v1", "apicred-api-token", mode="auto")
+
+        authorization = await resolver.authorize(user_id="user-1", provider="openai", model="gpt-5.4", job_id="job_1", max_iterations=5)
+        credential = await resolver.resolve(user_id="user-1", provider="openai", model="gpt-5.4")
+
+        self.assertTrue(authorization.allowed)
+        self.assertTrue(resolver.proxy_active)
+        self.assertEqual(credential.api_key, "apicred-api-token")
+        self.assertEqual([call["path"] for call in resolver.calls], ["/runtime/authorize"])
+
+    async def test_proxy_mode_requires_apicred_token(self) -> None:
+        resolver = APICredCredentialResolver("https://apicred.example/v1", "", mode="proxy")
+
+        with self.assertRaises(RuntimeError) as raised:
+            await resolver.resolve(user_id="user-1", provider="openai", model="gpt-5.4")
+
+        self.assertEqual(str(raised.exception), "apicred_proxy_token_required")
 
     async def test_runtime_authorization_repr_hides_raw_payload(self) -> None:
         authorization = RuntimeAuthorization(

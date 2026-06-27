@@ -12,7 +12,7 @@ The service is intentionally separate from DoBox:
 ## Runtime Integrations
 
 - **DoBox**: DoCode only calls project-level sandbox APIs, creates one DoBox agent session per job, and never accepts a Docker container id.
-- **APICred**: DoCode calls runtime authorization before a provider-backed job, fails closed if authorization or credential resolution is unavailable, resolves provider credentials only in memory, builds a transient weav provider/router runtime, and reports usage after the loop. The APICred bearer token is used only to talk to APICred; provider authentication must come from APICred's runtime credential response. The local `scripted` runtime remains available for smoke tests without provider credentials.
+- **APICred**: DoCode supports APICred runtime-credit mode and APICred OpenAI-compatible proxy mode. APICred identity is taken from the inbound BasaltPass cross-app bearer token and stored with the job for worker use, so no global APICred API token is required. In runtime mode DoCode calls APICred authorization before a provider-backed job, resolves provider credentials only in memory, builds a transient weav provider/router runtime, and reports measured usage after the loop. In proxy mode it sends model calls directly to APICred's `/v1/chat/completions` endpoint using the job's BasaltPass cross-app token as the OpenAI-compatible `api_key`, so usage is billed by APICred during the chat completion request and DoCode does not require `/runtime/authorize`. The local `scripted` runtime remains available for smoke tests without provider credentials.
 - **BasaltPass**: DoCode reads upstream-authenticated user identity from forwarded headers such as `X-Basalt-User-ID`.
 - **GitHub**: DoCode currently exports local patch/report/archive artifacts and includes a GitHub exporter adapter surface for branch/PR creation once a GitHub app or connector is configured.
 
@@ -84,14 +84,16 @@ Useful environment variables:
 - `DOCODE_DOBOX_TOKEN`: bearer token for DoBox API
 - `DOCODE_DOBOX_BACKEND_DIR`: local DoBox backend path used by `--start-dobox`, auto-detected from common workspace layouts when unset.
 - `DOCODE_DOBOX_START_TIMEOUT_SECONDS`: seconds to wait for a local DoBox backend started by smoke tooling, defaults to `20`.
-- `DOCODE_APICRED_BASE_URL`: APICred runtime/API base URL
-- `DOCODE_APICRED_TOKEN`: APICred bearer token for APICred calls; it is never reused as an LLM provider API key.
+- `DOCODE_APICRED_BASE_URL`: APICred runtime/API base URL, for example `http://localhost:8103/v1`
+- `DOCODE_APICRED_TOKEN`: optional legacy service token for APICred runtime/auth endpoints. Normal BasaltPass cross-app deployments do not need this.
+- `DOCODE_APICRED_MODE`: `auto` (default), `proxy`, or `runtime`. Use `proxy` for APICred's OpenAI-compatible relay service.
 - `DOCODE_AUTH_REQUIRED`: set to `true` to require APICred/BasaltPass session verification instead of local/forwarded-user fallback.
 - `DOCODE_DATABASE_PATH`: SQLite job database path, defaults to `.docode/docode.db`
 - `DOCODE_ARTIFACT_DIR`: local artifact directory, defaults to `.docode_artifacts`
 - `DOCODE_MAX_TOOL_CALLS`: default per-job tool-call budget, defaults to `100`
 - `DOCODE_MAX_LLM_TOKENS`: default estimated LLM token budget per job, defaults to `100000`.
-- `DOCODE_MAX_LLM_COST`: optional default LLM cost budget per job. DoCode enforces the stricter of this value, any job-level `max_llm_cost`, and APICred's authorization cost budget.
+- `DOCODE_DEFAULT_MODEL`: default model for new jobs, defaults to `gpt-5.4`.
+- `DOCODE_MAX_LLM_COST`: optional default LLM cost budget per job. DoCode enforces the stricter of this value, any job-level `max_llm_cost`, and APICred's authorization cost budget when runtime mode returns one.
 - `DOCODE_SANDBOX_RETENTION`: DoBox sandbox retention policy, one of `keep`, `delete_on_success`, or `delete_always`; defaults to `keep`.
 - `DOCODE_SANDBOX_NETWORK_MODE`: DoBox project network policy, either `project` or `no_internet`; defaults to `project`. Job creation can override this with `sandbox_network_mode`.
 - `DOCODE_GITHUB_EXPORT_ENABLED`: set to `true` to let `artifact_mode=pr` use the local `gh` CLI.
@@ -108,7 +110,7 @@ Every terminal job writes `result.json`, a machine-readable final result with st
 
 For non-scripted provider runs, DoCode also creates an independent verifier judge from the assembled weav provider client. Command checks remain mandatory: `git status`, a complete non-empty `git diff`, and detected test/build/lint commands must pass before completion. The verifier judge receives the status, diff, and command outputs, then can add structured `required_fixes` or veto completion when the change does not satisfy the original instruction.
 
-DoCode records LLM prompt/completion usage for provider-backed agent and verifier calls, prefers provider-reported usage metadata when available, falls back to conservative text-size estimates otherwise, enforces the stricter of the job token budget and APICred authorization budget, and reports measured usage to APICred after the run.
+DoCode records LLM prompt/completion usage for provider-backed agent and verifier calls, prefers provider-reported usage metadata when available, and falls back to conservative text-size estimates otherwise. Runtime mode enforces the stricter of the job token budget and APICred authorization budget and reports measured usage after the run. Proxy mode relies on APICred's OpenAI-compatible request path for billing and skips the separate runtime usage report.
 
 Malformed or temporarily failing model decisions are audited as `llm_error` steps and fed back into the loop. Repeated unusable model output is stopped by the same consecutive-failure policy as failing tools and verifier repairs. Tool results shown to the agent and verifier are prompt-safe summaries capped to the first 300 lines, with original size metadata recorded when output is clipped. Job event, step-listing APIs, and failed/stopped step-log artifacts omit full tool output, verifier status/diff text, and verifier command output, exposing size metadata instead. Failed/stopped jobs omit `patch.diff` when DoBox reports a truncated diff so terminal artifacts do not publish partial patches.
 

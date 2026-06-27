@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from docode.storage.models import JobStatus
+from docode.storage.models import CodingJob, JobStatus, public_job_dict
 from docode.storage.repository import JobRepository, terminal_status
 from docode.storage.step_redaction import redacted_step_content
 
@@ -85,6 +85,8 @@ async def load_result_payload(repository: JobRepository, job_id: str) -> dict[st
 
 
 def to_jsonable(value: Any) -> Any:
+    if isinstance(value, CodingJob):
+        return to_jsonable(public_job_dict(value))
     if is_dataclass(value):
         return to_jsonable(asdict(value))
     if isinstance(value, Enum):

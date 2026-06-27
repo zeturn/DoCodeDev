@@ -53,6 +53,7 @@ async def create_coding_job(
     model_policy: DocodeModelPolicy,
     user_id: str,
     request: CreateJobInput,
+    apicred_access_token: str | None = None,
 ) -> CodingJob:
     try:
         sandbox_network_mode = normalize_sandbox_network_mode(request.sandbox_network_mode or config.sandbox_network_mode)
@@ -89,6 +90,7 @@ async def create_coding_job(
         base_branch=request.base_branch or config.github_base_branch,
         provider=resolved_model.provider,
         model=resolved_model.model,
+        apicred_access_token=apicred_access_token,
         max_iterations=max_iterations,
         max_runtime_seconds=max_runtime_seconds,
         max_tool_calls=max_tool_calls,

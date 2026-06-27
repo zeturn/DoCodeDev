@@ -50,6 +50,7 @@ class AuthDependencyTests(IsolatedAsyncioTestCase):
         self.assertEqual(user.user_id, "verified-user")
         self.assertEqual(user.tenant, "tenant-1")
         self.assertEqual(user.auth_source, "apicred")
+        self.assertEqual(user.apicred_access_token, "user-token")
         self.assertEqual(verifier.calls[0]["forwarded_user_id"], "spoofed-user")
 
     async def test_required_auth_rejects_missing_identity(self) -> None:
@@ -81,6 +82,7 @@ class AuthDependencyTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(user.user_id, "basalt-user")
         self.assertEqual(user.auth_source, "forwarded")
+        self.assertEqual(user.apicred_access_token, "token")
 
     async def test_apicred_verifier_falls_back_to_auth_verify_endpoint(self) -> None:
         verifier = FakeAPICredSessionVerifier()

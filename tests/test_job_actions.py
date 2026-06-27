@@ -47,10 +47,12 @@ class JobActionTests(IsolatedAsyncioTestCase):
             config=config,
             model_policy=policy,  # type: ignore[arg-type]
             user_id="user-1",
+            apicred_access_token="bp_xat_cross_app",
             request=CreateJobInput(instruction="add settings page", provider="dev"),
         )
 
         self.assertEqual(job.user_id, "user-1")
+        self.assertEqual(job.apicred_access_token, "bp_xat_cross_app")
         self.assertEqual(job.provider, "scripted")
         self.assertEqual(job.model, "scripted")
         self.assertEqual(job.max_iterations, 12)

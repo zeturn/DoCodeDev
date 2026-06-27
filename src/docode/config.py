@@ -15,11 +15,12 @@ class DocodeConfig:
     dobox_start_timeout_seconds: float = 20.0
     apicred_base_url: str = "http://localhost:8103/v1"
     apicred_token: str = ""
+    apicred_mode: str = "auto"
     auth_required: bool = False
     database_path: str = ".docode/docode.db"
     artifact_dir: Path = Path(".docode_artifacts")
     default_provider: str = "openai"
-    default_model: str = "gpt-4o"
+    default_model: str = "gpt-5.4"
     max_iterations: int = 50
     max_runtime_seconds: int = 1800
     max_tool_calls: int = 100
@@ -43,11 +44,12 @@ def load_config() -> DocodeConfig:
         dobox_start_timeout_seconds=float(os.getenv("DOCODE_DOBOX_START_TIMEOUT_SECONDS", "20")),
         apicred_base_url=os.getenv("DOCODE_APICRED_BASE_URL", "http://localhost:8103/v1"),
         apicred_token=os.getenv("DOCODE_APICRED_TOKEN", ""),
+        apicred_mode=normalize_apicred_mode(os.getenv("DOCODE_APICRED_MODE", "auto")),
         auth_required=os.getenv("DOCODE_AUTH_REQUIRED", "").lower() in {"1", "true", "yes", "on"},
         database_path=os.getenv("DOCODE_DATABASE_PATH", ".docode/docode.db"),
         artifact_dir=Path(os.getenv("DOCODE_ARTIFACT_DIR", ".docode_artifacts")),
         default_provider=os.getenv("DOCODE_DEFAULT_PROVIDER", "openai"),
-        default_model=os.getenv("DOCODE_DEFAULT_MODEL", "gpt-4o"),
+        default_model=os.getenv("DOCODE_DEFAULT_MODEL", "gpt-5.4"),
         max_iterations=int(os.getenv("DOCODE_MAX_ITERATIONS", "50")),
         max_runtime_seconds=int(os.getenv("DOCODE_MAX_RUNTIME_SECONDS", "1800")),
         max_tool_calls=int(os.getenv("DOCODE_MAX_TOOL_CALLS", "100")),
@@ -74,3 +76,8 @@ def default_dobox_backend_dir() -> Path:
         if candidate.exists():
             return candidate
     return Path("DoBoxDev/backend")
+
+
+def normalize_apicred_mode(value: str | None) -> str:
+    mode = (value or "auto").strip().lower()
+    return mode if mode in {"auto", "runtime", "proxy"} else "auto"

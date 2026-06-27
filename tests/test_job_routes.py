@@ -11,7 +11,7 @@ from docode.api.artifact_actions import artifact_descriptor
 from docode.artifacts.terminal import export_stopped_artifacts
 from docode.api.job_actions import cancel_existing_job
 from docode.config import DocodeConfig
-from docode.storage.models import CodingJob, JobStatus, new_id
+from docode.storage.models import CodingJob, JobStatus, new_id, public_job_dict
 from docode.storage.repository import InMemoryJobRepository
 
 
@@ -24,6 +24,14 @@ class RecordingQueue:
 
 
 class JobRoutesTests(IsolatedAsyncioTestCase):
+    async def test_public_job_dict_hides_apicred_access_token(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="user-1", instruction="run tests", apicred_access_token="bp_xat_secret")
+
+        payload = public_job_dict(job)
+
+        self.assertNotIn("apicred_access_token", payload)
+        self.assertNotIn("bp_xat_secret", repr(payload))
+
     async def test_event_stream_emits_status_step_and_done_events(self) -> None:
         repo = InMemoryJobRepository()
         job = await repo.create_job(

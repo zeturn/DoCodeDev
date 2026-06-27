@@ -24,10 +24,16 @@ class RuntimeAuthorization:
 class APICredCredentialResolver:
     """Resolve provider credentials through APICred without persisting keys."""
 
-    def __init__(self, base_url: str, access_token: str = "") -> None:
+    def __init__(self, base_url: str, access_token: str = "", mode: str = "auto") -> None:
         self.base_url = base_url.rstrip("/")
         self.access_token = access_token
+        self.mode = normalize_apicred_mode(mode)
+        self.proxy_active = self.mode == "proxy"
         self.calls: list[dict[str, Any]] = []
+
+    def use_access_token(self, access_token: str | None) -> None:
+        if access_token:
+            self.access_token = access_token
 
     async def authorize(
         self,
@@ -61,11 +67,17 @@ class APICredCredentialResolver:
             "artifact_mode": artifact_mode,
         }
         payload.update({key: value for key, value in optional_policy.items() if value is not None})
+        if self.proxy_active:
+            return self._proxy_authorization()
+
         try:
             data = await self._post("/runtime/authorize", payload)
         except Exception as exc:
             if is_local_scripted_runtime(provider, model):
                 return RuntimeAuthorization(allowed=True, reason="local_scripted_runtime", raw={"error": str(exc)})
+            if self.mode == "auto" and is_missing_runtime_endpoint(exc):
+                self.proxy_active = True
+                return self._proxy_authorization(raw={"runtime_error": str(exc)})
             raise RuntimeError(f"apicred_authorize_unavailable:{exc}") from exc
 
         allowed = bool(data.get("allowed", data.get("authorized", True)))
@@ -78,6 +90,9 @@ class APICredCredentialResolver:
         )
 
     async def resolve(self, *, user_id: str, provider: str, model: str) -> ProviderCredential:
+        if self.proxy_active:
+            return self._proxy_credential(provider=provider, model=model)
+
         payload = {
             "user_id": user_id,
             "provider": provider,
@@ -87,6 +102,9 @@ class APICredCredentialResolver:
         try:
             data = await self._post("/runtime/credentials/resolve", payload)
         except Exception as exc:
+            if self.mode == "auto" and is_missing_runtime_endpoint(exc):
+                self.proxy_active = True
+                return self._proxy_credential(provider=provider, model=model)
             raise RuntimeError(f"apicred_credentials_resolve_unavailable:{exc}") from exc
         return ProviderCredential(
             provider=str(data.get("provider", provider)),
@@ -96,6 +114,12 @@ class APICredCredentialResolver:
         )
 
     async def list_providers(self, *, user_id: str | None = None) -> dict[str, list[str]]:
+        if self.proxy_active:
+            try:
+                data = await self._get("/models", {"user_id": user_id, "purpose": "docode"})
+            except Exception:
+                return {}
+            return parse_provider_catalog(data)
         try:
             data = await self._get("/runtime/providers", {"user_id": user_id, "purpose": "docode"})
         except Exception:
@@ -106,6 +130,16 @@ class APICredCredentialResolver:
         return parse_provider_catalog(data)
 
     async def report_usage(self, *, user_id: str, provider: str, model: str, tokens: int = 0, cost: float = 0.0) -> None:
+        if self.proxy_active:
+            self.calls.append(
+                {
+                    "method": "SKIP",
+                    "path": "/runtime/usage/report",
+                    "reason": "apicred_proxy_chat_completions_bills_usage",
+                    "payload": {"user_id": user_id, "provider": provider, "model": model, "tokens": tokens, "cost": cost},
+                }
+            )
+            return
         await self._post(
             "/runtime/usage/report",
             {
@@ -130,6 +164,14 @@ class APICredCredentialResolver:
             response.raise_for_status()
             data = response.json()
             return data if isinstance(data, dict) else {"data": data}
+
+    def _proxy_authorization(self, raw: dict[str, Any] | None = None) -> RuntimeAuthorization:
+        return RuntimeAuthorization(allowed=True, reason="apicred_proxy_chat_completions", raw=raw)
+
+    def _proxy_credential(self, *, provider: str, model: str) -> ProviderCredential:
+        if not self.access_token:
+            raise RuntimeError("apicred_proxy_token_required")
+        return ProviderCredential(provider=provider, model=model, api_key=self.access_token, base_url=self.base_url)
 
     async def _get(self, path: str, params: dict[str, object | None] | None = None) -> dict[str, object]:
         import httpx
@@ -193,3 +235,13 @@ def model_id(value: object) -> str | None:
 
 def is_local_scripted_runtime(provider: str, model: str) -> bool:
     return provider in {"scripted", "dev"} or model == "scripted"
+
+
+def normalize_apicred_mode(value: str | None) -> str:
+    mode = (value or "auto").strip().lower()
+    return mode if mode in {"auto", "runtime", "proxy"} else "auto"
+
+
+def is_missing_runtime_endpoint(exc: Exception) -> bool:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return status_code in {404, 405}

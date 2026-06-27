@@ -16,7 +16,8 @@ def make_runtime_router(config: DocodeConfig, user_dependency=get_user_context) 
 
     @router.get("/providers")
     async def list_runtime_providers(user: UserContext = Depends(user_dependency)) -> dict[str, object]:
-        resolver = APICredCredentialResolver(config.apicred_base_url, config.apicred_token)
+        resolver = APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode)
+        resolver.use_access_token(user.apicred_access_token)
         policy = DocodeModelPolicy(config, resolver)
         options = await policy.list_options(user_id=user.user_id)
         return jsonable_encoder(

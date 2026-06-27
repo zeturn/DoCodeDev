@@ -102,7 +102,10 @@ async def run_scripted_smoke_job(
 
         repository = build_repository(config)
         queue = AsyncJobQueue()
-        model_policy = DocodeModelPolicy(config, APICredCredentialResolver(config.apicred_base_url, config.apicred_token))
+        model_policy = DocodeModelPolicy(
+            config,
+            APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode),
+        )
         job = await create_coding_job(
             repository=repository,
             queue=queue,

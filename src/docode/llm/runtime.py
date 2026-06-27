@@ -242,23 +242,48 @@ def build_provider_client(provider: str, api_key: str | None, base_url: str | No
 
 
 async def call_provider(client: Any, prompt: str, model: str) -> ProviderCallResult:
+    config = provider_completion_config(model)
     if hasattr(client, "acomplete"):
-        response = await client.acomplete(prompt=prompt, model=model)
+        try:
+            response = await client.acomplete(prompt=prompt, model=model)
+        except TypeError:
+            response = await client.acomplete(prompt, config)
         return provider_call_result(response)
     if hasattr(client, "complete"):
-        response = client.complete(prompt=prompt, model=model)
+        try:
+            response = client.complete(prompt=prompt, model=model)
+        except TypeError:
+            response = client.complete(prompt, config)
+            if hasattr(response, "__await__"):
+                response = await response
         return provider_call_result(response)
     if hasattr(client, "achat"):
-        response = await client.achat(messages=[{"role": "user", "content": prompt}], model=model)
+        try:
+            response = await client.achat(messages=[{"role": "user", "content": prompt}], model=model)
+        except TypeError:
+            response = await client.achat([{"role": "user", "content": prompt}], config)
         return provider_call_result(response)
     if hasattr(client, "chat"):
-        response = client.chat(messages=[{"role": "user", "content": prompt}], model=model)
+        try:
+            response = client.chat(messages=[{"role": "user", "content": prompt}], model=model)
+        except TypeError:
+            response = client.chat([{"role": "user", "content": prompt}], config)
+            if hasattr(response, "__await__"):
+                response = await response
         return provider_call_result(response)
     raise RuntimeError("provider client does not expose a supported chat/completion method")
 
 
 async def call_provider_text(client: Any, prompt: str, model: str) -> str:
     return (await call_provider(client, prompt, model)).text
+
+
+def provider_completion_config(model: str) -> Any:
+    try:
+        from weav_provider_router.base import CompletionConfig
+    except Exception:
+        return {"model": model}
+    return CompletionConfig(model=model, temperature=0.0)
 
 
 def provider_call_result(response: Any) -> ProviderCallResult:
@@ -318,12 +343,7 @@ def register_provider(router: Any, provider: str, client: Any) -> None:
 
 
 def parse_decision(raw: str) -> AgentDecision:
-    text = raw.strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    data = json.loads(text)
+    data = parse_json_object(raw)
     decision_type = str(data.get("type", ""))
     if decision_type == "tool_call":
         return AgentDecision(type="tool_call", tool_name=str(data["tool_name"]), args=dict(data.get("args") or {}))
@@ -348,10 +368,9 @@ def parse_verifier_judgement(raw: str) -> VerifierJudgement:
 def parse_json_object(raw: str) -> dict[str, Any]:
     text = raw.strip()
     start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    data = json.loads(text)
+    if start >= 0:
+        text = text[start:]
+    data, _ = json.JSONDecoder().raw_decode(text)
     if not isinstance(data, dict):
         raise ValueError("expected JSON object")
     return data

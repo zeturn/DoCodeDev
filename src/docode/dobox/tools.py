@@ -72,12 +72,18 @@ class DoBoxTools:
         agent_session_id: str | None = None,
         command_timeout_seconds: int = 120,
         output_limit_bytes: int = 1_000_000,
+        command_overrides: dict[str, str] | None = None,
     ) -> None:
         self.client = client
         self.project_id = project_id
         self.agent_session_id = agent_session_id
         self.command_timeout_seconds = command_timeout_seconds
         self.output_limit_bytes = output_limit_bytes
+        self.command_overrides = dict(command_overrides or {})
+
+    def set_detected_command(self, name: str, command: str | None) -> None:
+        if command:
+            self.command_overrides[name] = command
 
     def definitions(self) -> list[ToolDefinition]:
         return [
@@ -99,7 +105,7 @@ class DoBoxTools:
     async def call(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
         for definition in self.definitions():
             if definition.name == tool_name:
-                return await definition.handler(**args)
+                return await definition.handler(**filter_handler_args(definition.handler, args))
         return ToolResult(tool=tool_name, output=f"unknown tool: {tool_name}", exit_code=127)
 
     async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
@@ -199,6 +205,8 @@ class DoBoxTools:
         return ToolResult(tool="run_lint", output=result.output, exit_code=result.exit_code, metadata={"command": command, "detected": True}, truncated=result.truncated)
 
     async def detect_test_command(self) -> str | None:
+        if command := self.command_overrides.get("test"):
+            return command
         checks = [
             (package_script_exists_command("test"), "npm test"),
             ("test -f pyproject.toml || test -f pytest.ini", "pytest"),
@@ -335,6 +343,13 @@ def workspace_path_error(path: str, *, label: str = "path") -> str | None:
 
 def rejected_tool_result(tool: str, reason: str, metadata: dict[str, Any]) -> ToolResult:
     return ToolResult(tool=tool, output=f"rejected: {reason}", exit_code=2, metadata={**metadata, "rejected": True, "reason": reason})
+
+
+def filter_handler_args(handler: ToolCallable, args: dict[str, Any]) -> dict[str, Any]:
+    signature = inspect.signature(handler)
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return args
+    return {key: value for key, value in args.items() if key in signature.parameters}
 
 
 def try_create_weav_tool_registry() -> Any | None:

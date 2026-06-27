@@ -18,6 +18,7 @@ class SQLiteRepositoryTests(IsolatedAsyncioTestCase):
                     id=new_id("job"),
                     user_id="user-1",
                     instruction="ship it",
+                    apicred_access_token="bp_xat_sqlite",
                     github_repo="zeturn/example",
                     base_branch="develop",
                     dobox_agent_session_id="7",
@@ -37,6 +38,7 @@ class SQLiteRepositoryTests(IsolatedAsyncioTestCase):
             self.assertIsNotNone(loaded)
             assert loaded is not None
             self.assertEqual(loaded.status, JobStatus.RUNNING)
+            self.assertEqual(loaded.apicred_access_token, "bp_xat_sqlite")
             self.assertEqual(loaded.dobox_project_id, "42")
             self.assertEqual(loaded.dobox_agent_session_id, "7")
             self.assertEqual(loaded.max_tool_calls, 7)

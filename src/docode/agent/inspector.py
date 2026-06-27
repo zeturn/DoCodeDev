@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from docode.dobox.tools import DoBoxTools
@@ -54,6 +55,10 @@ class ProjectInspector:
             "build": await tools.detect_build_command(),
             "lint": await tools.detect_lint_command(),
         }
+        explicit_test_command = extract_explicit_test_command(instruction)
+        if explicit_test_command:
+            detected_commands["test"] = explicit_test_command
+            tools.set_detected_command("test", explicit_test_command)
         return ProjectInspection(
             listing=listing,
             important_files=important_files,
@@ -92,6 +97,23 @@ def build_acceptance_criteria(instruction: str, detected_commands: dict[str, str
     if not any(detected_commands.values()):
         criteria.append("A reasonable manual or command-based verification explanation is recorded.")
     return criteria
+
+
+def extract_explicit_test_command(instruction: str) -> str | None:
+    commands = (
+        (r"\bpython(?:3)?\s+-m\s+unittest\b", "python -m unittest"),
+        (r"\bpytest\b", "pytest"),
+        (r"\bnpm\s+test\b", "npm test"),
+        (r"\bpnpm\s+test\b", "pnpm test"),
+        (r"\byarn\s+test\b", "yarn test"),
+        (r"\bgo\s+test\s+\./\.\.\.", "go test ./..."),
+        (r"\bcargo\s+test\b", "cargo test"),
+    )
+    for pattern, command in commands:
+        match = re.search(pattern, instruction, flags=re.IGNORECASE)
+        if match:
+            return command
+    return None
 
 
 def _listing_contains(listing: str, path: str) -> bool:

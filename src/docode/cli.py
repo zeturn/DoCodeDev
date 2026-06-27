@@ -11,6 +11,7 @@ from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
 from docode.runtime.smoke import run_scripted_smoke_job, run_smoke_check, write_smoke_report
 from docode.storage.db import build_repository
+from docode.storage.models import public_job_dict
 from docode.worker.queue import AsyncJobQueue
 from docode.worker.runner import JobRunnerService
 
@@ -50,7 +51,7 @@ async def run_scripted_job(args: argparse.Namespace) -> None:
     config = load_config()
     repository = build_repository(config)
     queue = AsyncJobQueue()
-    model_policy = DocodeModelPolicy(config, APICredCredentialResolver(config.apicred_base_url, config.apicred_token))
+    model_policy = DocodeModelPolicy(config, APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode))
     job = await create_coding_job(
         repository=repository,
         queue=queue,
@@ -74,7 +75,7 @@ async def run_scripted_job(args: argparse.Namespace) -> None:
     await runner.run_job(job.id)
     completed = await repository.get_job(job.id)
     artifacts = await repository.list_artifacts(job.id)
-    print(asdict(completed) if completed is not None else {"job_id": job.id, "status": "missing"})
+    print(public_job_dict(completed) if completed is not None else {"job_id": job.id, "status": "missing"})
     print({"artifacts": [asdict(artifact) for artifact in artifacts]})
 
 

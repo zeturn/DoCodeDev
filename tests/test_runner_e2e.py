@@ -235,6 +235,7 @@ class RunnerE2ETests(IsolatedAsyncioTestCase):
                     instruction="create a result file",
                     provider="scripted",
                     model="scripted",
+                    apicred_access_token="bp_xat_runner",
                     max_iterations=5,
                     max_tool_calls=10,
                     artifact_mode="pr",
@@ -283,6 +284,7 @@ class RunnerE2ETests(IsolatedAsyncioTestCase):
             self.assertTrue(all(session_id == "7" for session_id in fake_dobox.agent_session_ids))
             self.assertEqual(fake_dobox.deleted_projects, [])
             self.assertEqual(fake_apicred.authorize_calls, 1)
+            self.assertEqual(fake_apicred.access_token, "bp_xat_runner")
             authorize_payload = next(call["payload"] for call in fake_apicred.calls if call["path"] == "/runtime/authorize")
             self.assertEqual(authorize_payload["max_iterations"], 5)
             self.assertEqual(authorize_payload["max_runtime_seconds"], 1800)

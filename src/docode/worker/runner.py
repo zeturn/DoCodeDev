@@ -36,7 +36,7 @@ class JobRunnerService:
         self.dobox_client_factory = dobox_client_factory or (lambda: DoBoxClient(self.config.dobox_base_url, self.config.dobox_token))
         self.llm_factory = llm_factory
         self.credential_resolver_factory = credential_resolver_factory or (
-            lambda: APICredCredentialResolver(self.config.apicred_base_url, self.config.apicred_token)
+            lambda: APICredCredentialResolver(self.config.apicred_base_url, self.config.apicred_token, self.config.apicred_mode)
         )
 
     async def run_job(self, job_id: str) -> None:
@@ -56,6 +56,7 @@ class JobRunnerService:
             return
         try:
             resolver = self.credential_resolver_factory()
+            resolver.use_access_token(job.apicred_access_token)
             try:
                 authorization = await resolver.authorize(
                     user_id=job.user_id,

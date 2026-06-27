@@ -14,6 +14,7 @@ from docode.api.job_actions import CreateJobInput, JobActionError, cancel_existi
 from docode.config import DocodeConfig
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
+from docode.storage.models import public_job_dict
 from docode.storage.repository import JobRepository
 from docode.worker.queue import AsyncJobQueue
 
@@ -40,7 +41,9 @@ def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: Do
 
     @router.post("")
     async def create_job(req: CreateJobRequest, user: UserContext = Depends(user_dependency)) -> dict[str, str]:
-        model_policy = DocodeModelPolicy(config, APICredCredentialResolver(config.apicred_base_url, config.apicred_token))
+        resolver = APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode)
+        resolver.use_access_token(user.apicred_access_token)
+        model_policy = DocodeModelPolicy(config, resolver)
         try:
             job = await create_coding_job(
                 repository=repository,
@@ -48,6 +51,7 @@ def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: Do
                 config=config,
                 model_policy=model_policy,
                 user_id=user.user_id,
+                apicred_access_token=user.apicred_access_token,
                 request=CreateJobInput(
                     instruction=req.instruction,
                     repo_url=req.repo_url,
@@ -72,7 +76,7 @@ def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: Do
     @router.get("/{job_id}")
     async def get_job(job_id: str, user: UserContext = Depends(user_dependency)) -> dict[str, object]:
         job = await require_owned_job(repository, job_id, user)
-        payload = asdict(job)
+        payload = public_job_dict(job)
         result = await load_result_payload(repository, job_id)
         if result is not None:
             payload["result"] = result

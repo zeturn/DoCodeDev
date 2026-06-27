@@ -26,6 +26,7 @@ class UserContext:
     user_id: str
     tenant: str | None = None
     auth_source: str = "local"
+    apicred_access_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +114,7 @@ class UserContextDependency:
         x_tenant_id: Annotated[str | None, Header(alias="X-Tenant-ID")] = None,
     ) -> UserContext:
         forwarded_user_id = x_basalt_user_id or x_user_id
+        token = bearer_token(authorization)
         if self.verifier is not None and (authorization or self.auth_required):
             try:
                 verified = await self.verifier.verify(
@@ -127,13 +129,23 @@ class UserContextDependency:
                 if not verified.allowed:
                     raise HTTPException(status_code=401, detail=verified.reason or "unauthorized")
                 if verified.user_id:
-                    return UserContext(user_id=verified.user_id, tenant=verified.tenant, auth_source="apicred")
+                    return UserContext(
+                        user_id=verified.user_id,
+                        tenant=verified.tenant,
+                        auth_source="apicred",
+                        apicred_access_token=token,
+                    )
                 if self.auth_required:
                     raise HTTPException(status_code=401, detail="auth verification missing user")
 
         if self.auth_required and not forwarded_user_id:
             raise HTTPException(status_code=401, detail="missing authenticated user")
-        return UserContext(user_id=forwarded_user_id or "local", tenant=x_tenant_id, auth_source="forwarded" if forwarded_user_id else "local")
+        return UserContext(
+            user_id=forwarded_user_id or "local",
+            tenant=x_tenant_id,
+            auth_source="forwarded" if forwarded_user_id else "local",
+            apicred_access_token=token,
+        )
 
 
 async def get_user_context(
