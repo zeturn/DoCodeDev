@@ -96,6 +96,25 @@ class NoDetectedPythonVerifierTools(PassingVerifierTools):
         return ToolResult(tool="run_command", output="smoke output", exit_code=self.smoke_exit_code, metadata={"command": command})
 
 
+class BugfixWithoutTestVerifierTools(PassingVerifierTools):
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(tool="git_diff", output="diff --git a/src/app.py b/src/app.py\n+return retry()\n")
+
+    async def run_build(self) -> ToolResult:
+        return ToolResult(tool="run_build", output="ok", exit_code=0, metadata={"detected": False})
+
+
+class DocsVerifierTools(PassingVerifierTools):
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(tool="git_diff", output="diff --git a/README.md b/README.md\n+More usage docs.\n")
+
+    async def run_tests(self) -> ToolResult:
+        return ToolResult(tool="run_tests", output="no test command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_build(self) -> ToolResult:
+        return ToolResult(tool="run_build", output="no build command detected", exit_code=0, metadata={"detected": False})
+
+
 class VetoingJudge:
     async def judge(self, *, instruction, diff, tests, build, lint):
         from docode.agent.verifier import VerifierJudgement
@@ -319,3 +338,38 @@ class VerifierTests(IsolatedAsyncioTestCase):
 
         self.assertTrue(result.passed)
         self.assertEqual(result.smoke_result.exit_code, 0)
+
+    async def test_bugfix_plan_requires_related_test_change(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="fix retry bug in payment adapter"),
+            BugfixWithoutTestVerifierTools(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIsNotNone(result.verification_plan)
+        self.assertTrue(result.verification_plan.require_test_change)
+        self.assertIn("add or update a related test for this bugfix, or record why no automated test is appropriate", result.required_fixes)
+
+    async def test_docs_plan_does_not_require_test_change_or_placeholder_gate(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="update README docs"),
+            DocsVerifierTools(),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertIsNotNone(result.verification_plan)
+        self.assertFalse(result.verification_plan.require_test_change)
+        self.assertFalse(result.verification_plan.require_no_placeholder)
+
+    async def test_cli_plan_runs_python_entrypoint(self) -> None:
+        tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="add a CLI script"),
+            tools,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertIsNotNone(result.verification_plan)
+        self.assertTrue(result.verification_plan.require_entrypoint_run)
+        self.assertIn("python3 crawler.py", result.smoke_result.metadata["command"])

@@ -7,11 +7,13 @@ from typing import Any, Protocol
 
 from docode.agent.output import prompt_safe_output
 from docode.agent.verifier import VerifierJudgement
-from docode.dobox.tools import ToolDefinition, build_dobox_tool_registry
+from docode.agent.weav_tools import build_agent_tool_registry
+from docode.dobox.tools import ToolDefinition
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
 
 from .credentials import APICredCredentialResolver
+from .weav_apicred_store import APICredCredentialStore, APICredUsageSink, normalize_openai_compatible_provider
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,8 @@ class ProviderCallResult:
     completion_tokens: int | None = None
     total_tokens: int | None = None
     cost: float | None = None
+    tool_calls: list[Any] = field(default_factory=list)
+    raw: Any = None
 
 
 class DecisionLLM(Protocol):
@@ -56,6 +60,7 @@ class DocodeRuntime:
     router: Any = field(repr=False)
     tools: Any = field(repr=False)
     provider_client: Any | None = field(default=None, repr=False)
+    usage_sink: Any | None = field(default=None, repr=False)
     usage_meter: LLMUsageMeter = field(default_factory=lambda: LLMUsageMeter(), repr=False)
 
 
@@ -107,7 +112,7 @@ class LLMUsageMeter:
         }
 
 
-class WeavDecisionLLM:
+class DoCodeDecisionAdapter:
     def __init__(self, provider_client: Any, model: str, usage_meter: LLMUsageMeter | None = None) -> None:
         self.provider_client = provider_client
         self.model = model
@@ -121,13 +126,23 @@ class WeavDecisionLLM:
         return parse_decision(result.text)
 
     def _format_prompt(self, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> str:
-        tool_names = ", ".join(tool.name for tool in tools)
+        tool_specs = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema(),
+            }
+            for tool in tools
+        ]
         return (
-            f"{system}\n\nAvailable tools: {tool_names}\n\n"
+            f"{system}\n\nAvailable tools JSON schema:\n{json.dumps(tool_specs, ensure_ascii=False)}\n\n"
             "Respond as JSON: {\"type\":\"tool_call\",\"tool_name\":\"...\",\"args\":{...}} "
             "or {\"type\":\"final_candidate\",\"summary\":\"...\"}.\n\n"
-            f"Context:\n{context}\n\nMessages:\n{json.dumps(messages[-20:], ensure_ascii=False)}"
+            f"Context:\n{context}"
         )
+
+
+WeavDecisionLLM = DoCodeDecisionAdapter
 
 
 class WeavVerifierJudge:
@@ -269,8 +284,9 @@ async def build_docode_llm(job: CodingJob, resolver: APICredCredentialResolver) 
 
 
 async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolver, dobox_tools: Any | None = None) -> DocodeRuntime:
-    tool_registry = build_dobox_tool_registry(dobox_tools) if dobox_tools is not None else None
+    tool_registry = build_agent_tool_registry(dobox_tools) if dobox_tools is not None else None
     usage_meter = LLMUsageMeter()
+    usage_sink = APICredUsageSink(resolver)
     if job.provider in {"scripted", "dev"} or job.model == "scripted":
         return DocodeRuntime(
             provider="scripted",
@@ -278,6 +294,7 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
             llm=ScriptedDecisionLLM(job.instruction),
             router=LocalLLMRouter(),
             tools=tool_registry,
+            usage_sink=usage_sink,
             usage_meter=usage_meter,
         )
     if is_github_trending_araneae_instruction(job.instruction):
@@ -287,22 +304,99 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
             llm=GitHubTrendingCrawlerDecisionLLM(job.instruction),
             router=LocalLLMRouter(),
             tools=tool_registry,
+            usage_sink=usage_sink,
             usage_meter=usage_meter,
         )
 
-    credential = await resolver.resolve(user_id=job.user_id, provider=job.provider, model=job.model)
-    provider_client = build_provider_client(credential.provider, credential.api_key, credential.base_url)
-    router = create_llm_router()
-    register_provider(router, credential.provider, provider_client)
+    runtime_context, ai_runtime = build_weav_runtime(job, resolver, usage_sink)
+    model_spec = await resolve_model_async(ai_runtime, provider=job.provider, model=job.model)
+    router = await build_runtime_router_async(ai_runtime, runtime_context)
+    provider_client = registered_provider(router, model_spec.provider)
+    if provider_client is None:
+        raise RuntimeError(f"provider_not_registered:{model_spec.provider}")
     return DocodeRuntime(
-        provider=credential.provider,
-        model=credential.model,
-        llm=WeavDecisionLLM(provider_client, credential.model, usage_meter),
+        provider=model_spec.provider,
+        model=model_spec.model,
+        llm=DoCodeDecisionAdapter(provider_client, model_spec.model, usage_meter),
         router=router,
         tools=tool_registry,
         provider_client=provider_client,
+        usage_sink=usage_sink,
         usage_meter=usage_meter,
     )
+
+
+def build_weav_runtime(job: CodingJob, resolver: APICredCredentialResolver, usage_sink: APICredUsageSink) -> tuple[Any, Any]:
+    try:
+        from weav_ai_runtime import AIRuntime, AIRuntimeContext
+    except Exception as exc:  # pragma: no cover - only used with an out-of-date runtime install
+        raise RuntimeError(f"weav_ai_runtime_unavailable:{exc}") from exc
+
+    context = AIRuntimeContext(tenant=job.user_id, user_id=job.user_id, purpose="docode")
+    credential_store = APICredCredentialStore(resolver=resolver, user_id=job.user_id, provider=job.provider, model=job.model)
+    kwargs = {
+        "context": context,
+        "credentials": credential_store,
+        "model_catalog": credential_store,
+        "usage_sink": usage_sink,
+    }
+    try:
+        kwargs["policy"] = build_runtime_policy(job)
+        return context, AIRuntime(**kwargs)
+    except TypeError:
+        kwargs.pop("policy", None)
+        return context, AIRuntime(**kwargs)
+
+
+def build_runtime_policy(job: CodingJob) -> Any | None:
+    try:
+        from weav_ai_runtime import ModelSpec, RuntimePolicy
+    except Exception:
+        return None
+    provider = normalize_openai_compatible_provider(job.provider) if job.provider and job.provider not in {"scripted", "dev"} else ""
+    allowed_providers = [provider] if provider else []
+    return RuntimePolicy(
+        purpose="docode",
+        max_tokens=job.max_llm_tokens,
+        max_cost=job.max_llm_cost,
+        allowed_providers=allowed_providers,
+        fallback_chain=[ModelSpec(provider=provider, model=job.model)] if provider and job.model else [],
+    )
+
+
+async def resolve_model_async(ai_runtime: Any, *, provider: str, model: str) -> Any:
+    if hasattr(ai_runtime, "resolve_model_async"):
+        return await ai_runtime.resolve_model_async(provider=provider, model=model)
+    if ai_runtime.model_catalog is not None and hasattr(ai_runtime.model_catalog, "resolve_model"):
+        resolved = ai_runtime.model_catalog.resolve_model(ai_runtime.context, provider=provider, model=model)
+        if hasattr(resolved, "__await__"):
+            return await resolved
+        return resolved
+    return ai_runtime.resolve_model(provider=provider, model=model)
+
+
+async def build_runtime_router_async(ai_runtime: Any, context: Any) -> Any:
+    if hasattr(ai_runtime, "build_router_async"):
+        return await ai_runtime.build_router_async()
+    try:
+        from weav_ai_runtime import build_router_async
+    except Exception as exc:  # pragma: no cover - only used with an out-of-date runtime install
+        raise RuntimeError(f"weav_ai_runtime_async_router_unavailable:{exc}") from exc
+    return await build_router_async(context, ai_runtime.credentials)
+
+
+def registered_provider(router: Any, provider: str) -> Any | None:
+    if hasattr(router, "get"):
+        try:
+            found = router.get(provider)
+        except TypeError:
+            found = None
+        if found is not None:
+            return found
+    providers = getattr(router, "providers", None)
+    if isinstance(providers, dict):
+        return providers.get(provider)
+    return None
 
 
 def is_github_trending_araneae_instruction(instruction: str) -> bool:
@@ -332,6 +426,15 @@ def build_provider_client(provider: str, api_key: str | None, base_url: str | No
 
 
 async def call_provider(client: Any, prompt: str, model: str) -> ProviderCallResult:
+    try:
+        from weav_ai_runtime import call_llm_provider
+    except Exception:
+        return await call_provider_legacy(client, prompt, model)
+    result = await call_llm_provider(client, prompt=prompt, model=model, purpose="docode")
+    return provider_result_from_runtime_result(result)
+
+
+async def call_provider_legacy(client: Any, prompt: str, model: str) -> ProviderCallResult:
     config = provider_completion_config(model)
     if hasattr(client, "acomplete"):
         try:
@@ -377,8 +480,9 @@ def provider_completion_config(model: str) -> Any:
 
 
 def provider_call_result(response: Any) -> ProviderCallResult:
-    if isinstance(response, str):
-        return ProviderCallResult(text=response)
+    runtime_result = normalize_provider_response(response)
+    if runtime_result is not None:
+        return provider_result_from_runtime_result(runtime_result)
 
     usage = extract_usage(response)
     text = extract_text(response)
@@ -390,6 +494,28 @@ def provider_call_result(response: Any) -> ProviderCallResult:
         completion_tokens=int_or_none(usage.get("completion_tokens")),
         total_tokens=int_or_none(usage.get("total_tokens")),
         cost=float_or_none(usage.get("cost")),
+        raw=response,
+    )
+
+
+def normalize_provider_response(response: Any) -> Any | None:
+    try:
+        from weav_ai_runtime import normalize_llm_call_result
+    except Exception:
+        return None
+    return normalize_llm_call_result(response, purpose="docode")
+
+
+def provider_result_from_runtime_result(response: Any) -> ProviderCallResult:
+    usage = getattr(response, "usage", None)
+    return ProviderCallResult(
+        text=str(getattr(response, "text")),
+        prompt_tokens=int_or_none(get_field(usage, "prompt_tokens")),
+        completion_tokens=int_or_none(get_field(usage, "completion_tokens")),
+        total_tokens=int_or_none(get_field(usage, "tokens") or get_field(usage, "total_tokens")),
+        cost=float_or_none(get_field(usage, "cost")),
+        tool_calls=list(getattr(response, "tool_calls", []) or []),
+        raw=getattr(response, "raw", response),
     )
 
 

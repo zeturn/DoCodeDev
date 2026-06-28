@@ -5,6 +5,7 @@ from unittest import IsolatedAsyncioTestCase
 import httpx
 
 from docode.llm.credentials import APICredCredentialResolver, RuntimeAuthorization
+from docode.llm.weav_apicred_store import APICredCredentialStore, APICredUsageSink, AIRuntimeContext, UsageRecord
 
 
 class FailingUsageResolver(APICredCredentialResolver):
@@ -159,6 +160,38 @@ class CredentialResolverTests(IsolatedAsyncioTestCase):
         self.assertEqual(str(raised.exception), "usage report unavailable")
         self.assertEqual(resolver.calls[0]["path"], "/runtime/usage/report")
         self.assertEqual(resolver.calls[0]["payload"]["purpose"], "docode")
+
+    async def test_apicred_credential_store_caches_async_resolution(self) -> None:
+        resolver = ResponseResolver(
+            {
+                "provider": "openai",
+                "model": "gpt-runtime",
+                "api_key": "provider-key",
+                "base_url": "https://llm.example/v1",
+            }
+        )
+        store = APICredCredentialStore(resolver=resolver, user_id="user-1", provider="apicred", model="gpt-requested")
+        context = AIRuntimeContext(user_id="user-1", purpose="docode")
+
+        model = await store.resolve_model(context, provider="apicred", model="gpt-requested")
+        api_key = await store.get_api_key("openai", context)
+        base_url = await store.get_base_url("openai", context)
+
+        self.assertEqual(model.provider, "openai")
+        self.assertEqual(model.model, "gpt-runtime")
+        self.assertEqual(api_key, "provider-key")
+        self.assertEqual(base_url, "https://llm.example/v1")
+        self.assertEqual([call["path"] for call in resolver.calls], ["/runtime/credentials/resolve"])
+
+    async def test_apicred_usage_sink_records_usage_record(self) -> None:
+        resolver = ResponseResolver({})
+        sink = APICredUsageSink(resolver)
+
+        await sink.record(UsageRecord(user_id="user-1", provider="openai", model="gpt-4o", tokens=12, cost=0.03, purpose="docode"))
+
+        self.assertEqual(resolver.calls[0]["path"], "/runtime/usage/report")
+        self.assertEqual(resolver.calls[0]["payload"]["user_id"], "user-1")
+        self.assertEqual(resolver.calls[0]["payload"]["tokens"], 12)
 
 
 if __name__ == "__main__":

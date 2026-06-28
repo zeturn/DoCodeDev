@@ -20,6 +20,7 @@ class SQLiteRepositoryTests(IsolatedAsyncioTestCase):
                         id=new_id("job"),
                         user_id="user-1",
                         instruction="ship it",
+                        quality="strong",
                         apicred_access_token="bp_xat_sqlite",
                         github_repo="zeturn/example",
                         base_branch="develop",
@@ -44,6 +45,7 @@ class SQLiteRepositoryTests(IsolatedAsyncioTestCase):
                 self.assertEqual(loaded.apicred_access_token, "bp_xat_sqlite")
                 self.assertEqual(loaded.dobox_project_id, "42")
                 self.assertEqual(loaded.dobox_agent_session_id, "7")
+                self.assertEqual(loaded.quality, "strong")
                 self.assertEqual(loaded.max_consecutive_failures, 9)
                 self.assertEqual(loaded.max_tool_calls, 7)
                 self.assertEqual(loaded.max_llm_tokens, 12345)

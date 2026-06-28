@@ -36,6 +36,7 @@ class SQLiteJobRepository(JobRepository):
                 dobox_agent_session_id TEXT,
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
+                quality TEXT NOT NULL DEFAULT 'balanced',
                 apicred_access_token TEXT,
                 status TEXT NOT NULL,
                 max_iterations INTEGER NOT NULL,
@@ -87,6 +88,7 @@ class SQLiteJobRepository(JobRepository):
         self._ensure_column("docode_jobs", "github_repo", "TEXT")
         self._ensure_column("docode_jobs", "base_branch", "TEXT NOT NULL DEFAULT 'main'")
         self._ensure_column("docode_jobs", "apicred_access_token", "TEXT")
+        self._ensure_column("docode_jobs", "quality", "TEXT NOT NULL DEFAULT 'balanced'")
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -104,12 +106,12 @@ class SQLiteJobRepository(JobRepository):
                 """
                 INSERT INTO docode_jobs (
                     id, user_id, instruction, repo_url, branch, github_repo, base_branch,
-                    dobox_project_id, dobox_sandbox_id, dobox_agent_session_id, provider, model, apicred_access_token, status, max_iterations,
+                    dobox_project_id, dobox_sandbox_id, dobox_agent_session_id, provider, model, quality, apicred_access_token, status, max_iterations,
                     max_runtime_seconds, max_consecutive_failures, max_tool_calls, max_llm_tokens, max_llm_cost, artifact_mode, sandbox_network_mode, result_summary, failure_reason,
                     artifact_id, created_at,
                     updated_at, completed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 job_to_row(job),
             )
@@ -165,7 +167,7 @@ class SQLiteJobRepository(JobRepository):
                 UPDATE docode_jobs SET
                     user_id = ?, instruction = ?, repo_url = ?, branch = ?, github_repo = ?,
                     base_branch = ?, dobox_project_id = ?, dobox_sandbox_id = ?, dobox_agent_session_id = ?, provider = ?, model = ?,
-                    apicred_access_token = ?, status = ?, max_iterations = ?, max_runtime_seconds = ?, max_consecutive_failures = ?, max_tool_calls = ?,
+                    quality = ?, apicred_access_token = ?, status = ?, max_iterations = ?, max_runtime_seconds = ?, max_consecutive_failures = ?, max_tool_calls = ?,
                     max_llm_tokens = ?, max_llm_cost = ?, artifact_mode = ?, sandbox_network_mode = ?, result_summary = ?,
                     failure_reason = ?, artifact_id = ?, created_at = ?, updated_at = ?, completed_at = ?
                 WHERE id = ?
@@ -253,6 +255,7 @@ def job_to_row(job: CodingJob) -> tuple[object, ...]:
         job.dobox_agent_session_id,
         job.provider,
         job.model,
+        job.quality,
         job.apicred_access_token,
         job.status.value,
         job.max_iterations,
@@ -290,6 +293,7 @@ def job_from_row(row: sqlite3.Row) -> CodingJob:
         dobox_agent_session_id=row["dobox_agent_session_id"] if "dobox_agent_session_id" in row.keys() else None,
         provider=str(row["provider"]),
         model=str(row["model"]),
+        quality=str(row["quality"]) if "quality" in row.keys() and row["quality"] else "balanced",
         apicred_access_token=row["apicred_access_token"] if "apicred_access_token" in row.keys() else None,
         status=JobStatus(str(row["status"])),
         max_iterations=int(row["max_iterations"]),

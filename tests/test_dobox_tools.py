@@ -11,6 +11,8 @@ class FakeDoBoxClient:
         self.package_scripts = package_scripts or set()
         self.truncated_command = truncated_command
         self.agent_session_ids: list[str | None] = []
+        self.files: dict[str, str] = {"README.md": "hello\nworld\n"}
+        self.written_files: list[tuple[str, str]] = []
 
     async def run_command(self, project_id, command, cwd="/workspace", timeout_sec=120, output_limit=1_000_000, agent_session_id=None):
         self.agent_session_ids.append(agent_session_id)
@@ -25,6 +27,8 @@ class FakeDoBoxClient:
             return CommandResult("yes", 0)
         if "test -f" in command_text:
             return CommandResult("", 1)
+        if "git apply --check" in command_text:
+            return CommandResult(" README.md | 1 +\n", 0)
         return CommandResult(f"{project_id}:{cwd}:{command}", 0, truncated=self.truncated_command)
 
     async def git_diff(self, project_id, agent_session_id=None):
@@ -41,10 +45,12 @@ class FakeDoBoxClient:
 
     async def read_file(self, project_id, path, agent_session_id=None):
         self.agent_session_ids.append(agent_session_id)
-        return "content"
+        return self.files.get(path, "content")
 
     async def write_file(self, project_id, path, content, agent_session_id=None):
         self.agent_session_ids.append(agent_session_id)
+        self.files[path] = content
+        self.written_files.append((path, content))
         return None
 
     async def list_files(self, project_id, path=".", agent_session_id=None):
@@ -185,6 +191,40 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertIn("+change", result.output)
         self.assertTrue(result.truncated)
 
+    async def test_edit_file_replaces_exact_text_and_returns_diff(self) -> None:
+        client = FakeDoBoxClient()
+        tools = DoBoxTools(client, "project-123")
+
+        result = await tools.edit_file("README.md", "hello\n", "hello there\n")
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("-hello", result.output)
+        self.assertIn("+hello there", result.output)
+        self.assertEqual(client.files["README.md"], "hello there\nworld\n")
+
+    async def test_edit_file_rejects_missing_or_ambiguous_match(self) -> None:
+        client = FakeDoBoxClient()
+        client.files["README.md"] = "alpha\nbeta\nalpha\n"
+        tools = DoBoxTools(client, "project-123")
+
+        missing = await tools.edit_file("README.md", "gamma", "delta")
+        ambiguous = await tools.edit_file("README.md", "alpha", "delta")
+
+        self.assertEqual(missing.exit_code, 1)
+        self.assertIn("did not match exactly", missing.output)
+        self.assertEqual(ambiguous.exit_code, 1)
+        self.assertIn("matched 2 times", ambiguous.output)
+
+    async def test_apply_patch_writes_temp_patch_and_runs_git_apply(self) -> None:
+        client = FakeDoBoxClient()
+        tools = DoBoxTools(client, "project-123")
+
+        result = await tools.apply_patch("diff --git a/README.md b/README.md\n")
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(client.written_files[-1][0], ".docode_apply_patch.diff")
+        self.assertEqual(result.metadata, {"patch_bytes": 35})
+
     async def test_preview_and_logs_tools_are_project_level(self) -> None:
         tools = DoBoxTools(FakeDoBoxClient(), "project-123")
 
@@ -224,6 +264,8 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(spec)
         self.assertEqual(spec.input_schema["properties"]["command"]["type"], "string")
         self.assertEqual(spec.input_schema["required"], ["command"])
+        self.assertIsNotNone(registry.get("edit_file"))
+        self.assertIsNotNone(registry.get("apply_patch"))
         self.assertIsNotNone(registry.get("preview"))
         self.assertIsNotNone(registry.get("logs"))
 
@@ -248,5 +290,5 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         register_dobox_tools(registry, tools)
 
         output = await registry.handlers["read_file"]({"path": "README.md"})
-        self.assertEqual(output["content"], "content")
+        self.assertEqual(output["content"], "hello\nworld\n")
         self.assertTrue(output["ok"])

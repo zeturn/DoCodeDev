@@ -33,6 +33,17 @@ class VerificationResult:
     smoke_result: ToolResult | None = None
     workspace_result: ToolResult | None = None
     llm_judgement: VerifierJudgement | None = None
+    verification_plan: "VerificationPlan | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationPlan:
+    required_commands: list[str]
+    smoke_commands: list[str]
+    require_test_change: bool = False
+    require_entrypoint_run: bool = False
+    require_no_placeholder: bool = True
+    require_external_source_verified: bool = False
 
 
 class VerifierJudge(Protocol):
@@ -54,6 +65,7 @@ class CodingVerifier:
         self.judge = judge
 
     async def verify(self, job: CodingJob, tools: DoBoxTools) -> VerificationResult:
+        plan = build_verification_plan(job.instruction)
         await prepare_workspace_for_diff(tools)
         status_result = await safe_tool_call("git_status", tools.git_status)
         diff_result = await safe_tool_call("git_diff", tools.git_diff)
@@ -76,8 +88,9 @@ class CodingVerifier:
         build_ok = build_result.exit_code == 0
         lint_ok = lint_result.exit_code == 0
         verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_result.output, workspace_result)
-        smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result)
+        smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result, plan)
         smoke_ok = smoke_result.exit_code == 0
+        plan_ok, plan_fixes = evaluate_verification_plan(plan, verified_diff, test_result, build_result, lint_result, smoke_result)
 
         fixes: list[str] = []
         if not status_ok:
@@ -101,12 +114,13 @@ class CodingVerifier:
                 fixes.append("abandon the current data source, call web_search again, inspect a different machine-readable source with fetch_url, and update the crawler to use that working source")
             if smoke_output_indicates_missing_endpoint(smoke_result.output):
                 fixes.append("the current API endpoint returned 404 or not found; do not keep retrying the same endpoint, re-inspect the source documentation with fetch_url or call web_search again, then update the crawler to a verified working endpoint")
+        fixes.extend(fix for fix in plan_fixes if fix not in fixes)
 
         judgement = await self._judge(job, status_result, verified_diff, test_result, build_result, lint_result, smoke_result)
         if judgement is not None and not judgement.passed:
             fixes.extend(fix for fix in judgement.required_fixes if fix not in fixes)
 
-        command_checks_passed = status_ok and status_complete and has_change_evidence and diff_complete and tests_ok and build_ok and lint_ok and smoke_ok
+        command_checks_passed = status_ok and status_complete and has_change_evidence and diff_complete and tests_ok and build_ok and lint_ok and smoke_ok and plan_ok
         llm_checks_passed = judgement is None or judgement.passed
         if command_checks_passed and llm_checks_passed:
             confidence = min(judgement.confidence, 0.95) if judgement is not None else 0.86
@@ -125,6 +139,7 @@ class CodingVerifier:
                 smoke_result=smoke_result,
                 workspace_result=workspace_result,
                 llm_judgement=judgement,
+                verification_plan=plan,
             )
 
         reason = f"Verification failed for instruction: {job.instruction}"
@@ -146,6 +161,7 @@ class CodingVerifier:
             smoke_result=smoke_result,
             workspace_result=workspace_result,
             llm_judgement=judgement,
+            verification_plan=plan,
         )
 
     async def _judge(
@@ -247,7 +263,9 @@ async def run_smoke_verification(
     test_result: ToolResult,
     build_result: ToolResult,
     lint_result: ToolResult,
+    plan: VerificationPlan | None = None,
 ) -> ToolResult:
+    plan = plan or build_verification_plan(job.instruction)
     changed_files = changed_files_from_diff(diff)
     if not changed_files:
         return ToolResult(tool="run_smoke", output="no changed files detected for smoke verification", exit_code=0, metadata={"detected": False})
@@ -257,6 +275,8 @@ async def run_smoke_verification(
     if python_files:
         commands.append("python3 -m py_compile " + " ".join(shlex.quote(path) for path in python_files))
         runnable = runnable_python_files(job.instruction, python_files)
+        if runnable or plan.require_entrypoint_run:
+            runnable = runnable or runnable_python_entrypoints(python_files)
         if runnable:
             commands.extend("python3 " + shlex.quote(path) for path in runnable[:1])
             if requires_csv_output_check(job.instruction):
@@ -278,6 +298,8 @@ async def run_smoke_verification(
         if any_detected(test_result, build_result, lint_result):
             return ToolResult(tool="run_smoke", output="standard verification commands were detected; no additional smoke command selected", exit_code=0, metadata={"detected": False})
         return ToolResult(tool="run_smoke", output="no task-appropriate smoke command detected", exit_code=1, metadata={"detected": False, "changed_files": changed_files})
+
+    commands.extend(plan.smoke_commands)
 
     command = " && ".join(commands)
     result = await safe_optional_tool_call("run_command", tools, command, "/workspace")
@@ -305,6 +327,69 @@ def changed_files_from_diff(diff: str) -> list[str]:
         if path and path != "/dev/null" and path not in files:
             files.append(path)
     return files
+
+
+def build_verification_plan(instruction: str) -> VerificationPlan:
+    lowered = (instruction or "").lower()
+    is_crawler = any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
+    is_cli = any(keyword in lowered for keyword in ("cli", "command line", "命令行", "script", "脚本"))
+    is_api = any(keyword in lowered for keyword in ("api", "adapter", "integration", "endpoint", "接口"))
+    is_bugfix = any(keyword in lowered for keyword in ("bug", "fix", "regression", "修复", "报错", "失败"))
+    is_docs = any(keyword in lowered for keyword in ("readme", "docs", "documentation", "文档"))
+    required_commands: list[str] = []
+    if is_crawler:
+        required_commands.append("crawler_dry_run_or_entrypoint")
+    if is_cli:
+        required_commands.append("cli_entrypoint")
+    if is_api:
+        required_commands.append("api_contract_or_mock")
+    if is_bugfix and not is_docs:
+        required_commands.append("related_test")
+    return VerificationPlan(
+        required_commands=required_commands,
+        smoke_commands=[],
+        require_test_change=is_bugfix and not is_docs,
+        require_entrypoint_run=is_crawler or is_cli,
+        require_no_placeholder=not is_docs,
+        require_external_source_verified=is_crawler or is_api,
+    )
+
+
+def evaluate_verification_plan(
+    plan: VerificationPlan,
+    diff: str,
+    test_result: ToolResult,
+    build_result: ToolResult,
+    lint_result: ToolResult,
+    smoke_result: ToolResult,
+) -> tuple[bool, list[str]]:
+    _ = build_result, lint_result
+    fixes: list[str] = []
+    changed_files = changed_files_from_diff(diff)
+    diff_lowered = diff.lower()
+    if plan.require_test_change and not has_test_change(changed_files):
+        fixes.append("add or update a related test for this bugfix, or record why no automated test is appropriate")
+    if plan.require_entrypoint_run and not (smoke_result.metadata and smoke_result.metadata.get("detected")):
+        fixes.append("run the task entrypoint or CLI command as smoke verification")
+    if plan.require_no_placeholder and diff_contains_placeholder(diff_lowered):
+        fixes.append("remove placeholder/TODO/stub implementation text before finishing")
+    if plan.require_external_source_verified and not external_source_verified(diff_lowered, smoke_result):
+        fixes.append("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run")
+    return not fixes, fixes
+
+
+def has_test_change(changed_files: list[str]) -> bool:
+    return any("/test" in path or path.startswith("test") or path.startswith("tests/") for path in changed_files)
+
+
+def diff_contains_placeholder(diff_lowered: str) -> bool:
+    return any(marker in diff_lowered for marker in ("todo", "placeholder", "stub", "not implemented", "pass  #", "pass\n"))
+
+
+def external_source_verified(diff_lowered: str, smoke_result: ToolResult) -> bool:
+    if smoke_result.exit_code == 0 and smoke_result.metadata and smoke_result.metadata.get("detected"):
+        return True
+    return any(marker in diff_lowered for marker in ("fetch_url", "web_search", "http://", "https://", "requests.", "httpx.", "urllib."))
 
 
 def has_untracked_workspace_files(status: str) -> bool:
@@ -378,6 +463,13 @@ def runnable_python_files(instruction: str, python_files: list[str]) -> list[str
         return []
     excluded_parts = {"/test_", "/tests/", "\\test_", "\\tests\\"}
     return [path for path in python_files if not any(part in path for part in excluded_parts)]
+
+
+def runnable_python_entrypoints(python_files: list[str]) -> list[str]:
+    excluded_parts = {"/test_", "/tests/", "\\test_", "\\tests\\"}
+    candidates = [path for path in python_files if not any(part in path for part in excluded_parts)]
+    preferred = [path for path in candidates if path.endswith(("main.py", "cli.py", "crawler.py", "scraper.py"))]
+    return preferred or candidates[:1]
 
 
 def any_detected(*results: ToolResult) -> bool:
