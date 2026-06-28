@@ -5,6 +5,7 @@ import types
 from unittest import IsolatedAsyncioTestCase
 
 from docode.dobox.tools import DoBoxTools
+from docode.dobox.tools import ToolDefinition
 from docode.agent.tools import CompositeAgentTools
 from docode.web.tools import WebTools, WebToolsConfig
 from docode.llm.credentials import ProviderCredential
@@ -17,6 +18,7 @@ from docode.llm.runtime import (
     ScriptedDecisionLLM,
     WeavDecisionLLM,
     WeavVerifierJudge,
+    build_runtime_policy,
     build_docode_llm,
     build_docode_runtime,
     build_provider_client,
@@ -39,7 +41,10 @@ class RuntimeResolver:
 
 class RuntimeTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self._saved_modules = {name: sys.modules.get(name) for name in ("weav_ai_core", "weav_ai_core.llm", "weav_ai_providers")}
+        self._saved_modules = {
+            name: sys.modules.get(name)
+            for name in ("weav_ai_core", "weav_ai_core.llm", "weav_ai_providers", "weav_ai_runtime")
+        }
 
     async def asyncTearDown(self) -> None:
         for name, module in self._saved_modules.items():
@@ -137,13 +142,25 @@ class RuntimeTests(IsolatedAsyncioTestCase):
                 self.model = model
                 return '{"type": "final_candidate", "summary": "done"}'
 
+        async def read_file(path: str):
+            _ = path
+
         usage = LLMUsageMeter()
         provider = Provider()
         llm = WeavDecisionLLM(provider, "gpt-test", usage)
 
-        decision = await llm.decide(system="system", messages=[], tools=[], context="context")
+        decision = await llm.decide(
+            system="system",
+            messages=[],
+            tools=[ToolDefinition("read_file", "Read a file.", {"path": "string"}, read_file)],
+            context="context",
+        )
 
         self.assertEqual(decision.type, "final_candidate")
+        self.assertIn("Available tools JSON schema", provider.prompt)
+        self.assertIn('"input_schema"', provider.prompt)
+        self.assertIn('"read_file"', provider.prompt)
+        self.assertNotIn("Messages:", provider.prompt)
         self.assertEqual(usage.calls, 1)
         self.assertEqual(usage.prompt_tokens, estimate_tokens(provider.prompt))
         self.assertGreater(usage.total_tokens, 0)
@@ -172,6 +189,8 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertFalse(usage.estimated)
 
     async def test_provider_call_result_extracts_sdk_style_object(self) -> None:
+        install_weav_stubs()
+
         class Message:
             content = '{"type": "final_candidate", "summary": "object"}'
 
@@ -194,6 +213,47 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertEqual(result.prompt_tokens, 5)
         self.assertEqual(result.completion_tokens, 3)
 
+    async def test_provider_call_result_accepts_runtime_llm_call_result_shape(self) -> None:
+        install_weav_stubs()
+
+        class Usage:
+            tokens = 21
+            cost = 0.04
+
+        class RuntimeResult:
+            text = '{"type": "final_candidate", "summary": "runtime"}'
+            usage = Usage()
+            tool_calls = []
+            raw = {"id": "call_1"}
+
+        result = provider_call_result(RuntimeResult())
+
+        self.assertEqual(result.text, '{"type": "final_candidate", "summary": "runtime"}')
+        self.assertEqual(result.total_tokens, 21)
+        self.assertEqual(result.cost, 0.04)
+        self.assertEqual(result.raw, {"id": "call_1"})
+
+    async def test_build_runtime_policy_maps_job_budget_and_provider(self) -> None:
+        install_weav_stubs()
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="change code",
+            provider="apicred",
+            model="gpt-test",
+            max_llm_tokens=1234,
+            max_llm_cost=0.5,
+        )
+
+        policy = build_runtime_policy(job)
+
+        self.assertIsNotNone(policy)
+        self.assertEqual(policy.purpose, "docode")
+        self.assertEqual(policy.max_tokens, 1234)
+        self.assertEqual(policy.max_cost, 0.5)
+        self.assertEqual(policy.allowed_providers, ["openai"])
+        self.assertEqual(policy.fallback_chain[0].provider, "openai")
+
 
 def install_weav_stubs() -> None:
     core = types.ModuleType("weav_ai_core")
@@ -215,6 +275,156 @@ def install_weav_stubs() -> None:
         return {"provider": provider, "kwargs": kwargs}
 
     providers.build_provider = build_provider
+
+    runtime = types.ModuleType("weav_ai_runtime")
+
+    class AIRuntimeContext:
+        def __init__(self, tenant=None, user_id=None, purpose=None) -> None:
+            self.tenant = tenant
+            self.user_id = user_id
+            self.purpose = purpose
+
+    class ModelSpec:
+        def __init__(self, provider, model) -> None:
+            self.provider = provider
+            self.model = model
+
+    class RuntimePolicy:
+        def __init__(self, *, purpose, max_tokens=None, max_cost=None, allowed_providers=None, denied_models=None, fallback_chain=None) -> None:
+            self.purpose = purpose
+            self.max_tokens = max_tokens
+            self.max_cost = max_cost
+            self.allowed_providers = list(allowed_providers or [])
+            self.denied_models = list(denied_models or [])
+            self.fallback_chain = list(fallback_chain or [])
+
+    class UsageRecord:
+        def __init__(self, tokens=0, cost=0.0, prompt_tokens=None, completion_tokens=None, provider=None, model=None, purpose=None) -> None:
+            self.tokens = tokens
+            self.cost = cost
+            self.prompt_tokens = prompt_tokens
+            self.completion_tokens = completion_tokens
+            self.provider = provider
+            self.model = model
+            self.purpose = purpose
+
+    class LLMCallResult:
+        def __init__(self, text, tool_calls=None, usage=None, raw=None) -> None:
+            self.text = text
+            self.tool_calls = list(tool_calls or [])
+            self.usage = usage
+            self.raw = raw
+
+    def normalize_llm_call_result(response, **kwargs):
+        _ = kwargs
+        if isinstance(response, LLMCallResult):
+            return response
+        if hasattr(response, "text") and hasattr(response, "usage"):
+            usage = response.usage
+            return LLMCallResult(
+                response.text,
+                tool_calls=getattr(response, "tool_calls", []),
+                usage=UsageRecord(
+                    tokens=getattr(usage, "tokens", getattr(usage, "total_tokens", 0)),
+                    cost=getattr(usage, "cost", 0.0),
+                    prompt_tokens=getattr(usage, "prompt_tokens", None),
+                    completion_tokens=getattr(usage, "completion_tokens", None),
+                ),
+                raw=getattr(response, "raw", response),
+            )
+        if isinstance(response, str):
+            return LLMCallResult(response, raw=response)
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage")
+        tokens = None
+        prompt_tokens = None
+        completion_tokens = None
+        if isinstance(usage, dict):
+            tokens = usage.get("total_tokens") or usage.get("tokens")
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+        elif usage is not None:
+            tokens = getattr(usage, "total_tokens", getattr(usage, "tokens", None))
+            prompt_tokens = getattr(usage, "input_tokens", getattr(usage, "prompt_tokens", None))
+            completion_tokens = getattr(usage, "output_tokens", getattr(usage, "completion_tokens", None))
+        text = None
+        if isinstance(response, dict):
+            text = response.get("choices", [{}])[0].get("message", {}).get("content")
+        if text is None:
+            text = getattr(response, "text", None) or getattr(getattr(response, "choices", [None])[0], "message", None).content
+        return LLMCallResult(
+            text,
+            usage=UsageRecord(tokens=tokens or 0, cost=getattr(usage, "cost", 0.0), prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+            raw=getattr(response, "raw", response),
+        )
+
+    async def call_llm_provider(client, *, prompt, model, provider=None, purpose=None, config=None):
+        _ = provider, purpose, config
+        if hasattr(client, "acomplete"):
+            try:
+                response = await client.acomplete(prompt=prompt, model=model)
+            except TypeError:
+                response = await client.acomplete(prompt, {"model": model, "temperature": 0.0})
+            return normalize_llm_call_result(response)
+        if hasattr(client, "complete"):
+            try:
+                response = client.complete(prompt=prompt, model=model)
+            except TypeError:
+                response = client.complete(prompt, {"model": model, "temperature": 0.0})
+            if hasattr(response, "__await__"):
+                response = await response
+            return normalize_llm_call_result(response)
+        if hasattr(client, "achat"):
+            try:
+                response = await client.achat(messages=[{"role": "user", "content": prompt}], model=model)
+            except TypeError:
+                response = await client.achat([{"role": "user", "content": prompt}], {"model": model, "temperature": 0.0})
+            return normalize_llm_call_result(response)
+        if hasattr(client, "chat"):
+            try:
+                response = client.chat(messages=[{"role": "user", "content": prompt}], model=model)
+            except TypeError:
+                response = client.chat([{"role": "user", "content": prompt}], {"model": model, "temperature": 0.0})
+            if hasattr(response, "__await__"):
+                response = await response
+            return normalize_llm_call_result(response)
+        raise RuntimeError("provider client does not expose a supported chat/completion method")
+
+    class AIRuntime:
+        def __init__(self, *, context, credentials, model_catalog=None, usage_sink=None) -> None:
+            self.context = context
+            self.credentials = credentials
+            self.model_catalog = model_catalog
+            self.usage_sink = usage_sink
+
+        async def resolve_model_async(self, provider=None, model=None):
+            return await self.model_catalog.resolve_model(self.context, provider=provider, model=model)
+
+        async def build_router_async(self):
+            router = LLMRouter()
+            for provider in ("openai", "anthropic", "google", "ollama", "deepseek", "qwen", "zhipu"):
+                api_key = await self.credentials.get_api_key(provider, self.context)
+                base_url = await self.credentials.get_base_url(provider, self.context)
+                if not api_key and provider != "ollama":
+                    continue
+                kwargs = {}
+                if api_key:
+                    kwargs["api_key"] = api_key
+                if base_url:
+                    kwargs["base_url"] = base_url
+                router.register(provider, build_provider(provider, **kwargs))
+            return router
+
+    runtime.AIRuntime = AIRuntime
+    runtime.AIRuntimeContext = AIRuntimeContext
+    runtime.LLMCallResult = LLMCallResult
+    runtime.ModelSpec = ModelSpec
+    runtime.RuntimePolicy = RuntimePolicy
+    runtime.UsageRecord = UsageRecord
+    runtime.call_llm_provider = call_llm_provider
+    runtime.normalize_llm_call_result = normalize_llm_call_result
     sys.modules["weav_ai_core"] = core
     sys.modules["weav_ai_core.llm"] = llm
     sys.modules["weav_ai_providers"] = providers
+    sys.modules["weav_ai_runtime"] = runtime

@@ -62,6 +62,28 @@ class ModelPolicyTests(IsolatedAsyncioTestCase):
         self.assertTrue(scripted_result.allowed)
         self.assertEqual((scripted_result.provider, scripted_result.model), ("scripted", "scripted"))
 
+    async def test_quality_tiers_resolve_against_catalog_when_model_is_omitted(self) -> None:
+        policy = DocodeModelPolicy(
+            DocodeConfig(default_provider="openai", default_model="gpt-4o"),
+            FakeCatalogResolver({"openai": ["gpt-4o", "gpt-4o-mini"], "anthropic": ["claude-sonnet-4-5"]}),
+        )
+
+        fast = await policy.resolve(provider=None, model=None, quality="fast", user_id="user-1")
+        balanced = await policy.resolve(provider=None, model=None, quality="balanced", user_id="user-1")
+        strong = await policy.resolve(provider=None, model=None, quality="strong", user_id="user-1")
+
+        self.assertEqual((fast.provider, fast.model, fast.quality), ("openai", "gpt-4o-mini", "fast"))
+        self.assertEqual((balanced.provider, balanced.model, balanced.quality), ("openai", "gpt-4o", "balanced"))
+        self.assertEqual((strong.provider, strong.model, strong.quality), ("anthropic", "claude-sonnet-4-5", "strong"))
+
+    async def test_invalid_quality_is_rejected(self) -> None:
+        policy = DocodeModelPolicy(DocodeConfig(), FakeCatalogResolver({"openai": ["gpt-4o"]}))
+
+        with self.assertRaises(ValueError) as raised:
+            await policy.resolve(provider=None, model=None, quality="cheap", user_id="user-1")
+
+        self.assertEqual(str(raised.exception), "quality must be fast, balanced, or strong")
+
 
 class ProviderCatalogParsingTests(TestCase):
     def test_parse_provider_catalog_accepts_runtime_and_models_shapes(self) -> None:

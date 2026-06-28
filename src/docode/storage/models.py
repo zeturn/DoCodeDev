@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from docode.defaults import DEFAULT_MODEL, DEFAULT_PROVIDER, DEFAULT_QUALITY
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -46,8 +48,9 @@ class CodingJob:
     dobox_project_id: str | None = None
     dobox_sandbox_id: str | None = None
     dobox_agent_session_id: str | None = None
-    provider: str = "openai"
-    model: str = "gpt-5.4"
+    provider: str = DEFAULT_PROVIDER
+    model: str = DEFAULT_MODEL
+    quality: str = DEFAULT_QUALITY
     apicred_access_token: str | None = field(default=None, repr=False)
     status: JobStatus = JobStatus.QUEUED
     max_iterations: int = 50

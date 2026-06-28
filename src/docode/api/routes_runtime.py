@@ -20,10 +20,16 @@ def make_runtime_router(config: DocodeConfig, user_dependency=get_user_context) 
         resolver.use_access_token(user.apicred_access_token)
         policy = DocodeModelPolicy(config, resolver)
         options = await policy.list_options(user_id=user.user_id)
+        defaults = {
+            quality: asdict(await policy.resolve(provider=None, model=None, quality=quality, user_id=user.user_id))
+            for quality in ("fast", "balanced", "strong")
+        }
         return jsonable_encoder(
             {
-                "default_provider": config.default_provider,
-                "default_model": config.default_model,
+                "default_provider": defaults["balanced"]["provider"],
+                "default_model": defaults["balanced"]["model"],
+                "default_quality": "balanced",
+                "quality_defaults": defaults,
                 "options": [asdict(option) for option in options],
             }
         )

@@ -44,8 +44,8 @@ class WebTools:
             ),
             ToolDefinition(
                 "fetch_url",
-                "Fetch a public HTTP/HTTPS webpage and return readable text for source inspection.",
-                {"url": "string"},
+                "Fetch a public HTTP/HTTPS webpage and return goal-focused extracted sections for source inspection.",
+                {"url": "string", "goal": "string", "max_sections": "integer"},
                 self.fetch_url,
             ),
         ]
@@ -82,7 +82,7 @@ class WebTools:
             metadata={"query": query.strip(), "response_id": raw.get("id"), "model": self.config.openai_search_model},
         )
 
-    async def fetch_url(self, url: str) -> ToolResult:
+    async def fetch_url(self, url: str, goal: str = "", max_sections: int = 8) -> ToolResult:
         if not isinstance(url, str) or not url.strip():
             return ToolResult(tool="fetch_url", output="url must be a non-empty string", exit_code=2)
         normalized = url.strip()
@@ -101,12 +101,27 @@ class WebTools:
                 exit_code=1,
                 metadata={"url": normalized, "exception_type": type(exc).__name__},
             )
-        text = readable_text(content, content_type)
-        return clipped_tool_result(
-            "fetch_url",
-            text,
-            self.config.output_limit_bytes,
-            metadata={"url": normalized, "status_code": status_code, "content_type": content_type},
+        extraction = extract_url_content(
+            url=normalized,
+            content=content,
+            content_type=content_type,
+            goal=goal,
+            max_sections=max_sections,
+            output_limit_bytes=self.config.output_limit_bytes,
+        )
+        return ToolResult(
+            tool="fetch_url",
+            output=json.dumps(extraction.payload, ensure_ascii=False, indent=2),
+            metadata={
+                "url": normalized,
+                "status_code": status_code,
+                "content_type": content_type,
+                "original_bytes": extraction.original_bytes,
+                "returned_bytes": extraction.returned_bytes,
+                "truncated": extraction.truncated,
+                "goal": goal.strip() if isinstance(goal, str) else "",
+            },
+            truncated=extraction.truncated,
         )
 
 
@@ -203,13 +218,13 @@ class ReadableHTMLParser(HTMLParser):
         self.skip_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style", "noscript"}:
+        if tag in {"head", "title", "script", "style", "noscript"}:
             self.skip_depth += 1
         if tag in {"p", "br", "div", "section", "article", "li", "tr", "h1", "h2", "h3", "h4"}:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "noscript"} and self.skip_depth:
+        if tag in {"head", "title", "script", "style", "noscript"} and self.skip_depth:
             self.skip_depth -= 1
         if tag in {"p", "li", "tr", "h1", "h2", "h3", "h4"}:
             self.parts.append("\n")
@@ -221,6 +236,160 @@ class ReadableHTMLParser(HTMLParser):
     def text(self) -> str:
         text = html.unescape(" ".join(self.parts))
         return re.sub(r"[ \t\r\f\v]+", " ", re.sub(r"\n\s*\n+", "\n\n", text)).strip()
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedPage:
+    payload: dict[str, Any]
+    original_bytes: int
+    returned_bytes: int
+    truncated: bool
+
+
+def extract_url_content(
+    *,
+    url: str,
+    content: str,
+    content_type: str,
+    goal: str = "",
+    max_sections: int = 8,
+    output_limit_bytes: int = 200_000,
+) -> ExtractedPage:
+    text = readable_text(content, content_type)
+    title = extract_title(content, content_type)
+    section_limit = max(1, min(int_or_default(max_sections, 8), 20))
+    sections = select_relevant_sections(text, goal, section_limit)
+    payload: dict[str, Any] = {
+        "url": url,
+        "title": title,
+        "summary": summarize_sections(sections),
+        "relevant_sections": sections,
+        "original_bytes": len(content.encode("utf-8")),
+        "returned_bytes": 0,
+        "truncated": False,
+    }
+    payload, returned_bytes, truncated = fit_extraction_payload(payload, output_limit_bytes)
+    payload["truncated"] = truncated
+    payload["returned_bytes"] = len(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+    return ExtractedPage(
+        payload=payload,
+        original_bytes=len(content.encode("utf-8")),
+        returned_bytes=int(payload["returned_bytes"]),
+        truncated=truncated,
+    )
+
+
+def select_relevant_sections(text: str, goal: str, max_sections: int) -> list[dict[str, str]]:
+    chunks = page_chunks(text)
+    goal_terms = relevant_terms(goal)
+    ranked: list[tuple[int, int, str]] = []
+    for index, chunk in enumerate(chunks):
+        lowered = chunk.lower()
+        score = sum(1 for term in goal_terms if term in lowered)
+        ranked.append((-score, index, chunk))
+    selected = sorted(ranked)[:max_sections] if goal_terms else ranked[:max_sections]
+    return [section_payload(chunk, goal_terms, matched_score=-score) for score, _, chunk in selected]
+
+
+def page_chunks(text: str) -> list[str]:
+    raw_chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n+", text) if chunk.strip()]
+    chunks: list[str] = []
+    index = 0
+    while index < len(raw_chunks):
+        chunk = raw_chunks[index]
+        if index + 1 < len(raw_chunks) and looks_like_heading(chunk):
+            chunks.append(chunk + "\n" + raw_chunks[index + 1])
+            index += 2
+            continue
+        chunks.append(chunk)
+        index += 1
+    return chunks
+
+
+def looks_like_heading(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and len(stripped) <= 120 and "\n" not in stripped and not stripped.endswith((".", ":", ";"))
+
+
+def section_payload(chunk: str, goal_terms: set[str], *, matched_score: int) -> dict[str, str]:
+    lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+    heading = lines[0][:120] if lines else "Section"
+    if len(heading) > 80 and "." in heading:
+        heading = heading.split(".", 1)[0][:80]
+    text = chunk[:4000]
+    if len(chunk) > len(text):
+        text += "\n<truncated>"
+    matched_terms = sorted(term for term in goal_terms if term in chunk.lower())
+    if matched_terms:
+        why = "matched goal terms: " + ", ".join(matched_terms[:8])
+    elif matched_score > 0:
+        why = "matched the requested goal"
+    else:
+        why = "early page content"
+    return {"heading": heading or "Section", "text": text, "why_relevant": why}
+
+
+def summarize_sections(sections: list[dict[str, str]]) -> str:
+    text = "\n\n".join(section["text"] for section in sections)
+    return text[:1200] + ("\n<truncated>" if len(text) > 1200 else "")
+
+
+def fit_extraction_payload(payload: dict[str, Any], output_limit_bytes: int) -> tuple[dict[str, Any], int, bool]:
+    limit = max(1000, output_limit_bytes)
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    if len(encoded) <= limit:
+        return payload, len(encoded), False
+
+    clipped = dict(payload)
+    sections = [dict(section) for section in payload.get("relevant_sections", []) if isinstance(section, dict)]
+    per_section_limit = max(400, limit // max(1, len(sections) * 2))
+    for section in sections:
+        text = str(section.get("text", ""))
+        if len(text.encode("utf-8")) > per_section_limit:
+            section["text"] = text.encode("utf-8")[:per_section_limit].decode("utf-8", errors="replace") + "\n<truncated>"
+    clipped["relevant_sections"] = sections
+    clipped["summary"] = summarize_sections(sections)
+    clipped["truncated"] = True
+
+    while len(json.dumps(clipped, ensure_ascii=False, indent=2).encode("utf-8")) > limit and len(sections) > 1:
+        sections.pop()
+        clipped["relevant_sections"] = sections
+        clipped["summary"] = summarize_sections(sections)
+
+    while len(json.dumps(clipped, ensure_ascii=False, indent=2).encode("utf-8")) > limit and sections:
+        largest = max(sections, key=lambda section: len(str(section.get("text", "")).encode("utf-8")))
+        text = str(largest.get("text", ""))
+        encoded_text = text.encode("utf-8")
+        if len(encoded_text) <= 120:
+            break
+        largest["text"] = encoded_text[: max(120, len(encoded_text) // 2)].decode("utf-8", errors="replace") + "\n<truncated>"
+        clipped["summary"] = summarize_sections(sections)
+
+    encoded = json.dumps(clipped, ensure_ascii=False, indent=2).encode("utf-8")
+    return clipped, len(encoded), True
+
+
+def extract_title(content: str, content_type: str) -> str:
+    if "html" not in content_type.lower():
+        return ""
+    match = re.search(r"(?is)<title[^>]*>(.*?)</title>", content)
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", html.unescape(match.group(1))).strip()
+
+
+def relevant_terms(goal: str) -> set[str]:
+    if not isinstance(goal, str):
+        return set()
+    stopwords = {"the", "and", "for", "with", "from", "this", "that", "api", "url", "http", "https", "extract"}
+    return {token for token in re.findall(r"[a-zA-Z0-9_./-]{3,}", goal.lower()) if token not in stopwords}
+
+
+def int_or_default(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def is_private_or_local_host(hostname: str) -> bool:

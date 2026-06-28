@@ -15,6 +15,7 @@ from docode.dobox.tools import DoBoxTools
 from docode.integrations.basaltpass import BasaltPassTokenExchangeClient
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.runtime import WeavVerifierJudge, build_docode_runtime
+from docode.llm.weav_apicred_store import usage_record_from_snapshot
 from docode.storage.models import JobStatus
 from docode.storage.repository import JobRepository, terminal_status
 from docode.web.tools import WebTools, WebToolsConfig
@@ -190,7 +191,15 @@ class JobRunnerService:
             )
             completed = await loop.run(job)
             usage = runtime.usage_meter.snapshot()
-            await self.report_usage_best_effort(resolver, completed, usage, max_llm_tokens, max_llm_cost)
+            await self.report_usage_best_effort(
+                runtime.usage_sink,
+                completed,
+                usage,
+                max_llm_tokens,
+                max_llm_cost,
+                provider=runtime.provider,
+                model=runtime.model,
+            )
             await self.cleanup_sandbox_if_needed(dobox, completed)
         except Exception as exc:
             if not await self._is_stopped(job.id):
@@ -251,20 +260,41 @@ class JobRunnerService:
 
     async def report_usage_best_effort(
         self,
-        resolver: APICredCredentialResolver,
+        usage_sink,
         completed,
         usage: dict[str, object],
         budget_tokens: int | None,
         budget_cost: float | None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
-        try:
-            await resolver.report_usage(
-                user_id=completed.user_id,
-                provider=completed.provider,
-                model=completed.model,
-                tokens=int(usage["total_tokens"]),
-                cost=float(usage["cost"]),
+        reported_provider = provider or completed.provider
+        reported_model = model or completed.model
+        if usage_sink is None:
+            await self.repository.add_step(
+                completed.id,
+                "system",
+                {
+                    "type": "usage_report",
+                    "status": "skipped",
+                    "provider": reported_provider,
+                    "model": reported_model,
+                    "usage": usage,
+                    "budget_tokens": budget_tokens,
+                    "budget_cost": budget_cost,
+                },
             )
+            return
+        record = usage_record_from_snapshot(
+            user_id=completed.user_id,
+            provider=reported_provider,
+            model=reported_model,
+            usage=usage,
+        )
+        try:
+            result = usage_sink.record(record)
+            if hasattr(result, "__await__"):
+                await result
         except Exception as exc:
             await self.repository.add_step(
                 completed.id,
@@ -272,8 +302,8 @@ class JobRunnerService:
                 {
                     "type": "apicred_usage_report",
                     "status": "failed",
-                    "provider": completed.provider,
-                    "model": completed.model,
+                    "provider": reported_provider,
+                    "model": reported_model,
                     "tokens": usage["total_tokens"],
                     "cost": usage["cost"],
                     "usage": usage,
@@ -289,8 +319,8 @@ class JobRunnerService:
             {
                 "type": "apicred_usage_report",
                 "status": "reported",
-                "provider": completed.provider,
-                "model": completed.model,
+                "provider": reported_provider,
+                "model": reported_model,
                 "tokens": usage["total_tokens"],
                 "cost": usage["cost"],
                 "usage": usage,

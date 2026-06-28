@@ -21,8 +21,15 @@ class FakeModelPolicy:
         self.result = result
         self.calls: list[dict[str, str | None]] = []
 
-    async def resolve(self, *, provider: str | None, model: str | None, user_id: str | None = None) -> ModelPolicyResult:
-        self.calls.append({"provider": provider, "model": model, "user_id": user_id})
+    async def resolve(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        quality: str | None = None,
+        user_id: str | None = None,
+    ) -> ModelPolicyResult:
+        self.calls.append({"provider": provider, "model": model, "quality": quality, "user_id": user_id})
         return self.result
 
 
@@ -55,6 +62,7 @@ class JobActionTests(IsolatedAsyncioTestCase):
         self.assertEqual(job.apicred_access_token, "bp_xat_cross_app")
         self.assertEqual(job.provider, "scripted")
         self.assertEqual(job.model, "scripted")
+        self.assertEqual(job.quality, "balanced")
         self.assertEqual(job.max_iterations, 12)
         self.assertEqual(job.max_runtime_seconds, 900)
         self.assertEqual(job.max_consecutive_failures, 5)
@@ -66,12 +74,12 @@ class JobActionTests(IsolatedAsyncioTestCase):
         self.assertEqual(job.sandbox_network_mode, "project")
         self.assertEqual(queue.enqueued, [job.id])
         self.assertIs(await repo.get_job(job.id), job)
-        self.assertEqual(policy.calls, [{"provider": "dev", "model": None, "user_id": "user-1"}])
+        self.assertEqual(policy.calls, [{"provider": "dev", "model": None, "quality": None, "user_id": "user-1"}])
 
     async def test_create_coding_job_preserves_explicit_runtime_fields(self) -> None:
         repo = InMemoryJobRepository()
         queue = RecordingQueue()
-        policy = FakeModelPolicy(ModelPolicyResult(provider="anthropic", model="claude-sonnet-4-5", allowed=True))
+        policy = FakeModelPolicy(ModelPolicyResult(provider="anthropic", model="claude-sonnet-4-5", allowed=True, quality="strong"))
 
         job = await create_coding_job(
             repository=repo,
@@ -87,6 +95,7 @@ class JobActionTests(IsolatedAsyncioTestCase):
                 base_branch="release",
                 provider="anthropic",
                 model="claude-sonnet-4-5",
+                quality="strong",
                 max_iterations=4,
                 max_runtime_seconds=120,
                 max_consecutive_failures=7,
@@ -104,6 +113,7 @@ class JobActionTests(IsolatedAsyncioTestCase):
         self.assertEqual(job.base_branch, "release")
         self.assertEqual(job.provider, "anthropic")
         self.assertEqual(job.model, "claude-sonnet-4-5")
+        self.assertEqual(job.quality, "strong")
         self.assertEqual(job.max_iterations, 4)
         self.assertEqual(job.max_runtime_seconds, 120)
         self.assertEqual(job.max_consecutive_failures, 7)
@@ -131,6 +141,23 @@ class JobActionTests(IsolatedAsyncioTestCase):
         self.assertEqual(job.max_iterations, 100)
         self.assertEqual(job.max_consecutive_failures, 12)
         self.assertEqual(job.max_tool_calls, 250)
+
+    async def test_create_coding_job_passes_quality_to_model_policy(self) -> None:
+        repo = InMemoryJobRepository()
+        queue = RecordingQueue()
+        policy = FakeModelPolicy(ModelPolicyResult(provider="openai", model="gpt-4o-mini", allowed=True, quality="fast"))
+
+        job = await create_coding_job(
+            repository=repo,
+            queue=queue,  # type: ignore[arg-type]
+            config=DocodeConfig(),
+            model_policy=policy,  # type: ignore[arg-type]
+            user_id="user-1",
+            request=CreateJobInput(instruction="fix build", quality="fast"),
+        )
+
+        self.assertEqual(job.quality, "fast")
+        self.assertEqual(policy.calls, [{"provider": None, "model": None, "quality": "fast", "user_id": "user-1"}])
 
     async def test_create_coding_job_keeps_explicit_budget_for_crawler_tasks(self) -> None:
         repo = InMemoryJobRepository()

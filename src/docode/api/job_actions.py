@@ -33,6 +33,7 @@ class CreateJobInput:
     base_branch: str | None = None
     provider: str | None = None
     model: str | None = None
+    quality: str | None = None
     max_iterations: int | None = None
     max_runtime_seconds: int | None = None
     max_consecutive_failures: int | None = None
@@ -90,7 +91,10 @@ async def create_coding_job(
     except ValueError as exc:
         raise JobActionError(400, str(exc)) from exc
 
-    resolved_model = await model_policy.resolve(provider=request.provider, model=request.model, user_id=user_id)
+    try:
+        resolved_model = await model_policy.resolve(provider=request.provider, model=request.model, quality=request.quality, user_id=user_id)
+    except ValueError as exc:
+        raise JobActionError(400, str(exc)) from exc
     if not resolved_model.allowed:
         raise JobActionError(400, resolved_model.reason)
 
@@ -104,6 +108,7 @@ async def create_coding_job(
         base_branch=request.base_branch or config.github_base_branch,
         provider=resolved_model.provider,
         model=resolved_model.model,
+        quality=resolved_model.quality,
         apicred_access_token=apicred_access_token,
         max_iterations=max_iterations,
         max_runtime_seconds=max_runtime_seconds,

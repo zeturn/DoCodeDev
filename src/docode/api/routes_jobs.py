@@ -27,6 +27,7 @@ class CreateJobRequest(BaseModel):
     base_branch: str | None = None
     provider: str | None = None
     model: str | None = None
+    quality: str | None = Field(default=None, pattern="^(fast|balanced|strong)$")
     max_iterations: int | None = Field(default=None, ge=1, le=200)
     max_runtime_seconds: int | None = Field(default=None, ge=30, le=24 * 60 * 60)
     max_consecutive_failures: int | None = Field(default=None, ge=1, le=50)
@@ -61,6 +62,7 @@ def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: Do
                     base_branch=req.base_branch,
                     provider=req.provider,
                     model=req.model,
+                    quality=req.quality,
                     max_iterations=req.max_iterations,
                     max_runtime_seconds=req.max_runtime_seconds,
                     max_consecutive_failures=req.max_consecutive_failures,

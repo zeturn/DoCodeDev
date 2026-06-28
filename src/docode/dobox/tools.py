@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import posixpath
+import difflib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -90,6 +91,13 @@ class DoBoxTools:
             ToolDefinition("run_command", "Run a shell command inside the project sandbox.", {"command": "string", "cwd": "string"}, self.run_command),
             ToolDefinition("read_file", "Read a file under /workspace.", {"path": "string"}, self.read_file),
             ToolDefinition("write_file", "Write a file under /workspace.", {"path": "string", "content": "string"}, self.write_file),
+            ToolDefinition(
+                "edit_file",
+                "Replace exact text in an existing file under /workspace and return a diff preview.",
+                {"path": "string", "old_text": "string", "new_text": "string", "expected_occurrences": "integer"},
+                self.edit_file,
+            ),
+            ToolDefinition("apply_patch", "Apply a unified diff patch in the workspace and return a diff preview.", {"patch": "string"}, self.apply_patch),
             ToolDefinition("list_files", "List files under a workspace path.", {"path": "string"}, self.list_files),
             ToolDefinition("search", "Search project files for text.", {"query": "string", "path": "string"}, self.search),
             ToolDefinition("git_status", "Return git porcelain status.", {}, self.git_status),
@@ -144,6 +152,62 @@ class DoBoxTools:
             return rejected_tool_result("write_file", path_error, {"path": path})
         await self.client.write_file(self.project_id, path, content, agent_session_id=self.agent_session_id)
         return ToolResult(tool="write_file", output=f"wrote {len(content.encode('utf-8'))} bytes", metadata={"path": path})
+
+    async def edit_file(self, path: str, old_text: str, new_text: str, expected_occurrences: int = 1) -> ToolResult:
+        path_error = workspace_path_error(path)
+        if path_error:
+            return rejected_tool_result("edit_file", path_error, {"path": path})
+        if not isinstance(old_text, str) or old_text == "":
+            return ToolResult(tool="edit_file", output="old_text must be a non-empty string", exit_code=2, metadata={"path": path})
+        expected = int_or_default(expected_occurrences, 1)
+        if expected < 1:
+            return ToolResult(tool="edit_file", output="expected_occurrences must be at least 1", exit_code=2, metadata={"path": path})
+
+        file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+        original = file_result.content if isinstance(file_result, FileResult) else str(file_result)
+        occurrences = original.count(old_text)
+        metadata = {"path": path, "expected_occurrences": expected, "occurrences": occurrences}
+        if occurrences == 0:
+            return ToolResult(
+                tool="edit_file",
+                output="old_text did not match exactly.\n\nSimilar context:\n" + similar_context(original, old_text),
+                exit_code=1,
+                metadata=metadata,
+            )
+        if occurrences != expected:
+            return ToolResult(
+                tool="edit_file",
+                output=f"old_text matched {occurrences} times; expected {expected}. Provide a more specific old_text.",
+                exit_code=1,
+                metadata=metadata,
+            )
+
+        updated = original.replace(old_text, new_text, expected)
+        await self.client.write_file(self.project_id, path, updated, agent_session_id=self.agent_session_id)
+        preview = unified_diff_preview(path, original, updated)
+        return self._compress("edit_file", preview or "file edited; no diff preview", 0, metadata)
+
+    async def apply_patch(self, patch: str) -> ToolResult:
+        if not isinstance(patch, str) or not patch.strip():
+            return ToolResult(tool="apply_patch", output="patch must be a non-empty unified diff string", exit_code=2)
+        patch_path = ".docode_apply_patch.diff"
+        await self.client.write_file(self.project_id, patch_path, patch, agent_session_id=self.agent_session_id)
+        command = (
+            f"git apply --check {patch_path} && "
+            f"git apply {patch_path} && "
+            f"rm -f {patch_path} && "
+            "git diff --stat && git diff -- "
+        )
+        result = await self.run_command(command, "/workspace")
+        if result.exit_code != 0:
+            await self.run_command(f"rm -f {patch_path}", "/workspace")
+        return ToolResult(
+            tool="apply_patch",
+            output=result.output,
+            exit_code=result.exit_code,
+            metadata={"patch_bytes": len(patch.encode("utf-8"))},
+            truncated=result.truncated,
+        )
 
     async def list_files(self, path: str = ".") -> ToolResult:
         path_error = workspace_path_error(path)
@@ -350,6 +414,51 @@ def filter_handler_args(handler: ToolCallable, args: dict[str, Any]) -> dict[str
     if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
         return args
     return {key: value for key, value in args.items() if key in signature.parameters}
+
+
+def unified_diff_preview(path: str, before: str, after: str, *, max_bytes: int = 80_000) -> str:
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+    encoded = diff.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return diff
+    return encoded[:max_bytes].decode("utf-8", errors="replace") + "\n<truncated>"
+
+
+def similar_context(content: str, needle: str, *, context_lines: int = 3) -> str:
+    target = first_meaningful_line(needle)
+    lines = content.splitlines()
+    if not lines:
+        return "<empty file>"
+    if target:
+        close = difflib.get_close_matches(target, lines, n=1, cutoff=0.35)
+        if close:
+            index = lines.index(close[0])
+            start = max(0, index - context_lines)
+            end = min(len(lines), index + context_lines + 1)
+            return "\n".join(f"{line_no + 1}: {lines[line_no]}" for line_no in range(start, end))
+    return "\n".join(f"{line_no + 1}: {line}" for line_no, line in enumerate(lines[: context_lines * 2 + 1]))
+
+
+def first_meaningful_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return text.strip()
+
+
+def int_or_default(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def try_create_weav_tool_registry() -> Any | None:

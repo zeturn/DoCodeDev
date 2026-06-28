@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from docode.defaults import DEFAULT_MODEL, DEFAULT_PROVIDER
 from docode.sandbox import DEFAULT_SANDBOX_NETWORK_MODE, normalize_sandbox_network_mode
 
 
@@ -25,8 +26,8 @@ class DocodeConfig:
     basaltpass_apicred_scope: str = "llm apicred.read"
     database_path: str = ".docode/docode.db"
     artifact_dir: Path = Path(".docode_artifacts")
-    default_provider: str = "openai"
-    default_model: str = "gpt-5.4"
+    default_provider: str = DEFAULT_PROVIDER
+    default_model: str = DEFAULT_MODEL
     max_iterations: int = 50
     max_runtime_seconds: int = 1800
     max_tool_calls: int = 100
@@ -68,8 +69,8 @@ def load_config() -> DocodeConfig:
         basaltpass_apicred_scope=os.getenv("BASALTPASS_APICRED_SCOPE", "llm apicred.read"),
         database_path=os.getenv("DOCODE_DATABASE_PATH", ".docode/docode.db"),
         artifact_dir=Path(os.getenv("DOCODE_ARTIFACT_DIR", ".docode_artifacts")),
-        default_provider=os.getenv("DOCODE_DEFAULT_PROVIDER", "openai"),
-        default_model=os.getenv("DOCODE_DEFAULT_MODEL", "gpt-5.4"),
+        default_provider=os.getenv("DOCODE_DEFAULT_PROVIDER", DEFAULT_PROVIDER),
+        default_model=os.getenv("DOCODE_DEFAULT_MODEL", DEFAULT_MODEL),
         max_iterations=int(os.getenv("DOCODE_MAX_ITERATIONS", "50")),
         max_runtime_seconds=int(os.getenv("DOCODE_MAX_RUNTIME_SECONDS", "1800")),
         max_tool_calls=int(os.getenv("DOCODE_MAX_TOOL_CALLS", "100")),

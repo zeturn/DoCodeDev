@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from docode.agent.context import ContextManager, ContextPack
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.state import AgentState
@@ -26,6 +27,7 @@ class CodingAgentLoop:
         exporter: ArtifactExporter,
         stop_policy: StopPolicy,
         inspector: ProjectInspector | None = None,
+        context_manager: ContextManager | None = None,
         usage_meter: LLMUsageMeter | None = None,
     ) -> None:
         self.llm = llm
@@ -35,6 +37,7 @@ class CodingAgentLoop:
         self.exporter = exporter
         self.stop_policy = stop_policy
         self.inspector = inspector or ProjectInspector()
+        self.context_manager = context_manager or ContextManager()
         self.usage_meter = usage_meter
 
     async def run(self, job: CodingJob) -> CodingJob:
@@ -52,8 +55,9 @@ class CodingAgentLoop:
             if stop.should_stop:
                 return await self.fail(job.id, stop.reason or "stopped")
 
-            observation = await self.collect_observation(state)
-            await self.repository.add_step(job.id, "system", {"type": "observation", "content": observation})
+            context_pack = await self.collect_observation(state)
+            observation = context_pack.render()
+            await self.repository.add_step(job.id, "system", observation_step(context_pack))
             try:
                 decision = await self.llm.decide(
                     system=DOCODE_SYSTEM_PROMPT,
@@ -189,14 +193,17 @@ class CodingAgentLoop:
             },
         )
 
-    async def collect_observation(self, state: AgentState) -> str:
+    async def collect_observation(self, state: AgentState) -> ContextPack:
         status = await self.tools.git_status()
-        inspection = state.inspection.summary() if state.inspection else "Project inspection unavailable."
-        return (
-            f"Instruction: {state.job.instruction}\n"
-            f"{inspection}\n"
-            f"Git status:\n{status.output}\n"
-            f"Recent messages: {len(state.messages)}"
+        return self.context_manager.build_pack(
+            job=state.job,
+            inspection=state.inspection,
+            messages=state.messages,
+            git_status=status,
+            iteration=state.iteration,
+            tool_calls_count=state.tool_calls_count,
+            llm_tokens_used=state.llm_tokens_used,
+            llm_cost_used=state.llm_cost_used,
         )
 
     async def fail(self, job_id: str, reason: str) -> CodingJob:
@@ -290,6 +297,29 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
         }
         if result.llm_judgement
         else None,
+        "verification_plan": {
+            "required_commands": result.verification_plan.required_commands,
+            "smoke_commands": result.verification_plan.smoke_commands,
+            "require_test_change": result.verification_plan.require_test_change,
+            "require_entrypoint_run": result.verification_plan.require_entrypoint_run,
+            "require_no_placeholder": result.verification_plan.require_no_placeholder,
+            "require_external_source_verified": result.verification_plan.require_external_source_verified,
+        }
+        if result.verification_plan
+        else None,
+    }
+
+
+def observation_step(context_pack: ContextPack) -> dict[str, object]:
+    return {
+        "type": "observation",
+        "content": context_pack.render(),
+        "task_contract": context_pack.task_contract,
+        "repo_map": context_pack.repo_map,
+        "working_memory": context_pack.working_memory,
+        "file_memory": context_pack.file_memory,
+        "latest_evidence": context_pack.latest_evidence,
+        "recent_messages": context_pack.recent_messages,
     }
 
 
