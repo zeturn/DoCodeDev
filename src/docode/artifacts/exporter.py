@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import tarfile
+from io import BytesIO
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from docode.agent.verifier import VerificationResult
+from docode.agent.verifier import VerificationResult, changed_paths_from_status
 from docode.artifacts.github import GitHubExportRequest, GitHubExporter
 from docode.artifacts.patch import changed_files_from_diff
 from docode.artifacts.zip import zip_files
@@ -21,18 +23,45 @@ def terminal_artifact_id(artifacts: list[DocodeArtifact]) -> str | None:
     return artifacts[0].id if artifacts else None
 
 
+def archive_candidate_paths(verification: VerificationResult) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for path in [*changed_files_from_diff(verification.git_diff), *changed_paths_from_status(verification.git_status)]:
+        normalized = path.strip().replace("\\", "/")
+        if not normalized or normalized.startswith(("/", "../")) or "/../" in f"/{normalized}/":
+            continue
+        if should_skip_archive_path(normalized):
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            selected.append(normalized)
+    return selected
+
+
+def should_skip_archive_path(path: str) -> bool:
+    parts = path.split("/")
+    return (
+        ".git" in parts
+        or "__pycache__" in parts
+        or path.endswith((".pyc", ".pyo"))
+        or path.startswith(".araneae/sink/")
+    )
+
+
 class ArtifactExporter:
     def __init__(
         self,
         artifact_dir: Path,
         repository: JobRepository,
         workspace_archive_provider: Callable[[], Awaitable[bytes]] | None = None,
+        workspace_file_reader: Callable[[str], Awaitable[str | bytes | object]] | None = None,
         commit_provider: Callable[[str], Awaitable[CommandResult]] | None = None,
         github_exporter: GitHubExporter | None = None,
     ) -> None:
         self.artifact_dir = artifact_dir
         self.repository = repository
         self.workspace_archive_provider = workspace_archive_provider
+        self.workspace_file_reader = workspace_file_reader
         self.commit_provider = commit_provider
         self.github_exporter = github_exporter
 
@@ -89,7 +118,7 @@ class ArtifactExporter:
             has_pull_request = True
 
         has_archive = False
-        archive = await self._workspace_archive()
+        archive = await self._workspace_archive(job, verification=verification)
         if archive:
             archive_path = job_dir / "workspace.tar"
             archive_path.write_bytes(archive)
@@ -153,7 +182,7 @@ class ArtifactExporter:
             artifacts.append(await self.repository.add_artifact(job.id, "log", str(log_path), log_path.stat().st_size))
 
         has_archive = False
-        archive = await self._workspace_archive()
+        archive = await self._workspace_archive(job)
         if archive:
             archive_path = job_dir / "workspace.tar"
             archive_path.write_bytes(archive)
@@ -214,7 +243,7 @@ class ArtifactExporter:
             artifacts.append(await self.repository.add_artifact(job.id, "log", str(log_path), log_path.stat().st_size))
 
         has_archive = False
-        archive = await self._workspace_archive()
+        archive = await self._workspace_archive(job)
         if archive:
             archive_path = job_dir / "workspace.tar"
             archive_path.write_bytes(archive)
@@ -282,13 +311,62 @@ class ArtifactExporter:
             f"\n{result.output}"
         )
 
-    async def _workspace_archive(self) -> bytes | None:
+    async def _workspace_archive(self, job: CodingJob, verification: VerificationResult | None = None) -> bytes | None:
+        provider_error: str | None = None
         if self.workspace_archive_provider is None:
-            return None
+            return await self._fallback_workspace_archive(job, verification, provider_error)
         try:
             return await self.workspace_archive_provider()
-        except Exception:
+        except Exception as exc:
+            provider_error = str(exc)
+            await self.repository.add_step(
+                job.id,
+                "system",
+                {"type": "workspace_archive_provider_failed", "error": provider_error},
+            )
+            return await self._fallback_workspace_archive(job, verification, provider_error)
+
+    async def _fallback_workspace_archive(
+        self,
+        job: CodingJob,
+        verification: VerificationResult | None,
+        provider_error: str | None,
+    ) -> bytes | None:
+        if self.workspace_file_reader is None or verification is None:
             return None
+        paths = archive_candidate_paths(verification)
+        if not paths:
+            return None
+
+        buffer = BytesIO()
+        added = 0
+        failed: dict[str, str] = {}
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            for path in paths:
+                try:
+                    raw = await self.workspace_file_reader(path)
+                    content = getattr(raw, "content", raw)
+                    data = content if isinstance(content, bytes) else str(content).encode("utf-8")
+                except Exception as exc:
+                    failed[path] = str(exc)
+                    continue
+                info = tarfile.TarInfo(path)
+                info.size = len(data)
+                archive.addfile(info, BytesIO(data))
+                added += 1
+        if added == 0:
+            return None
+        await self.repository.add_step(
+            job.id,
+            "system",
+            {
+                "type": "workspace_archive_fallback_built",
+                "file_count": added,
+                "failed_files": failed,
+                "provider_error": provider_error,
+            },
+        )
+        return buffer.getvalue()
 
     def _render_report(self, job: CodingJob, verification: VerificationResult, summary: str) -> str:
         checks = "\n".join(f"- {line}" for line in self._verification_status_lines(verification)) or "- not run"

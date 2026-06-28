@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tarfile
 from zipfile import ZipFile
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -106,6 +107,17 @@ class TruncatedDiffDoBoxClient(StatefulFakeDoBoxClient):
     async def git_diff_result(self, project_id: str, agent_session_id: str | None = None) -> CommandResult:
         diff = await self.git_diff(project_id, agent_session_id=agent_session_id)
         return CommandResult(diff, 0, truncated=True)
+
+
+class FailingArchiveDoBoxClient(StatefulFakeDoBoxClient):
+    async def archive_workspace(self, project_id: str, agent_session_id: str | None = None) -> bytes:
+        self.agent_session_ids.append(agent_session_id)
+        raise RuntimeError("archive endpoint unavailable")
+
+    async def git_status(self, project_id: str, agent_session_id: str | None = None) -> CommandResult:
+        self.agent_session_ids.append(agent_session_id)
+        lines = [f" A {path}" for path in sorted(self.files) if path != "README.md"]
+        return CommandResult("\n".join(lines) + ("\n" if lines else ""), 0)
 
 
 class SlowCreateDoBoxClient(StatefulFakeDoBoxClient):
@@ -310,6 +322,113 @@ class RunnerE2ETests(IsolatedAsyncioTestCase):
             cleanup_step = next(step for step in steps if step.content.get("type") == "sandbox_cleanup")
             self.assertEqual(cleanup_step.content["status"], "kept")
             self.assertNotIn("secret-token", repr(completed))
+
+    async def test_runner_falls_back_to_file_reads_when_workspace_archive_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            config = DocodeConfig(artifact_dir=Path(tmp))
+            fake_dobox = FailingArchiveDoBoxClient()
+            fake_dobox.files["fixtures/sample.html"] = "<html></html>\n"
+            fake_dobox.files["tests/test_parser.py"] = "import unittest\n"
+            fake_apicred = FakeCredentialResolver()
+            runner = JobRunnerService(
+                config=config,
+                repository=repo,
+                dobox_client_factory=lambda: fake_dobox,
+                credential_resolver_factory=lambda: fake_apicred,
+            )
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="user-1",
+                    instruction="create a result file",
+                    provider="scripted",
+                    model="scripted",
+                    apicred_access_token="bp_xat_runner",
+                    max_iterations=5,
+                    max_tool_calls=10,
+                )
+            )
+
+            await runner.run_job(job.id)
+
+            completed = await repo.get_job(job.id)
+            assert completed is not None
+            self.assertEqual(completed.status, JobStatus.SUCCEEDED)
+            artifacts = await repo.list_artifacts(job.id)
+            self.assertIn("archive", {artifact.kind for artifact in artifacts})
+            tar_path = Path(tmp) / job.id / "workspace.tar"
+            self.assertTrue(tar_path.exists())
+            with tarfile.open(tar_path) as archive:
+                member = archive.extractfile("DOCODE_RESULT.md")
+                assert member is not None
+                self.assertIn("scripted development agent", member.read().decode("utf-8"))
+                self.assertIsNotNone(archive.extractfile("fixtures/sample.html"))
+                self.assertIsNotNone(archive.extractfile("tests/test_parser.py"))
+            with ZipFile(Path(tmp) / job.id / "workspace.zip") as archive:
+                self.assertIn("workspace.tar", archive.namelist())
+            steps = await repo.list_steps(job.id)
+            self.assertTrue(any(step.content.get("type") == "workspace_archive_provider_failed" for step in steps))
+            self.assertTrue(any(step.content.get("type") == "workspace_archive_fallback_built" for step in steps))
+
+    async def test_runner_exchanges_inbound_docode_token_for_apicred_token(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            config = DocodeConfig(
+                artifact_dir=Path(tmp),
+                basaltpass_enabled=True,
+                basaltpass_base_url="http://basalt.local",
+                basaltpass_client_id="docode-client",
+                basaltpass_client_secret="docode-secret",
+                basaltpass_apicred_resource="APICred",
+                basaltpass_apicred_scope="llm apicred.read",
+            )
+            fake_dobox = StatefulFakeDoBoxClient()
+            fake_apicred = FakeCredentialResolver()
+            exchanges = []
+
+            class FakeExchangeClient:
+                def __init__(self, base_url, client_id, client_secret):
+                    exchanges.append({"base_url": base_url, "client_id": client_id, "client_secret": client_secret})
+
+                async def exchange(self, *, subject_token, resource, scope):
+                    exchanges.append({"subject_token": subject_token, "resource": resource, "scope": scope})
+                    return "bp_xat_apicred"
+
+            from docode.worker import runner as runner_module
+
+            original_exchange = runner_module.BasaltPassTokenExchangeClient
+            runner_module.BasaltPassTokenExchangeClient = FakeExchangeClient
+            try:
+                runner = JobRunnerService(
+                    config=config,
+                    repository=repo,
+                    dobox_client_factory=lambda: fake_dobox,
+                    credential_resolver_factory=lambda: fake_apicred,
+                )
+                job = await repo.create_job(
+                    CodingJob(
+                        id=new_id("job"),
+                        user_id="user-1",
+                        instruction="create a result file",
+                        provider="scripted",
+                        model="scripted",
+                        apicred_access_token="bp_xat_docode",
+                        max_iterations=5,
+                        max_tool_calls=10,
+                    )
+                )
+
+                await runner.run_job(job.id)
+            finally:
+                runner_module.BasaltPassTokenExchangeClient = original_exchange
+
+            self.assertEqual(fake_apicred.access_token, "bp_xat_apicred")
+            self.assertEqual(exchanges[0]["client_id"], "docode-client")
+            self.assertEqual(exchanges[1], {"subject_token": "bp_xat_docode", "resource": "APICred", "scope": "llm apicred.read"})
+            steps = await repo.list_steps(job.id)
+            exchange_step = next(step for step in steps if step.content.get("type") == "basaltpass_token_exchange")
+            self.assertEqual(exchange_step.content["status"], "exchanged")
 
     async def test_runner_keeps_success_when_usage_report_fails(self) -> None:
         with TemporaryDirectory() as tmp:

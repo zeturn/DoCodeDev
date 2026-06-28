@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from docode.agent.loop import CodingAgentLoop
@@ -11,6 +12,7 @@ from docode.artifacts.github import GitHubExporter
 from docode.config import DocodeConfig
 from docode.dobox.client import DoBoxClient
 from docode.dobox.tools import DoBoxTools
+from docode.integrations.basaltpass import BasaltPassTokenExchangeClient
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.runtime import WeavVerifierJudge, build_docode_runtime
 from docode.storage.models import JobStatus
@@ -58,7 +60,7 @@ class JobRunnerService:
             return
         try:
             resolver = self.credential_resolver_factory()
-            resolver.use_access_token(job.apicred_access_token)
+            resolver.use_access_token(await self.apicred_token_for_job(job))
             try:
                 authorization = await resolver.authorize(
                     user_id=job.user_id,
@@ -171,7 +173,8 @@ class JobRunnerService:
                 exporter=ArtifactExporter(
                     self.config.artifact_dir,
                     self.repository,
-                    workspace_archive_provider=lambda: dobox.archive_workspace(project.project_id, agent_session_id=session.session_id),
+                    workspace_archive_provider=lambda: self.workspace_archive_for_export(dobox, project.project_id, session.session_id),
+                    workspace_file_reader=lambda path: dobox.read_file(project.project_id, path, agent_session_id=session.session_id),
                     commit_provider=lambda message: dobox.git_commit(project.project_id, message, agent_session_id=session.session_id),
                     github_exporter=GitHubExporter(enabled=self.config.github_export_enabled, work_dir=self.config.github_work_dir),
                 ),
@@ -196,6 +199,35 @@ class JobRunnerService:
                 failed = await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=str(exc), artifact_id=artifact_id)
                 if "dobox" in locals():
                     await self.cleanup_sandbox_if_needed(dobox, failed)
+
+    async def apicred_token_for_job(self, job) -> str | None:
+        token = job.apicred_access_token
+        if not self.config.basaltpass_enabled:
+            return token
+        exchanger = BasaltPassTokenExchangeClient(
+            self.config.basaltpass_base_url,
+            self.config.basaltpass_client_id,
+            self.config.basaltpass_client_secret,
+        )
+        exchanged = await exchanger.exchange(
+            subject_token=token,
+            resource=self.config.basaltpass_apicred_resource,
+            scope=self.config.basaltpass_apicred_scope,
+        )
+        await self.repository.add_step(
+            job.id,
+            "system",
+            {
+                "type": "basaltpass_token_exchange",
+                "resource": self.config.basaltpass_apicred_resource,
+                "scope": self.config.basaltpass_apicred_scope,
+                "status": "exchanged" if exchanged else "skipped",
+            },
+        )
+        return exchanged or token
+
+    async def workspace_archive_for_export(self, dobox: DoBoxClient, project_id: str, agent_session_id: str | None) -> bytes:
+        return await asyncio.wait_for(dobox.archive_workspace(project_id, agent_session_id=agent_session_id), timeout=8)
 
     async def _is_stopped(self, job_id: str) -> bool:
         current = await self.repository.get_job(job_id)

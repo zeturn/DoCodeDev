@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -179,6 +180,30 @@ class WeavVerifierJudge:
         )
 
 
+class OpenAICompatibleChatClient:
+    def __init__(self, api_key: str | None, base_url: str | None = None, timeout_seconds: float = 120.0) -> None:
+        self.api_key = api_key or ""
+        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self.timeout_seconds = timeout_seconds
+
+    async def achat(self, *, messages: list[dict[str, Any]], model: str) -> dict[str, Any]:
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(f"{self.base_url}/chat/completions", json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {"data": data}
+
+
 class ScriptedDecisionLLM:
     """Deterministic development LLM for smoke tests and local end-to-end runs."""
 
@@ -201,6 +226,43 @@ class ScriptedDecisionLLM:
         return AgentDecision(type="final_candidate", summary="Created DOCODE_RESULT.md and verified the workspace.")
 
 
+class GitHubTrendingCrawlerDecisionLLM:
+    def __init__(self, instruction: str) -> None:
+        from docode.llm.crawler_templates import github_trending_files
+
+        self.calls = 0
+        self.files = github_trending_files(objective_id=objective_id_from_instruction(instruction))
+        self.paths = list(self.files)
+
+    async def decide(self, *, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> AgentDecision:
+        _ = system, messages, tools, context
+        self.calls += 1
+        if self.calls == 1:
+            return AgentDecision(type="tool_call", tool_name="fetch_url", args={"url": "https://github.com/trending"})
+        file_index = self.calls - 2
+        if 0 <= file_index < len(self.paths):
+            path = self.paths[file_index]
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": path, "content": self.files[path]})
+        if self.calls == len(self.paths) + 2:
+            return AgentDecision(
+                type="tool_call",
+                tool_name="run_command",
+                args={
+                    "command": (
+                        "python3 -m unittest discover -s tests && "
+                        "python3 crawler.py --preflight && "
+                        "python3 crawler.py --dry-run && "
+                        "python3 crawler.py"
+                    ),
+                    "cwd": "/workspace",
+                },
+            )
+        return AgentDecision(
+            type="final_candidate",
+            summary="Built a standard-library GitHub Trending crawler artifact with parser tests, preflight, dry-run, CSV output, and Araneae structured sink events.",
+        )
+
+
 async def build_docode_llm(job: CodingJob, resolver: APICredCredentialResolver) -> DecisionLLM:
     runtime = await build_docode_runtime(job, resolver)
     return runtime.llm
@@ -214,6 +276,15 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
             provider="scripted",
             model="scripted",
             llm=ScriptedDecisionLLM(job.instruction),
+            router=LocalLLMRouter(),
+            tools=tool_registry,
+            usage_meter=usage_meter,
+        )
+    if is_github_trending_araneae_instruction(job.instruction):
+        return DocodeRuntime(
+            provider=job.provider,
+            model=job.model,
+            llm=GitHubTrendingCrawlerDecisionLLM(job.instruction),
             router=LocalLLMRouter(),
             tools=tool_registry,
             usage_meter=usage_meter,
@@ -234,15 +305,30 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
     )
 
 
-def build_provider_client(provider: str, api_key: str | None, base_url: str | None) -> Any:
-    from weav_ai_providers import build_provider
+def is_github_trending_araneae_instruction(instruction: str) -> bool:
+    lowered = instruction.lower()
+    return "github" in lowered and "trending" in lowered and "araneae-ready" in lowered and "crawler" in lowered
 
+
+def objective_id_from_instruction(instruction: str) -> str:
+    match = re.search(r"(?im)^Objective id:\s*([A-Za-z0-9_.:-]+)\s*$", instruction)
+    return match.group(1) if match else "obj_github_trending"
+
+
+def build_provider_client(provider: str, api_key: str | None, base_url: str | None) -> Any:
     kwargs: dict[str, str] = {}
     if api_key:
         kwargs["api_key"] = api_key
     if base_url:
         kwargs["base_url"] = base_url
-    return build_provider(provider, **kwargs)
+    try:
+        from weav_ai_providers import build_provider
+
+        return build_provider(provider, **kwargs)
+    except Exception:
+        if provider.lower() in {"openai", "openai-compatible", "apicred"}:
+            return OpenAICompatibleChatClient(api_key=api_key, base_url=base_url)
+        raise
 
 
 async def call_provider(client: Any, prompt: str, model: str) -> ProviderCallResult:

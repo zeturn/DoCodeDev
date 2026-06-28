@@ -54,6 +54,7 @@ class CodingVerifier:
         self.judge = judge
 
     async def verify(self, job: CodingJob, tools: DoBoxTools) -> VerificationResult:
+        await prepare_workspace_for_diff(tools)
         status_result = await safe_tool_call("git_status", tools.git_status)
         diff_result = await safe_tool_call("git_diff", tools.git_diff)
         test_result = await safe_tool_call("run_tests", tools.run_tests)
@@ -198,6 +199,22 @@ class CodingVerifier:
             )
 
 
+async def prepare_workspace_for_diff(tools: DoBoxTools) -> None:
+    await safe_optional_tool_call(
+        "run_command",
+        tools,
+        (
+            "if command -v git >/dev/null 2>&1; then "
+            "if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then "
+            "git init >/dev/null && git config user.email docode@example.test && git config user.name DoCode; "
+            "fi; "
+            "git add -N . >/dev/null 2>&1 || true; "
+            "fi"
+        ),
+        "/workspace",
+    )
+
+
 async def safe_tool_call(tool_name: str, call) -> ToolResult:
     try:
         return await call()
@@ -238,14 +255,14 @@ async def run_smoke_verification(
     commands: list[str] = []
     python_files = [path for path in changed_files if path.endswith(".py")]
     if python_files:
-        commands.append("python -m py_compile " + " ".join(shlex.quote(path) for path in python_files))
+        commands.append("python3 -m py_compile " + " ".join(shlex.quote(path) for path in python_files))
         runnable = runnable_python_files(job.instruction, python_files)
         if runnable:
-            commands.extend("python " + shlex.quote(path) for path in runnable[:1])
+            commands.extend("python3 " + shlex.quote(path) for path in runnable[:1])
             if requires_csv_output_check(job.instruction):
-                commands.append("python -c " + double_quote_shell_arg(csv_output_check_script()))
+                commands.append("python3 -c " + double_quote_shell_arg(csv_output_check_script()))
             elif requires_json_output_check(job.instruction):
-                commands.append("python -c " + double_quote_shell_arg(json_output_check_script(minimum_required_records(job.instruction))))
+                commands.append("python3 -c " + double_quote_shell_arg(json_output_check_script(minimum_required_records(job.instruction))))
 
     javascript_files = [path for path in changed_files if path.endswith((".js", ".mjs", ".cjs"))]
     for path in javascript_files:
@@ -253,7 +270,7 @@ async def run_smoke_verification(
 
     json_files = [path for path in changed_files if path.endswith(".json")]
     for path in json_files:
-        commands.append(f"python -m json.tool {shlex.quote(path)} >/dev/null")
+        commands.append(f"python3 -m json.tool {shlex.quote(path)} >/dev/null")
 
     if not commands:
         if not has_code_like_changes(changed_files):
@@ -291,23 +308,53 @@ def changed_files_from_diff(diff: str) -> list[str]:
 
 
 def has_untracked_workspace_files(status: str) -> bool:
-    return any(line.startswith("?? ") and line[3:].strip() for line in status.splitlines())
+    return bool(changed_paths_from_status(status))
 
 
 def synthetic_diff_from_status(status: str, workspace_result: ToolResult | None) -> str:
-    if workspace_result is None or workspace_result.exit_code != 0:
-        return ""
-    workspace_files = {line.strip().rstrip("/") for line in workspace_result.output.splitlines() if line.strip() and not line.strip().endswith("/")}
     files = []
-    for line in status.splitlines():
-        if not line.startswith("?? "):
-            continue
-        path = line[3:].strip()
-        if path in workspace_files:
+    workspace_files = workspace_file_names(workspace_result.output) if workspace_result is not None and workspace_result.exit_code == 0 else set()
+    for path in changed_paths_from_status(status):
+        if not workspace_files or path in workspace_files:
             files.append(path)
     if not files:
         return ""
     return "\n".join(f"diff --git a/{path} b/{path}\nnew file mode 100644" for path in files) + "\n"
+
+
+def changed_paths_from_status(status: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in status.splitlines():
+        line = strip_ansi(raw_line).rstrip()
+        if len(line) < 4:
+            continue
+        marker = line[:2]
+        path = line[3:].strip()
+        if not path:
+            continue
+        if marker == "??" or marker.strip():
+            paths.append(path)
+    return paths
+
+
+def workspace_file_names(listing: str) -> set[str]:
+    files: set[str] = set()
+    for raw_line in listing.splitlines():
+        line = strip_ansi(raw_line).strip().rstrip("/")
+        if not line or line.startswith("total "):
+            continue
+        parts = line.split()
+        name = parts[-1] if len(parts) >= 9 else line
+        if name not in {".", ".."}:
+            files.add(name)
+    return files
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(value: str) -> str:
+    return ANSI_RE.sub("", value)
 
 
 def runnable_python_files(instruction: str, python_files: list[str]) -> list[str]:

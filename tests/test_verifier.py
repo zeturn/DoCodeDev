@@ -183,7 +183,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.passed)
         self.assertIn("diff --git a/crawler.py b/crawler.py", result.git_diff)
         self.assertIsNotNone(result.workspace_result)
-        self.assertIn("python -m py_compile crawler.py", tools.command)
+        self.assertIn("python3 -m py_compile crawler.py", tools.command)
 
     async def test_verifier_converts_tool_exception_to_failed_check(self) -> None:
         result = await CodingVerifier().verify(
@@ -221,9 +221,9 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIn("fix failing smoke verification command", result.required_fixes)
         self.assertIsNotNone(result.smoke_result)
         self.assertEqual(result.smoke_result.exit_code, 1)
-        self.assertEqual(len(tools.commands), 1)
-        self.assertIn("python -m py_compile crawler.py", tools.commands[0])
-        self.assertIn("python crawler.py", tools.commands[0])
+        self.assertGreaterEqual(len(tools.commands), 1)
+        self.assertIn("python3 -m py_compile crawler.py", tools.commands[-1])
+        self.assertIn("python3 crawler.py", tools.commands[-1])
 
     async def test_python_smoke_success_allows_no_detected_standard_commands(self) -> None:
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)
@@ -236,7 +236,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.passed)
         self.assertIsNotNone(result.smoke_result)
         self.assertEqual(result.smoke_result.exit_code, 0)
-        self.assertIn("python crawler.py", result.smoke_result.metadata["command"])
+        self.assertIn("python3 crawler.py", result.smoke_result.metadata["command"])
 
     async def test_python_crawler_smoke_checks_for_csv_output(self) -> None:
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)

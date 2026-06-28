@@ -17,6 +17,12 @@ class DocodeConfig:
     apicred_token: str = ""
     apicred_mode: str = "auto"
     auth_required: bool = False
+    basaltpass_enabled: bool = False
+    basaltpass_base_url: str = "http://localhost:8101"
+    basaltpass_client_id: str = ""
+    basaltpass_client_secret: str = ""
+    basaltpass_apicred_resource: str = "APICred"
+    basaltpass_apicred_scope: str = "llm apicred.read"
     database_path: str = ".docode/docode.db"
     artifact_dir: Path = Path(".docode_artifacts")
     default_provider: str = "openai"
@@ -54,6 +60,12 @@ def load_config() -> DocodeConfig:
         apicred_token=os.getenv("DOCODE_APICRED_TOKEN", ""),
         apicred_mode=normalize_apicred_mode(os.getenv("DOCODE_APICRED_MODE", "auto")),
         auth_required=os.getenv("DOCODE_AUTH_REQUIRED", "").lower() in {"1", "true", "yes", "on"},
+        basaltpass_enabled=os.getenv("DOCODE_BASALTPASS_ENABLED", "").lower() in {"1", "true", "yes", "on"},
+        basaltpass_base_url=os.getenv("BASALTPASS_BASE_URL", "http://localhost:8101"),
+        basaltpass_client_id=os.getenv("BASALTPASS_OAUTH_CLIENT_ID", ""),
+        basaltpass_client_secret=os.getenv("BASALTPASS_OAUTH_CLIENT_SECRET", ""),
+        basaltpass_apicred_resource=os.getenv("BASALTPASS_APICRED_RESOURCE", "APICred"),
+        basaltpass_apicred_scope=os.getenv("BASALTPASS_APICRED_SCOPE", "llm apicred.read"),
         database_path=os.getenv("DOCODE_DATABASE_PATH", ".docode/docode.db"),
         artifact_dir=Path(os.getenv("DOCODE_ARTIFACT_DIR", ".docode_artifacts")),
         default_provider=os.getenv("DOCODE_DEFAULT_PROVIDER", "openai"),

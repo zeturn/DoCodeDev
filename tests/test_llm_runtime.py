@@ -11,12 +11,15 @@ from docode.llm.credentials import ProviderCredential
 from docode.llm.runtime import (
     LLMUsageMeter,
     LocalLLMRouter,
+    OpenAICompatibleChatClient,
     ProviderCallResult,
+    GitHubTrendingCrawlerDecisionLLM,
     ScriptedDecisionLLM,
     WeavDecisionLLM,
     WeavVerifierJudge,
     build_docode_llm,
     build_docode_runtime,
+    build_provider_client,
     estimate_tokens,
     parse_verifier_judgement,
     provider_call_result,
@@ -66,6 +69,14 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(runtime.tools.get("fetch_url"))
         self.assertNotIn("secret-key", repr(runtime))
 
+    async def test_openai_provider_falls_back_without_weav_package(self) -> None:
+        sys.modules.pop("weav_ai_providers", None)
+
+        client = build_provider_client("openai", "secret-key", "https://llm.example/v1")
+
+        self.assertIsInstance(client, OpenAICompatibleChatClient)
+        self.assertEqual(client.base_url, "https://llm.example/v1")
+
     async def test_scripted_runtime_does_not_resolve_credentials(self) -> None:
         resolver = RuntimeResolver()
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="script it", provider="scripted", model="scripted")
@@ -77,6 +88,13 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertIsInstance(runtime.llm, ScriptedDecisionLLM)
         self.assertIsInstance(llm, ScriptedDecisionLLM)
         self.assertEqual(resolver.resolve_calls, 0)
+
+    async def test_github_trending_template_uses_objective_id_from_instruction(self) -> None:
+        llm = GitHubTrendingCrawlerDecisionLLM(
+            "Build crawler\nObjective id: obj_github_trending_abc123\nTarget: GitHub Trending"
+        )
+
+        self.assertIn('OBJECTIVE_ID = "obj_github_trending_abc123"', llm.files["crawler.py"])
 
     async def test_weav_verifier_judge_parses_structured_judgement(self) -> None:
         class Provider:

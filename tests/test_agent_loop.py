@@ -174,14 +174,14 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
                     tool="run_smoke",
                     output="SyntaxError: f-string: unmatched '('",
                     exit_code=1,
-                    metadata={"command": "python -m py_compile scraper.py && python scraper.py"},
+                    metadata={"command": "python3 -m py_compile scraper.py && python scraper.py"},
                 ),
             )
         )
 
         self.assertIn("Required fixes:", feedback)
         self.assertIn("Smoke command:", feedback)
-        self.assertIn("python -m py_compile scraper.py && python scraper.py", feedback)
+        self.assertIn("python3 -m py_compile scraper.py && python scraper.py", feedback)
         self.assertIn("Smoke output:", feedback)
         self.assertIn("SyntaxError", feedback)
 

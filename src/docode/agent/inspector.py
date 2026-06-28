@@ -101,7 +101,7 @@ def build_acceptance_criteria(instruction: str, detected_commands: dict[str, str
 
 def extract_explicit_test_command(instruction: str) -> str | None:
     commands = (
-        (r"\bpython(?:3)?\s+-m\s+unittest\b", "python -m unittest"),
+        (r"\bpython(?:3)?\s+-m\s+unittest\b", "python3 -m unittest discover -s tests"),
         (r"\bpytest\b", "pytest"),
         (r"\bnpm\s+test\b", "npm test"),
         (r"\bpnpm\s+test\b", "pnpm test"),
