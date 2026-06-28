@@ -108,7 +108,7 @@ class UserContextDependency:
 
     async def __call__(
         self,
-        authorization: Annotated[str | None, Header()] = None,
+        authorization: Annotated[str | None, Header(alias="Authorization")] = None,
         x_user_id: Annotated[str | None, Header(alias="X-User-ID")] = None,
         x_basalt_user_id: Annotated[str | None, Header(alias="X-Basalt-User-ID")] = None,
         x_tenant_id: Annotated[str | None, Header(alias="X-Tenant-ID")] = None,
@@ -149,7 +149,7 @@ class UserContextDependency:
 
 
 async def get_user_context(
-    authorization: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
     x_user_id: Annotated[str | None, Header(alias="X-User-ID")] = None,
     x_basalt_user_id: Annotated[str | None, Header(alias="X-Basalt-User-ID")] = None,
     x_tenant_id: Annotated[str | None, Header(alias="X-Tenant-ID")] = None,
@@ -169,11 +169,26 @@ async def get_user_context(
     )
 
 
-def make_user_context_dependency(config: DocodeConfig, verifier: SessionVerifier | None = None) -> UserContextDependency:
-    return UserContextDependency(
+def make_user_context_dependency(config: DocodeConfig, verifier: SessionVerifier | None = None):
+    dependency = UserContextDependency(
         auth_required=config.auth_required,
         verifier=verifier or APICredSessionVerifier(config.apicred_base_url, config.apicred_token),
     )
+
+    async def _dependency(
+        authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+        x_user_id: Annotated[str | None, Header(alias="X-User-ID")] = None,
+        x_basalt_user_id: Annotated[str | None, Header(alias="X-Basalt-User-ID")] = None,
+        x_tenant_id: Annotated[str | None, Header(alias="X-Tenant-ID")] = None,
+    ) -> UserContext:
+        return await dependency(
+            authorization=authorization,
+            x_user_id=x_user_id,
+            x_basalt_user_id=x_basalt_user_id,
+            x_tenant_id=x_tenant_id,
+        )
+
+    return _dependency
 
 
 async def require_owned_job(repository: JobRepository, job_id: str, user: UserContext) -> CodingJob:

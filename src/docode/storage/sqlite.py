@@ -40,6 +40,7 @@ class SQLiteJobRepository(JobRepository):
                 status TEXT NOT NULL,
                 max_iterations INTEGER NOT NULL,
                 max_runtime_seconds INTEGER NOT NULL,
+                max_consecutive_failures INTEGER NOT NULL DEFAULT 5,
                 max_tool_calls INTEGER NOT NULL DEFAULT 100,
                 max_llm_tokens INTEGER NOT NULL DEFAULT 100000,
                 max_llm_cost REAL,
@@ -77,6 +78,7 @@ class SQLiteJobRepository(JobRepository):
             """
         )
         self._ensure_column("docode_jobs", "max_tool_calls", "INTEGER NOT NULL DEFAULT 100")
+        self._ensure_column("docode_jobs", "max_consecutive_failures", "INTEGER NOT NULL DEFAULT 5")
         self._ensure_column("docode_jobs", "max_llm_tokens", "INTEGER NOT NULL DEFAULT 100000")
         self._ensure_column("docode_jobs", "max_llm_cost", "REAL")
         self._ensure_column("docode_jobs", "artifact_mode", "TEXT NOT NULL DEFAULT 'patch'")
@@ -93,6 +95,9 @@ class SQLiteJobRepository(JobRepository):
             return
         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+    def close(self) -> None:
+        self._conn.close()
+
     async def create_job(self, job: CodingJob) -> CodingJob:
         async with self._lock:
             self._conn.execute(
@@ -100,11 +105,11 @@ class SQLiteJobRepository(JobRepository):
                 INSERT INTO docode_jobs (
                     id, user_id, instruction, repo_url, branch, github_repo, base_branch,
                     dobox_project_id, dobox_sandbox_id, dobox_agent_session_id, provider, model, apicred_access_token, status, max_iterations,
-                    max_runtime_seconds, max_tool_calls, max_llm_tokens, max_llm_cost, artifact_mode, sandbox_network_mode, result_summary, failure_reason,
+                    max_runtime_seconds, max_consecutive_failures, max_tool_calls, max_llm_tokens, max_llm_cost, artifact_mode, sandbox_network_mode, result_summary, failure_reason,
                     artifact_id, created_at,
                     updated_at, completed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 job_to_row(job),
             )
@@ -160,7 +165,7 @@ class SQLiteJobRepository(JobRepository):
                 UPDATE docode_jobs SET
                     user_id = ?, instruction = ?, repo_url = ?, branch = ?, github_repo = ?,
                     base_branch = ?, dobox_project_id = ?, dobox_sandbox_id = ?, dobox_agent_session_id = ?, provider = ?, model = ?,
-                    apicred_access_token = ?, status = ?, max_iterations = ?, max_runtime_seconds = ?, max_tool_calls = ?,
+                    apicred_access_token = ?, status = ?, max_iterations = ?, max_runtime_seconds = ?, max_consecutive_failures = ?, max_tool_calls = ?,
                     max_llm_tokens = ?, max_llm_cost = ?, artifact_mode = ?, sandbox_network_mode = ?, result_summary = ?,
                     failure_reason = ?, artifact_id = ?, created_at = ?, updated_at = ?, completed_at = ?
                 WHERE id = ?
@@ -252,6 +257,7 @@ def job_to_row(job: CodingJob) -> tuple[object, ...]:
         job.status.value,
         job.max_iterations,
         job.max_runtime_seconds,
+        job.max_consecutive_failures,
         job.max_tool_calls,
         job.max_llm_tokens,
         job.max_llm_cost,
@@ -288,6 +294,7 @@ def job_from_row(row: sqlite3.Row) -> CodingJob:
         status=JobStatus(str(row["status"])),
         max_iterations=int(row["max_iterations"]),
         max_runtime_seconds=int(row["max_runtime_seconds"]),
+        max_consecutive_failures=int(row["max_consecutive_failures"]) if "max_consecutive_failures" in row.keys() else 5,
         max_tool_calls=int(row["max_tool_calls"]) if "max_tool_calls" in row.keys() else 100,
         max_llm_tokens=int(row["max_llm_tokens"]) if "max_llm_tokens" in row.keys() else 100_000,
         max_llm_cost=float(row["max_llm_cost"]) if "max_llm_cost" in row.keys() and row["max_llm_cost"] is not None else None,

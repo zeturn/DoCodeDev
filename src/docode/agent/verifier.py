@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import shlex
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -28,6 +30,7 @@ class VerificationResult:
     test_result: ToolResult | None = None
     build_result: ToolResult | None = None
     lint_result: ToolResult | None = None
+    smoke_result: ToolResult | None = None
     workspace_result: ToolResult | None = None
     llm_judgement: VerifierJudgement | None = None
 
@@ -42,6 +45,7 @@ class VerifierJudge(Protocol):
         tests: ToolResult,
         build: ToolResult,
         lint: ToolResult,
+        smoke: ToolResult | None = None,
     ) -> VerifierJudgement: ...
 
 
@@ -58,7 +62,7 @@ class CodingVerifier:
         non_git_workspace = is_non_git_status(status_result)
         workspace_result: ToolResult | None = None
         has_explicit_artifact = False
-        if non_git_workspace and not job.repo_url:
+        if not job.repo_url and (non_git_workspace or has_untracked_workspace_files(status_result.output)):
             workspace_result = await safe_optional_tool_call("list_files", tools, ".")
             has_explicit_artifact = workspace_result.exit_code == 0 and bool(workspace_result.output.strip()) and not workspace_result.truncated
 
@@ -70,7 +74,9 @@ class CodingVerifier:
         tests_ok = test_result.exit_code == 0
         build_ok = build_result.exit_code == 0
         lint_ok = lint_result.exit_code == 0
-        verified_diff = diff_result.output if has_diff else ""
+        verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_result.output, workspace_result)
+        smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result)
+        smoke_ok = smoke_result.exit_code == 0
 
         fixes: list[str] = []
         if not status_ok:
@@ -87,12 +93,19 @@ class CodingVerifier:
             fixes.append("fix failing build command")
         if not lint_ok:
             fixes.append("fix failing lint command")
+        if not smoke_ok:
+            fixes.append("fix failing smoke verification command")
+            fixes.append(smoke_failure_hint(smoke_result))
+            if smoke_output_indicates_blocked_source(smoke_result.output):
+                fixes.append("abandon the current data source, call web_search again, inspect a different machine-readable source with fetch_url, and update the crawler to use that working source")
+            if smoke_output_indicates_missing_endpoint(smoke_result.output):
+                fixes.append("the current API endpoint returned 404 or not found; do not keep retrying the same endpoint, re-inspect the source documentation with fetch_url or call web_search again, then update the crawler to a verified working endpoint")
 
-        judgement = await self._judge(job, status_result, verified_diff, test_result, build_result, lint_result)
+        judgement = await self._judge(job, status_result, verified_diff, test_result, build_result, lint_result, smoke_result)
         if judgement is not None and not judgement.passed:
             fixes.extend(fix for fix in judgement.required_fixes if fix not in fixes)
 
-        command_checks_passed = status_ok and status_complete and has_change_evidence and diff_complete and tests_ok and build_ok and lint_ok
+        command_checks_passed = status_ok and status_complete and has_change_evidence and diff_complete and tests_ok and build_ok and lint_ok and smoke_ok
         llm_checks_passed = judgement is None or judgement.passed
         if command_checks_passed and llm_checks_passed:
             confidence = min(judgement.confidence, 0.95) if judgement is not None else 0.86
@@ -108,11 +121,14 @@ class CodingVerifier:
                 test_result=test_result,
                 build_result=build_result,
                 lint_result=lint_result,
+                smoke_result=smoke_result,
                 workspace_result=workspace_result,
                 llm_judgement=judgement,
             )
 
         reason = f"Verification failed for instruction: {job.instruction}"
+        if smoke_result.exit_code != 0:
+            reason = f"{reason}; smoke verification failed: {smoke_failure_hint(smoke_result)}"
         if judgement is not None and judgement.reason:
             reason = f"{reason}; verifier model: {judgement.reason}"
         return VerificationResult(
@@ -126,6 +142,7 @@ class CodingVerifier:
             test_result=test_result,
             build_result=build_result,
             lint_result=lint_result,
+            smoke_result=smoke_result,
             workspace_result=workspace_result,
             llm_judgement=judgement,
         )
@@ -138,6 +155,7 @@ class CodingVerifier:
         test_result: ToolResult,
         build_result: ToolResult,
         lint_result: ToolResult,
+        smoke_result: ToolResult,
     ) -> VerifierJudgement | None:
         if self.judge is None:
             return None
@@ -150,8 +168,18 @@ class CodingVerifier:
                     tests=test_result,
                     build=build_result,
                     lint=lint_result,
+                    smoke=smoke_result,
                 )
             except TypeError as exc:
+                if "smoke" in str(exc):
+                    return await self.judge.judge(
+                        instruction=job.instruction,
+                        status=status_result,
+                        diff=diff,
+                        tests=test_result,
+                        build=build_result,
+                        lint=lint_result,
+                    )
                 if "status" not in str(exc):
                     raise
                 return await self.judge.judge(
@@ -195,11 +223,263 @@ async def safe_optional_tool_call(tool_name: str, tools: DoBoxTools, *args) -> T
     return await safe_tool_call(tool_name, lambda: call(*args))
 
 
+async def run_smoke_verification(
+    job: CodingJob,
+    tools: DoBoxTools,
+    diff: str,
+    test_result: ToolResult,
+    build_result: ToolResult,
+    lint_result: ToolResult,
+) -> ToolResult:
+    changed_files = changed_files_from_diff(diff)
+    if not changed_files:
+        return ToolResult(tool="run_smoke", output="no changed files detected for smoke verification", exit_code=0, metadata={"detected": False})
+
+    commands: list[str] = []
+    python_files = [path for path in changed_files if path.endswith(".py")]
+    if python_files:
+        commands.append("python -m py_compile " + " ".join(shlex.quote(path) for path in python_files))
+        runnable = runnable_python_files(job.instruction, python_files)
+        if runnable:
+            commands.extend("python " + shlex.quote(path) for path in runnable[:1])
+            if requires_csv_output_check(job.instruction):
+                commands.append("python -c " + double_quote_shell_arg(csv_output_check_script()))
+            elif requires_json_output_check(job.instruction):
+                commands.append("python -c " + double_quote_shell_arg(json_output_check_script(minimum_required_records(job.instruction))))
+
+    javascript_files = [path for path in changed_files if path.endswith((".js", ".mjs", ".cjs"))]
+    for path in javascript_files:
+        commands.append(f"command -v node >/dev/null 2>&1 && node --check {shlex.quote(path)}")
+
+    json_files = [path for path in changed_files if path.endswith(".json")]
+    for path in json_files:
+        commands.append(f"python -m json.tool {shlex.quote(path)} >/dev/null")
+
+    if not commands:
+        if not has_code_like_changes(changed_files):
+            return ToolResult(tool="run_smoke", output="no code-like changed files detected; smoke verification skipped", exit_code=0, metadata={"detected": False, "changed_files": changed_files})
+        if any_detected(test_result, build_result, lint_result):
+            return ToolResult(tool="run_smoke", output="standard verification commands were detected; no additional smoke command selected", exit_code=0, metadata={"detected": False})
+        return ToolResult(tool="run_smoke", output="no task-appropriate smoke command detected", exit_code=1, metadata={"detected": False, "changed_files": changed_files})
+
+    command = " && ".join(commands)
+    result = await safe_optional_tool_call("run_command", tools, command, "/workspace")
+    exit_code = result.exit_code
+    if exit_code == 0 and smoke_output_indicates_failure(result.output):
+        exit_code = 1
+    return ToolResult(
+        tool="run_smoke",
+        output=result.output,
+        exit_code=exit_code,
+        metadata={"detected": True, "command": command, "changed_files": changed_files},
+        truncated=result.truncated,
+    )
+
+
+def changed_files_from_diff(diff: str) -> list[str]:
+    files: list[str] = []
+    for line in diff.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        match = re.search(r" b/(.+)$", line)
+        if not match:
+            continue
+        path = match.group(1).strip()
+        if path and path != "/dev/null" and path not in files:
+            files.append(path)
+    return files
+
+
+def has_untracked_workspace_files(status: str) -> bool:
+    return any(line.startswith("?? ") and line[3:].strip() for line in status.splitlines())
+
+
+def synthetic_diff_from_status(status: str, workspace_result: ToolResult | None) -> str:
+    if workspace_result is None or workspace_result.exit_code != 0:
+        return ""
+    workspace_files = {line.strip().rstrip("/") for line in workspace_result.output.splitlines() if line.strip() and not line.strip().endswith("/")}
+    files = []
+    for line in status.splitlines():
+        if not line.startswith("?? "):
+            continue
+        path = line[3:].strip()
+        if path in workspace_files:
+            files.append(path)
+    if not files:
+        return ""
+    return "\n".join(f"diff --git a/{path} b/{path}\nnew file mode 100644" for path in files) + "\n"
+
+
+def runnable_python_files(instruction: str, python_files: list[str]) -> list[str]:
+    lowered = instruction.lower()
+    runnable_task = any(
+        keyword in lowered
+        for keyword in (
+            "crawler",
+            "scraper",
+            "scrape",
+            "爬虫",
+            "抓取",
+            "下载",
+            "fetch",
+            "etl",
+            "script",
+            "脚本",
+        )
+    )
+    if not runnable_task:
+        return []
+    excluded_parts = {"/test_", "/tests/", "\\test_", "\\tests\\"}
+    return [path for path in python_files if not any(part in path for part in excluded_parts)]
+
+
+def any_detected(*results: ToolResult) -> bool:
+    return any(bool(result.metadata and result.metadata.get("detected")) for result in results)
+
+
+def requires_csv_output_check(instruction: str) -> bool:
+    lowered = (instruction or "").lower()
+    return "csv" in lowered
+
+
+def requires_json_output_check(instruction: str) -> bool:
+    lowered = (instruction or "").lower()
+    return any(keyword in lowered for keyword in ("json", "output.json"))
+
+
+def minimum_required_records(instruction: str) -> int:
+    lowered = (instruction or "").lower()
+    if any(marker in lowered for marker in ("至少 5", "at least 5", ">=5", ">= 5")):
+        return 5
+    return 1
+
+
+def smoke_output_indicates_failure(output: str) -> bool:
+    lowered = (output or "").lower()
+    failure_markers = (
+        "traceback",
+        "syntaxerror",
+        "attributeerror",
+        "typeerror",
+        "valueerror",
+        "modulenotfounderror",
+        "error fetching",
+        "failed to fetch",
+        "forbidden",
+        "unauthorized",
+        "exception",
+    )
+    return any(marker in lowered for marker in failure_markers) or smoke_output_indicates_missing_endpoint(output)
+
+
+def smoke_output_indicates_blocked_source(output: str) -> bool:
+    lowered = (output or "").lower()
+    return any(marker in lowered for marker in ("403", "forbidden", "unauthorized", "401", "access denied"))
+
+
+def smoke_output_indicates_missing_endpoint(output: str) -> bool:
+    lowered = (output or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "404",
+            "not found for url",
+            "endpoint not found",
+            "no such endpoint",
+            '"status":404',
+            "'status': 404",
+        )
+    )
+
+
+def csv_output_check_script() -> str:
+    return (
+        "import glob, os, sys; "
+        "files=[p for p in glob.glob('*.csv') if os.path.isfile(p) and os.path.getsize(p)>0]; "
+        "print('CSV outputs:', ', '.join(files)); "
+        "sys.exit(0 if files else 1)"
+    )
+
+
+def json_output_check_script(min_records: int = 1) -> str:
+    return (
+        "import glob, json, os, sys; "
+        "candidates=['data/output.json','output.json']+[p for p in glob.glob('*.json') if os.path.isfile(p)]; "
+        "files=[]; "
+        f"min_records={int(min_records)}; "
+        "\nfor p in candidates:\n"
+        "    if p in files or not os.path.isfile(p) or os.path.getsize(p)<=0:\n"
+        "        continue\n"
+        "    try:\n"
+        "        data=json.load(open(p, encoding='utf-8'))\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    count=len(data) if isinstance(data, list) else (len(data) if isinstance(data, dict) else 1)\n"
+        "    if count>=min_records:\n"
+        "        files.append(p)\n"
+        "print('JSON outputs:', ', '.join(files)); "
+        "sys.exit(0 if files else 1)"
+    )
+
+
+def double_quote_shell_arg(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def has_code_like_changes(changed_files: list[str]) -> bool:
+    code_suffixes = (
+        ".py",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".cs",
+        ".rb",
+        ".php",
+        ".sh",
+        ".ps1",
+        ".sql",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+    )
+    return any(path.endswith(code_suffixes) for path in changed_files)
+
+
+def smoke_failure_hint(result: ToolResult) -> str:
+    command = result.metadata.get("command") if result.metadata else None
+    output = result.output.strip()
+    parts = ["repair the code so the smoke command exits successfully"]
+    if command:
+        parts.append(f"command={command}")
+    if output:
+        parts.append("output=" + truncate_hint(output, 800))
+    if smoke_output_indicates_blocked_source(output):
+        parts.append("current data source appears blocked or unauthorized; do not keep retrying it, call web_search again and switch to a different machine-readable source")
+    if smoke_output_indicates_missing_endpoint(output):
+        parts.append("current API endpoint appears missing; do not keep retrying it, re-inspect the source documentation with fetch_url or call web_search again, and verify the exact endpoint before finishing")
+    return "; ".join(parts)
+
+
+def truncate_hint(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", errors="replace") + " <truncated>"
+
+
 def is_non_git_status(result: ToolResult) -> bool:
     return result.exit_code != 0 and "not a git repository" in result.output.lower()
 
 
 def verification_success_reason(has_explicit_artifact: bool) -> str:
     if has_explicit_artifact:
-        return "Workspace is not a git repository, but explicit workspace artifacts exist and detected tests/build/lint passed or were not detected."
-    return "Git status succeeded, diff is non-empty, and detected tests/build/lint passed or were not detected."
+        return "Workspace is not a git repository, but explicit workspace artifacts exist and tests/build/lint plus smoke verification passed."
+    return "Git status succeeded, diff is non-empty, and tests/build/lint plus smoke verification passed."

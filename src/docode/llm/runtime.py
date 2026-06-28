@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from docode.agent.output import prompt_safe_output
 from docode.agent.verifier import VerifierJudgement
-from docode.dobox.tools import DoBoxTools, ToolDefinition, build_dobox_tool_registry
+from docode.dobox.tools import ToolDefinition, build_dobox_tool_registry
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
 
@@ -144,8 +144,9 @@ class WeavVerifierJudge:
         tests: ToolResult,
         build: ToolResult,
         lint: ToolResult,
+        smoke: ToolResult | None = None,
     ) -> VerifierJudgement:
-        prompt = self._format_prompt(instruction=instruction, status=status, diff=diff, tests=tests, build=build, lint=lint)
+        prompt = self._format_prompt(instruction=instruction, status=status, diff=diff, tests=tests, build=build, lint=lint, smoke=smoke)
         result = await call_provider(self.provider_client, prompt, self.model)
         if self.usage_meter is not None:
             self.usage_meter.record_provider_call(prompt=prompt, result=result)
@@ -160,8 +161,10 @@ class WeavVerifierJudge:
         tests: ToolResult,
         build: ToolResult,
         lint: ToolResult,
+        smoke: ToolResult | None = None,
     ) -> str:
         status_section = f"Git status:\n{tool_result_for_prompt(status)}\n\n" if status is not None else ""
+        smoke_section = f"\n\nSmoke:\n{tool_result_for_prompt(smoke)}" if smoke is not None else ""
         return (
             "You are DoCode's independent verifier. Review whether the code diff satisfies the user's instruction.\n"
             "You must consider the diff and the verification command outputs. Respond only as JSON with this shape:\n"
@@ -172,6 +175,7 @@ class WeavVerifierJudge:
             f"Tests:\n{tool_result_for_prompt(tests)}\n\n"
             f"Build:\n{tool_result_for_prompt(build)}\n\n"
             f"Lint:\n{tool_result_for_prompt(lint)}"
+            f"{smoke_section}"
         )
 
 
@@ -202,7 +206,7 @@ async def build_docode_llm(job: CodingJob, resolver: APICredCredentialResolver) 
     return runtime.llm
 
 
-async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolver, dobox_tools: DoBoxTools | None = None) -> DocodeRuntime:
+async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolver, dobox_tools: Any | None = None) -> DocodeRuntime:
     tool_registry = build_dobox_tool_registry(dobox_tools) if dobox_tools is not None else None
     usage_meter = LLMUsageMeter()
     if job.provider in {"scripted", "dev"} or job.model == "scripted":

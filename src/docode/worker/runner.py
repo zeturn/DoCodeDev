@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from docode.agent.loop import CodingAgentLoop
 from docode.agent.stop_policy import StopPolicy
+from docode.agent.tools import CompositeAgentTools
 from docode.agent.verifier import CodingVerifier
 from docode.artifacts.exporter import ArtifactExporter, terminal_artifact_id
 from docode.artifacts.github import GitHubExporter
@@ -14,6 +15,7 @@ from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.runtime import WeavVerifierJudge, build_docode_runtime
 from docode.storage.models import JobStatus
 from docode.storage.repository import JobRepository, terminal_status
+from docode.web.tools import WebTools, WebToolsConfig
 
 
 DoBoxClientFactory = Callable[[], DoBoxClient]
@@ -134,7 +136,8 @@ class JobRunnerService:
                 command_timeout_seconds=self.config.command_timeout_seconds,
                 output_limit_bytes=self.config.output_limit_bytes,
             )
-            runtime = await build_docode_runtime(job, resolver, tools)
+            agent_tools = CompositeAgentTools(tools, self.build_web_tools())
+            runtime = await build_docode_runtime(job, resolver, agent_tools)
             await self.repository.add_step(
                 job.id,
                 "system",
@@ -146,7 +149,7 @@ class JobRunnerService:
                     "model": runtime.model,
                     "sandbox_network_mode": job.sandbox_network_mode,
                     "dobox_agent_session_id": session.session_id,
-                    "tools": [definition.name for definition in tools.definitions()],
+                    "tools": [definition.name for definition in agent_tools.definitions()],
                 },
             )
             if await self._is_stopped(job.id):
@@ -162,7 +165,7 @@ class JobRunnerService:
             max_llm_cost = runtime_budget(job.max_llm_cost, authorization.budget_cost)
             loop = CodingAgentLoop(
                 llm=llm,
-                tools=tools,
+                tools=agent_tools,
                 verifier=CodingVerifier(judge=verifier_judge),
                 repository=self.repository,
                 exporter=ArtifactExporter(
@@ -175,6 +178,7 @@ class JobRunnerService:
                 stop_policy=StopPolicy(
                     max_iterations=job.max_iterations,
                     max_runtime_seconds=job.max_runtime_seconds,
+                    max_consecutive_failures=job.max_consecutive_failures,
                     max_tool_calls=job.max_tool_calls,
                     max_llm_tokens=max_llm_tokens,
                     max_llm_cost=max_llm_cost,
@@ -196,6 +200,22 @@ class JobRunnerService:
     async def _is_stopped(self, job_id: str) -> bool:
         current = await self.repository.get_job(job_id)
         return current is not None and current.status == JobStatus.STOPPED
+
+    def build_web_tools(self) -> WebTools | None:
+        if not self.config.web_tools_enabled:
+            return None
+        return WebTools(
+            WebToolsConfig(
+                openai_api_key=self.config.openai_api_key,
+                openai_base_url=self.config.openai_base_url,
+                openai_search_model=self.config.openai_search_model,
+                openai_search_tool_type=self.config.openai_search_tool_type,
+                search_context_size=self.config.web_search_context_size,
+                fetch_timeout_seconds=self.config.web_fetch_timeout_seconds,
+                output_limit_bytes=self.config.output_limit_bytes,
+                allow_private_hosts=self.config.web_fetch_allow_private_hosts,
+            )
+        )
 
     async def report_usage_best_effort(
         self,

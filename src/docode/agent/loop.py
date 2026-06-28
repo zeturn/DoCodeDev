@@ -132,7 +132,7 @@ class CodingAgentLoop:
                         result_summary=final_summary,
                         artifact_id=artifact_id,
                     )
-                state.add_feedback(verification.reason + "; required fixes: " + ", ".join(verification.required_fixes))
+                state.add_feedback(verification_repair_feedback(verification))
                 state.iteration += 1
                 continue
 
@@ -276,6 +276,12 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
             "exit_code": result.lint_result.exit_code if result.lint_result else None,
             "output": result.lint_result.output if result.lint_result else None,
         },
+        "smoke": {
+            "tool": result.smoke_result.tool if result.smoke_result else None,
+            "exit_code": result.smoke_result.exit_code if result.smoke_result else None,
+            "output": result.smoke_result.output if result.smoke_result else None,
+            "metadata": result.smoke_result.metadata if result.smoke_result else None,
+        },
         "llm_judgement": {
             "passed": result.llm_judgement.passed,
             "confidence": result.llm_judgement.confidence,
@@ -285,6 +291,18 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
         if result.llm_judgement
         else None,
     }
+
+
+def verification_repair_feedback(result: VerificationResult) -> str:
+    parts = [result.reason]
+    if result.required_fixes:
+        parts.append("Required fixes:\n" + "\n".join(f"- {fix}" for fix in result.required_fixes))
+    if result.smoke_result is not None and result.smoke_result.exit_code != 0:
+        command = result.smoke_result.metadata.get("command") if result.smoke_result.metadata else None
+        if command:
+            parts.append("Smoke command:\n" + command)
+        parts.append("Smoke output:\n" + truncate_text(result.smoke_result.output, 4000))
+    return "\n\n".join(part for part in parts if part)
 
 
 def decision_to_step(decision, usage_meter: LLMUsageMeter | None = None) -> dict[str, object]:

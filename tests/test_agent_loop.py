@@ -5,9 +5,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
 
-from docode.agent.loop import CodingAgentLoop
+from docode.agent.loop import CodingAgentLoop, verification_repair_feedback
 from docode.agent.stop_policy import StopPolicy
-from docode.agent.verifier import CodingVerifier
+from docode.agent.verifier import CodingVerifier, VerificationResult
 from docode.artifacts.exporter import ArtifactExporter
 from docode.dobox.types import ToolResult
 from docode.llm.runtime import AgentDecision, LLMUsageMeter
@@ -163,6 +163,28 @@ class FakeTools:
 
 
 class AgentLoopTests(IsolatedAsyncioTestCase):
+    def test_verification_feedback_includes_smoke_command_and_output(self) -> None:
+        feedback = verification_repair_feedback(
+            VerificationResult(
+                passed=False,
+                confidence=0.2,
+                reason="Verification failed",
+                required_fixes=["fix failing smoke verification command"],
+                smoke_result=ToolResult(
+                    tool="run_smoke",
+                    output="SyntaxError: f-string: unmatched '('",
+                    exit_code=1,
+                    metadata={"command": "python -m py_compile scraper.py && python scraper.py"},
+                ),
+            )
+        )
+
+        self.assertIn("Required fixes:", feedback)
+        self.assertIn("Smoke command:", feedback)
+        self.assertIn("python -m py_compile scraper.py && python scraper.py", feedback)
+        self.assertIn("Smoke output:", feedback)
+        self.assertIn("SyntaxError", feedback)
+
     async def test_agent_loop_tools_verifies_and_exports_artifacts(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

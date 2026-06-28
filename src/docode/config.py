@@ -33,6 +33,14 @@ class DocodeConfig:
     github_export_enabled: bool = False
     github_base_branch: str = "main"
     github_work_dir: Path = Path(".docode/github")
+    web_tools_enabled: bool = True
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_search_model: str = "gpt-4o-mini"
+    openai_search_tool_type: str = "web_search"
+    web_search_context_size: str = "low"
+    web_fetch_timeout_seconds: float = 20.0
+    web_fetch_allow_private_hosts: bool = False
 
 
 def load_config() -> DocodeConfig:
@@ -62,6 +70,14 @@ def load_config() -> DocodeConfig:
         github_export_enabled=os.getenv("DOCODE_GITHUB_EXPORT_ENABLED", "").lower() in {"1", "true", "yes", "on"},
         github_base_branch=os.getenv("DOCODE_GITHUB_BASE_BRANCH", "main"),
         github_work_dir=Path(os.getenv("DOCODE_GITHUB_WORK_DIR", ".docode/github")),
+        web_tools_enabled=os.getenv("DOCODE_WEB_TOOLS_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        openai_api_key=os.getenv("DOCODE_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")),
+        openai_base_url=os.getenv("DOCODE_OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        openai_search_model=os.getenv("DOCODE_OPENAI_SEARCH_MODEL", "gpt-4o-mini"),
+        openai_search_tool_type=os.getenv("DOCODE_OPENAI_SEARCH_TOOL_TYPE", "web_search"),
+        web_search_context_size=os.getenv("DOCODE_WEB_SEARCH_CONTEXT_SIZE", "low"),
+        web_fetch_timeout_seconds=float(os.getenv("DOCODE_WEB_FETCH_TIMEOUT_SECONDS", "20")),
+        web_fetch_allow_private_hosts=os.getenv("DOCODE_WEB_FETCH_ALLOW_PRIVATE_HOSTS", "").lower() in {"1", "true", "yes", "on"},
     )
 
 

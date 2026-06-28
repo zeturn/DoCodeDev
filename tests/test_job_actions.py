@@ -57,6 +57,7 @@ class JobActionTests(IsolatedAsyncioTestCase):
         self.assertEqual(job.model, "scripted")
         self.assertEqual(job.max_iterations, 12)
         self.assertEqual(job.max_runtime_seconds, 900)
+        self.assertEqual(job.max_consecutive_failures, 5)
         self.assertEqual(job.max_tool_calls, 33)
         self.assertEqual(job.max_llm_tokens, 44_000)
         self.assertEqual(job.max_llm_cost, 1.25)
@@ -88,6 +89,7 @@ class JobActionTests(IsolatedAsyncioTestCase):
                 model="claude-sonnet-4-5",
                 max_iterations=4,
                 max_runtime_seconds=120,
+                max_consecutive_failures=7,
                 max_tool_calls=8,
                 max_llm_tokens=9000,
                 max_llm_cost=0.5,
@@ -104,12 +106,54 @@ class JobActionTests(IsolatedAsyncioTestCase):
         self.assertEqual(job.model, "claude-sonnet-4-5")
         self.assertEqual(job.max_iterations, 4)
         self.assertEqual(job.max_runtime_seconds, 120)
+        self.assertEqual(job.max_consecutive_failures, 7)
         self.assertEqual(job.max_tool_calls, 8)
         self.assertEqual(job.max_llm_tokens, 9000)
         self.assertEqual(job.max_llm_cost, 0.5)
         self.assertEqual(job.artifact_mode, "pr")
         self.assertEqual(job.sandbox_network_mode, "no_internet")
         self.assertEqual(queue.enqueued, [job.id])
+
+    async def test_create_coding_job_expands_budget_for_crawler_tasks(self) -> None:
+        repo = InMemoryJobRepository()
+        queue = RecordingQueue()
+        policy = FakeModelPolicy(ModelPolicyResult(provider="openai", model="gpt-4o-mini", allowed=True))
+
+        job = await create_coding_job(
+            repository=repo,
+            queue=queue,  # type: ignore[arg-type]
+            config=DocodeConfig(max_iterations=50, max_tool_calls=100),
+            model_policy=policy,  # type: ignore[arg-type]
+            user_id="user-1",
+            request=CreateJobInput(instruction="帮我联网寻找数据源并生成一个长期每日更新数据的 Python 爬虫"),
+        )
+
+        self.assertEqual(job.max_iterations, 100)
+        self.assertEqual(job.max_consecutive_failures, 12)
+        self.assertEqual(job.max_tool_calls, 250)
+
+    async def test_create_coding_job_keeps_explicit_budget_for_crawler_tasks(self) -> None:
+        repo = InMemoryJobRepository()
+        queue = RecordingQueue()
+        policy = FakeModelPolicy(ModelPolicyResult(provider="openai", model="gpt-4o-mini", allowed=True))
+
+        job = await create_coding_job(
+            repository=repo,
+            queue=queue,  # type: ignore[arg-type]
+            config=DocodeConfig(max_iterations=50, max_tool_calls=100),
+            model_policy=policy,  # type: ignore[arg-type]
+            user_id="user-1",
+            request=CreateJobInput(
+                instruction="帮我联网寻找数据源并生成一个长期每日更新数据的 Python 爬虫",
+                max_iterations=12,
+                max_consecutive_failures=4,
+                max_tool_calls=30,
+            ),
+        )
+
+        self.assertEqual(job.max_iterations, 12)
+        self.assertEqual(job.max_consecutive_failures, 4)
+        self.assertEqual(job.max_tool_calls, 30)
 
     async def test_create_coding_job_uses_stricter_configured_cost_budget(self) -> None:
         repo = InMemoryJobRepository()
@@ -173,6 +217,7 @@ class JobActionTests(IsolatedAsyncioTestCase):
             (CreateJobInput(instruction="fix build", artifact_mode="tar"), "artifact_mode must be patch, zip, commit, or pr"),
             (CreateJobInput(instruction="fix build", max_iterations=0), "max_iterations must be between 1 and 200"),
             (CreateJobInput(instruction="fix build", max_runtime_seconds=29), "max_runtime_seconds must be between 30 and 86400"),
+            (CreateJobInput(instruction="fix build", max_consecutive_failures=0), "max_consecutive_failures must be between 1 and 50"),
             (CreateJobInput(instruction="fix build", max_tool_calls=0), "max_tool_calls must be between 1 and 1000"),
             (CreateJobInput(instruction="fix build", max_llm_tokens=0), "max_llm_tokens must be between 1 and 10000000"),
             (CreateJobInput(instruction="fix build", max_llm_cost=0), "max_llm_cost must be greater than 0 and at most 10000"),

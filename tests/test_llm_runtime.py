@@ -5,6 +5,8 @@ import types
 from unittest import IsolatedAsyncioTestCase
 
 from docode.dobox.tools import DoBoxTools
+from docode.agent.tools import CompositeAgentTools
+from docode.web.tools import WebTools, WebToolsConfig
 from docode.llm.credentials import ProviderCredential
 from docode.llm.runtime import (
     LLMUsageMeter,
@@ -48,8 +50,9 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         resolver = RuntimeResolver()
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="change code", provider="openai", model="gpt-test")
         dobox_tools = DoBoxTools(object(), "project-1")
+        agent_tools = CompositeAgentTools(dobox_tools, WebTools(WebToolsConfig(openai_api_key="key-1")))
 
-        runtime = await build_docode_runtime(job, resolver, dobox_tools)
+        runtime = await build_docode_runtime(job, resolver, agent_tools)
 
         self.assertEqual(runtime.provider, "openai")
         self.assertEqual(runtime.model, "gpt-test")
@@ -59,6 +62,8 @@ class RuntimeTests(IsolatedAsyncioTestCase):
             {"provider": "openai", "kwargs": {"api_key": "secret-key", "base_url": "https://llm.example/v1"}},
         )
         self.assertIsNotNone(runtime.tools.get("run_command"))
+        self.assertIsNotNone(runtime.tools.get("web_search"))
+        self.assertIsNotNone(runtime.tools.get("fetch_url"))
         self.assertNotIn("secret-key", repr(runtime))
 
     async def test_scripted_runtime_does_not_resolve_credentials(self) -> None:

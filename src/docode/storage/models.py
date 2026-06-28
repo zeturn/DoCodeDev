@@ -52,6 +52,7 @@ class CodingJob:
     status: JobStatus = JobStatus.QUEUED
     max_iterations: int = 50
     max_runtime_seconds: int = 1800
+    max_consecutive_failures: int = 5
     max_tool_calls: int = 100
     max_llm_tokens: int = 100_000
     max_llm_cost: float | None = None

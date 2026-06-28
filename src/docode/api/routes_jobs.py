@@ -29,6 +29,7 @@ class CreateJobRequest(BaseModel):
     model: str | None = None
     max_iterations: int | None = Field(default=None, ge=1, le=200)
     max_runtime_seconds: int | None = Field(default=None, ge=30, le=24 * 60 * 60)
+    max_consecutive_failures: int | None = Field(default=None, ge=1, le=50)
     max_tool_calls: int | None = Field(default=None, ge=1, le=1000)
     max_llm_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
     max_llm_cost: float | None = Field(default=None, gt=0, le=10_000)
@@ -62,6 +63,7 @@ def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: Do
                     model=req.model,
                     max_iterations=req.max_iterations,
                     max_runtime_seconds=req.max_runtime_seconds,
+                    max_consecutive_failures=req.max_consecutive_failures,
                     max_tool_calls=req.max_tool_calls,
                     max_llm_tokens=req.max_llm_tokens,
                     max_llm_cost=req.max_llm_cost,

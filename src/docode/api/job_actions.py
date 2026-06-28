@@ -15,9 +15,13 @@ from docode.worker.queue import AsyncJobQueue
 ALLOWED_ARTIFACT_MODES = frozenset({"patch", "zip", "commit", "pr"})
 MAX_ITERATIONS_LIMIT = 200
 MAX_RUNTIME_SECONDS_LIMIT = 24 * 60 * 60
+MAX_CONSECUTIVE_FAILURES_LIMIT = 50
 MAX_TOOL_CALLS_LIMIT = 1000
 MAX_LLM_TOKENS_LIMIT = 10_000_000
 MAX_LLM_COST_LIMIT = 10_000.0
+HIGH_VALIDATION_DEFAULT_MAX_ITERATIONS = 100
+HIGH_VALIDATION_DEFAULT_MAX_TOOL_CALLS = 250
+HIGH_VALIDATION_DEFAULT_MAX_CONSECUTIVE_FAILURES = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +35,7 @@ class CreateJobInput:
     model: str | None = None
     max_iterations: int | None = None
     max_runtime_seconds: int | None = None
+    max_consecutive_failures: int | None = None
     max_tool_calls: int | None = None
     max_llm_tokens: int | None = None
     max_llm_cost: float | None = None
@@ -61,7 +66,9 @@ async def create_coding_job(
         raise JobActionError(400, str(exc)) from exc
 
     try:
-        max_iterations = bounded_int("max_iterations", request.max_iterations, config.max_iterations, minimum=1, maximum=MAX_ITERATIONS_LIMIT)
+        default_max_iterations = default_iterations_for_request(request, config)
+        default_max_tool_calls = default_tool_calls_for_request(request, config)
+        max_iterations = bounded_int("max_iterations", request.max_iterations, default_max_iterations, minimum=1, maximum=MAX_ITERATIONS_LIMIT)
         max_runtime_seconds = bounded_int(
             "max_runtime_seconds",
             request.max_runtime_seconds,
@@ -69,7 +76,14 @@ async def create_coding_job(
             minimum=30,
             maximum=MAX_RUNTIME_SECONDS_LIMIT,
         )
-        max_tool_calls = bounded_int("max_tool_calls", request.max_tool_calls, config.max_tool_calls, minimum=1, maximum=MAX_TOOL_CALLS_LIMIT)
+        max_consecutive_failures = bounded_int(
+            "max_consecutive_failures",
+            request.max_consecutive_failures,
+            default_consecutive_failures_for_request(request),
+            minimum=1,
+            maximum=MAX_CONSECUTIVE_FAILURES_LIMIT,
+        )
+        max_tool_calls = bounded_int("max_tool_calls", request.max_tool_calls, default_max_tool_calls, minimum=1, maximum=MAX_TOOL_CALLS_LIMIT)
         max_llm_tokens = bounded_int("max_llm_tokens", request.max_llm_tokens, config.max_llm_tokens, minimum=1, maximum=MAX_LLM_TOKENS_LIMIT)
         max_llm_cost = runtime_cost_budget(request.max_llm_cost, config.max_llm_cost)
         artifact_mode = normalize_artifact_mode(request.artifact_mode)
@@ -93,6 +107,7 @@ async def create_coding_job(
         apicred_access_token=apicred_access_token,
         max_iterations=max_iterations,
         max_runtime_seconds=max_runtime_seconds,
+        max_consecutive_failures=max_consecutive_failures,
         max_tool_calls=max_tool_calls,
         max_llm_tokens=max_llm_tokens,
         max_llm_cost=max_llm_cost,
@@ -114,6 +129,51 @@ def bounded_int(name: str, requested: int | None, configured: int, *, minimum: i
     if value < minimum or value > maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def default_iterations_for_request(request: CreateJobInput, config: DocodeConfig) -> int:
+    if request.max_iterations is not None or not needs_expanded_repair_budget(request.instruction):
+        return config.max_iterations
+    return min(MAX_ITERATIONS_LIMIT, max(config.max_iterations, HIGH_VALIDATION_DEFAULT_MAX_ITERATIONS))
+
+
+def default_tool_calls_for_request(request: CreateJobInput, config: DocodeConfig) -> int:
+    if request.max_tool_calls is not None or not needs_expanded_repair_budget(request.instruction):
+        return config.max_tool_calls
+    return min(MAX_TOOL_CALLS_LIMIT, max(config.max_tool_calls, HIGH_VALIDATION_DEFAULT_MAX_TOOL_CALLS))
+
+
+def default_consecutive_failures_for_request(request: CreateJobInput) -> int:
+    if request.max_consecutive_failures is not None or not needs_expanded_repair_budget(request.instruction):
+        return 5
+    return HIGH_VALIDATION_DEFAULT_MAX_CONSECUTIVE_FAILURES
+
+
+def needs_expanded_repair_budget(instruction: str) -> bool:
+    lowered = (instruction or "").lower()
+    keywords = (
+        "crawler",
+        "scraper",
+        "scrape",
+        "spider",
+        "爬虫",
+        "抓取",
+        "采集",
+        "下载",
+        "每日",
+        "长期",
+        "数据源",
+        "联网",
+        "web_search",
+        "fetch_url",
+        "etl",
+        "pipeline",
+        "script",
+        "脚本",
+        "cli",
+        "命令行",
+    )
+    return any(keyword in lowered for keyword in keywords)
 
 
 def runtime_cost_budget(requested: float | None, configured: float | None) -> float | None:
