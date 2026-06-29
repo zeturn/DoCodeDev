@@ -15,13 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from docode.api.job_actions import CreateJobInput, create_coding_job
 from docode.config import DocodeConfig
-from docode.llm.credentials import APICredCredentialResolver
-from docode.llm.model_policy import DocodeModelPolicy
-from docode.storage.db import build_repository
-from docode.worker.queue import AsyncJobQueue
-from docode.worker.runner import JobRunnerService
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +37,13 @@ HealthChecker = Callable[[str], Awaitable[tuple[bool, str]]]
 CommandRunner = Callable[[list[str], Path | None, float], "CommandProbe"]
 DoboxTokenResolver = Callable[[DocodeConfig], Awaitable[tuple[str | None, "SmokeCheck"]]]
 REQUIRED_PYTHON_MODULES = ("httpx", "fastapi", "pydantic", "uvicorn")
+CreateJobInput = None
+create_coding_job = None
+APICredCredentialResolver = None
+DocodeModelPolicy = None
+build_repository = None
+AsyncJobQueue = None
+JobRunnerService = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +100,8 @@ async def run_scripted_smoke_job(
         if preflight.status != "passed":
             return preflight
         config.dobox_token = token or config.dobox_token
+
+        load_job_runtime_dependencies()
 
         repository = build_repository(config)
         queue = AsyncJobQueue()
@@ -160,6 +163,45 @@ def python_dependency_checks() -> list[SmokeCheck]:
         detail = "importable" if available else f"{module} is not importable; install project dependencies"
         checks.append(SmokeCheck(f"python_dependency:{module}", "passed" if available else "failed", detail))
     return checks
+
+
+def load_job_runtime_dependencies() -> None:
+    global APICredCredentialResolver
+    global AsyncJobQueue
+    global CreateJobInput
+    global DocodeModelPolicy
+    global JobRunnerService
+    global build_repository
+    global create_coding_job
+
+    if CreateJobInput is None:
+        from docode.api.job_actions import CreateJobInput as imported
+
+        CreateJobInput = imported
+    if create_coding_job is None:
+        from docode.api.job_actions import create_coding_job as imported
+
+        create_coding_job = imported
+    if APICredCredentialResolver is None:
+        from docode.llm.credentials import APICredCredentialResolver as imported
+
+        APICredCredentialResolver = imported
+    if DocodeModelPolicy is None:
+        from docode.llm.model_policy import DocodeModelPolicy as imported
+
+        DocodeModelPolicy = imported
+    if build_repository is None:
+        from docode.storage.db import build_repository as imported
+
+        build_repository = imported
+    if AsyncJobQueue is None:
+        from docode.worker.queue import AsyncJobQueue as imported
+
+        AsyncJobQueue = imported
+    if JobRunnerService is None:
+        from docode.worker.runner import JobRunnerService as imported
+
+        JobRunnerService = imported
 
 
 async def ensure_dobox_smoke_token(config: DocodeConfig) -> tuple[str | None, SmokeCheck]:

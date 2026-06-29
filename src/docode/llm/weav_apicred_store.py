@@ -116,12 +116,14 @@ class APICredCredentialStore:
         key = (normalize_openai_compatible_provider(provider), model)
         if key not in self._credentials:
             credential = await self.resolver.resolve(user_id=self.user_id, provider=key[0], model=key[1])
-            self._credentials[key] = ProviderCredential(
+            resolved = ProviderCredential(
                 provider=normalize_openai_compatible_provider(credential.provider),
                 model=credential.model,
                 api_key=credential.api_key,
                 base_url=credential.base_url,
             )
+            self._credentials[key] = resolved
+            self._credentials[(resolved.provider, resolved.model)] = resolved
         return self._credentials[key]
 
 

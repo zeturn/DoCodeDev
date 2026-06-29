@@ -55,6 +55,7 @@ def main() -> None:
     eval_jobs.add_argument("--quality")
     eval_jobs.add_argument("--limit", type=int)
     eval_jobs.add_argument("--user-id", default="eval")
+    eval_jobs.add_argument("--start-dobox", action="store_true", help="Temporarily start the local DoBox backend for eval jobs if needed.")
 
     args = parser.parse_args()
     if args.command == "scripted-job":
@@ -135,11 +136,45 @@ def run_eval_scaffold_command(args: argparse.Namespace) -> None:
 
 
 async def run_eval_jobs_command(args: argparse.Namespace) -> None:
+    if args.start_dobox:
+        from docode.runtime.smoke import (
+            SmokeReport,
+            check_http_health,
+            dependency_checks,
+            ensure_dobox_smoke_token,
+            is_fatal_smoke_failure,
+            local_dobox_checks,
+            managed_local_dobox,
+            run_command_probe,
+            write_smoke_report,
+        )
+
+        config = load_config()
+        checks = await local_dobox_checks(config, run_command_probe)
+        async with managed_local_dobox(config, check_http_health, True, checks) as start_checks:
+            checks.extend(start_checks)
+            checks.extend(await dependency_checks(config, check_http_health))
+            token, token_check = await ensure_dobox_smoke_token(config)
+            checks.append(token_check)
+            status = "passed" if all(not is_fatal_smoke_failure(check) for check in checks) else "failed"
+            preflight = SmokeReport(status=status, checks=checks)
+            write_smoke_report(preflight, Path(args.results_dir) / "_meta" / "preflight.json")
+            if preflight.status != "passed":
+                failed = write_eval_preflight_failures(args, "eval_preflight_failed")
+                print({"results_dir": args.results_dir, "status": "failed", "failure_reason": "eval_preflight_failed", "cases": failed})
+                return
+            config.dobox_token = token or config.dobox_token
+            await run_eval_jobs_with_config(args, config)
+            return
+
+    await run_eval_jobs_with_config(args, load_config())
+
+
+async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
     runner_cls = JobRunnerService
     if runner_cls is None:
         from docode.worker.runner import JobRunnerService as runner_cls
 
-    config = load_config()
     repository = build_repository(config)
     queue = AsyncJobQueue()
     model_policy = DocodeModelPolicy(config, APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode))
@@ -172,6 +207,25 @@ async def run_eval_jobs_command(args: argparse.Namespace) -> None:
         write_eval_case_result(result, Path(args.results_dir))
         results.append(result)
     print({"results_dir": args.results_dir, "cases": len(results), "succeeded": sum(1 for result in results if result.get("success"))})
+
+
+def write_eval_preflight_failures(args: argparse.Namespace, failure_reason: str) -> int:
+    manifest = load_eval_manifest(Path(args.manifest))
+    cases = manifest["cases"][: args.limit] if args.limit else manifest["cases"]
+    for case in cases:
+        write_eval_case_result(
+            {
+                "name": case.get("name"),
+                "category": case.get("category"),
+                "instruction": case.get("instruction"),
+                "status": "failed",
+                "success": False,
+                "failure_reason": failure_reason,
+                "verification": {"required_fixes": [failure_reason]},
+            },
+            Path(args.results_dir),
+        )
+    return len(cases)
 
 
 if __name__ == "__main__":
