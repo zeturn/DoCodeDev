@@ -26,6 +26,7 @@ from docode.llm.runtime import (
     parse_verifier_judgement,
     provider_call_result,
 )
+from docode.llm import runtime as runtime_surface
 from docode.storage.models import CodingJob, new_id
 from docode.dobox.types import ToolResult
 
@@ -164,6 +165,24 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertEqual(usage.calls, 1)
         self.assertEqual(usage.prompt_tokens, estimate_tokens(provider.prompt))
         self.assertGreater(usage.total_tokens, 0)
+
+    async def test_final_candidate_supports_structured_verification_fields(self) -> None:
+        decision = runtime_surface.parse_decision(
+            '{"type":"final_candidate","summary":"done","verification":"pytest passed",'
+            '"no_test_reason":"No automated test is appropriate for this config-only change; manual verification was performed.",'
+            '"remaining_risks":["depends on prod config"]}'
+        )
+
+        self.assertEqual(decision.summary, "done")
+        self.assertEqual(decision.verification, "pytest passed")
+        self.assertIn("No automated test", decision.no_test_reason)
+        self.assertEqual(decision.remaining_risks, ["depends on prod config"])
+
+    def test_runtime_all_excludes_legacy_provider_helpers(self) -> None:
+        self.assertIn("build_docode_runtime", runtime_surface.__all__)
+        self.assertNotIn("call_provider_legacy", runtime_surface.__all__)
+        self.assertIn("call_provider_legacy", runtime_surface.LEGACY_RUNTIME_EXPORTS)
+        self.assertTrue(hasattr(runtime_surface, "call_provider_legacy"))
 
     async def test_weav_decision_llm_uses_provider_reported_usage(self) -> None:
         class Provider:

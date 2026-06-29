@@ -47,9 +47,11 @@ Generate runtime evidence reports:
 docode smoke-check --report .docode/smoke-check.json
 docode smoke-run --report .docode/smoke-run.json
 docode smoke-run --start-dobox --report .docode/smoke-run.json
+docode eval run tests/fixtures --report .docode/eval-report.json
 ```
 
 `smoke-check` verifies configured DoBox health, local DoBox backend path, Docker CLI/daemon access, APICred model access, local `gh` availability, database path, and artifact directory. `smoke-run` first runs those checks and then executes a `provider=scripted` end-to-end job when DoBox is reachable. Pass `--start-dobox` to temporarily run `go run ./cmd/server` from the configured local DoBox backend directory for the duration of the smoke check or smoke job.
+`eval run` aggregates saved eval case result JSON files into a report with success rate, iterations, tool calls, token/cost totals, failure reasons, and verification-plan failures.
 
 Workers claim queued jobs by atomically moving them to `preparing` before APICred authorization or DoBox project creation, so duplicate queue deliveries do not start duplicate sandboxes for the same job. On API startup, jobs interrupted in `preparing`, `running`, or `verifying` are requeued with an audit step before the worker begins claiming jobs.
 

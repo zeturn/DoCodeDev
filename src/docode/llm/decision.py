@@ -16,6 +16,9 @@ class AgentDecision:
     tool_name: str | None = None
     args: dict[str, Any] | None = None
     summary: str | None = None
+    verification: str | None = None
+    no_test_reason: str | None = None
+    remaining_risks: list[str] | None = None
 
 
 class DecisionLLM(Protocol):
@@ -47,7 +50,8 @@ class DoCodeDecisionAdapter:
         return (
             f"{system}\n\nAvailable tools JSON schema:\n{json.dumps(tool_specs, ensure_ascii=False)}\n\n"
             "Respond as JSON: {\"type\":\"tool_call\",\"tool_name\":\"...\",\"args\":{...}} "
-            "or {\"type\":\"final_candidate\",\"summary\":\"...\"}.\n\n"
+            "or {\"type\":\"final_candidate\",\"summary\":\"...\",\"verification\":\"...\","
+            "\"no_test_reason\":null,\"remaining_risks\":[]}.\n\n"
             f"Context:\n{context}"
         )
 
@@ -61,7 +65,17 @@ def parse_decision(raw: str) -> AgentDecision:
     if decision_type == "tool_call":
         return AgentDecision(type="tool_call", tool_name=str(data["tool_name"]), args=dict(data.get("args") or {}))
     if decision_type == "final_candidate":
-        return AgentDecision(type="final_candidate", summary=str(data.get("summary") or ""))
+        risks = data.get("remaining_risks") or []
+        if not isinstance(risks, list):
+            risks = [str(risks)]
+        no_test_reason = data.get("no_test_reason")
+        return AgentDecision(
+            type="final_candidate",
+            summary=str(data.get("summary") or ""),
+            verification=str(data.get("verification") or ""),
+            no_test_reason=str(no_test_reason) if no_test_reason else None,
+            remaining_risks=[str(risk) for risk in risks if str(risk)],
+        )
     raise ValueError(f"unsupported decision type: {decision_type}")
 
 

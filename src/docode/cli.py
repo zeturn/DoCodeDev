@@ -9,11 +9,12 @@ from docode.api.job_actions import CreateJobInput, create_coding_job
 from docode.config import load_config
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
-from docode.runtime.smoke import run_scripted_smoke_job, run_smoke_check, write_smoke_report
+from docode.eval import run_eval, write_eval_report
 from docode.storage.db import build_repository
 from docode.storage.models import public_job_dict
 from docode.worker.queue import AsyncJobQueue
-from docode.worker.runner import JobRunnerService
+
+JobRunnerService = None
 
 
 def main() -> None:
@@ -38,6 +39,12 @@ def main() -> None:
     smoke_run.add_argument("--report", default=".docode/smoke-run.json")
     smoke_run.add_argument("--start-dobox", action="store_true", help="Temporarily start the local DoBox backend for the smoke job if needed.")
 
+    eval_parser = subcommands.add_parser("eval", help="Run DoCode eval utilities.")
+    eval_subcommands = eval_parser.add_subparsers(dest="eval_command", required=True)
+    eval_run = eval_subcommands.add_parser("run", help="Aggregate eval fixture results into a report.")
+    eval_run.add_argument("fixtures_dir")
+    eval_run.add_argument("--report", default=".docode/eval-report.json")
+
     args = parser.parse_args()
     if args.command == "scripted-job":
         asyncio.run(run_scripted_job(args))
@@ -45,9 +52,15 @@ def main() -> None:
         asyncio.run(run_smoke_check_command(args))
     if args.command == "smoke-run":
         asyncio.run(run_smoke_run_command(args))
+    if args.command == "eval" and args.eval_command == "run":
+        run_eval_command(args)
 
 
 async def run_scripted_job(args: argparse.Namespace) -> None:
+    runner_cls = JobRunnerService
+    if runner_cls is None:
+        from docode.worker.runner import JobRunnerService as runner_cls
+
     config = load_config()
     repository = build_repository(config)
     queue = AsyncJobQueue()
@@ -71,7 +84,7 @@ async def run_scripted_job(args: argparse.Namespace) -> None:
             sandbox_network_mode=config.sandbox_network_mode,
         ),
     )
-    runner = JobRunnerService(config=config, repository=repository)
+    runner = runner_cls(config=config, repository=repository)
     await runner.run_job(job.id)
     completed = await repository.get_job(job.id)
     artifacts = await repository.list_artifacts(job.id)
@@ -80,15 +93,25 @@ async def run_scripted_job(args: argparse.Namespace) -> None:
 
 
 async def run_smoke_check_command(args: argparse.Namespace) -> None:
+    from docode.runtime.smoke import run_smoke_check, write_smoke_report
+
     report = await run_smoke_check(load_config(), start_dobox=args.start_dobox)
     write_smoke_report(report, Path(args.report))
     print(asdict(report))
 
 
 async def run_smoke_run_command(args: argparse.Namespace) -> None:
+    from docode.runtime.smoke import run_scripted_smoke_job, write_smoke_report
+
     report = await run_scripted_smoke_job(load_config(), instruction=args.instruction, start_dobox=args.start_dobox)
     write_smoke_report(report, Path(args.report))
     print(asdict(report))
+
+
+def run_eval_command(args: argparse.Namespace) -> None:
+    report = run_eval(Path(args.fixtures_dir))
+    write_eval_report(report, Path(args.report))
+    print(report.to_dict())
 
 
 if __name__ == "__main__":

@@ -121,7 +121,7 @@ class CodingAgentLoop:
                     )
                     continue
                 await self.repository.update_job(job.id, status=JobStatus.VERIFYING)
-                evidence = verification_evidence_from_steps(await self.repository.list_steps(job.id)).with_no_test_reason(final_summary)
+                evidence = verification_evidence_from_steps(await self.repository.list_steps(job.id)).with_no_test_reason(decision.no_test_reason)
                 verification = await self.verifier.verify(job, self.tools, evidence=evidence)
                 self.sync_llm_usage(state)
                 await self.repository.add_step(job.id, "verifier", verification_to_dict(verification))
@@ -311,6 +311,7 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
         "evidence": {
             "successful_fetch_urls": result.evidence.successful_fetch_urls,
             "successful_web_search_queries": result.evidence.successful_web_search_queries,
+            "relevant_fetch_urls": result.evidence.relevant_fetch_urls or [],
             "no_test_reason": result.evidence.no_test_reason,
         }
         if result.evidence
@@ -350,6 +351,12 @@ def decision_to_step(decision, usage_meter: LLMUsageMeter | None = None) -> dict
         payload["args"] = sanitize_tool_args(decision.args or {})
     if decision.summary:
         payload["summary"] = truncate_text(decision.summary, 2000)
+    if getattr(decision, "verification", None):
+        payload["verification"] = truncate_text(decision.verification, 2000)
+    if getattr(decision, "no_test_reason", None):
+        payload["no_test_reason"] = truncate_text(decision.no_test_reason, 1000)
+    if getattr(decision, "remaining_risks", None):
+        payload["remaining_risks"] = [truncate_text(str(risk), 500) for risk in decision.remaining_risks or []]
     if usage_meter is not None:
         payload["usage"] = usage_meter.snapshot()
     return payload

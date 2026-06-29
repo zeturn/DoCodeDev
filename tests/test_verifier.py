@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest import IsolatedAsyncioTestCase
 
 from docode.agent.verifier import CodingVerifier, VerificationEvidence, verification_evidence_from_steps
@@ -412,15 +413,26 @@ class VerifierTests(IsolatedAsyncioTestCase):
         result = await CodingVerifier().verify(
             CodingJob(id=new_id("job"), user_id="u1", instruction="add API adapter for external endpoint"),
             ApiVerifierTools(),
-            evidence=VerificationEvidence(successful_fetch_urls=["https://api.example.test/docs"], successful_web_search_queries=[]),
+            evidence=VerificationEvidence(
+                successful_fetch_urls=["https://api.example.test/docs"],
+                successful_web_search_queries=[],
+                relevant_fetch_urls=["https://api.example.test/docs"],
+            ),
         )
 
         self.assertTrue(result.passed)
         self.assertEqual(result.evidence.successful_fetch_urls, ["https://api.example.test/docs"])
+        self.assertEqual(result.evidence.relevant_fetch_urls, ["https://api.example.test/docs"])
 
     def test_verification_evidence_from_steps_collects_successful_source_tools(self) -> None:
         steps = [
-            {"type": "tool_result", "tool": "fetch_url", "exit_code": 0, "metadata": {"url": "https://example.test/docs"}},
+            {
+                "type": "tool_result",
+                "tool": "fetch_url",
+                "exit_code": 0,
+                "metadata": {"url": "https://example.test/docs", "goal": "api auth", "returned_bytes": 100, "status_code": 200},
+                "output": json.dumps({"confidence": "medium", "relevant_sections": [{"heading": "Auth", "text": "token"}]}),
+            },
             {"type": "tool_result", "tool": "web_search", "exit_code": 0, "metadata": {"query": "example api docs"}},
             {"type": "tool_result", "tool": "fetch_url", "exit_code": 1, "metadata": {"url": "https://bad.test"}},
         ]
@@ -428,7 +440,22 @@ class VerifierTests(IsolatedAsyncioTestCase):
         evidence = verification_evidence_from_steps(steps)
 
         self.assertEqual(evidence.successful_fetch_urls, ["https://example.test/docs"])
+        self.assertEqual(evidence.relevant_fetch_urls, ["https://example.test/docs"])
         self.assertEqual(evidence.successful_web_search_queries, ["example api docs"])
+
+    async def test_external_source_rejects_unrelated_fetch_url_evidence(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="add API adapter for external endpoint"),
+            ApiVerifierTools(),
+            evidence=VerificationEvidence(
+                successful_fetch_urls=["https://example.test/home"],
+                successful_web_search_queries=[],
+                relevant_fetch_urls=[],
+            ),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIn("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run", result.required_fixes)
 
     async def test_cli_plan_runs_python_entrypoint(self) -> None:
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)

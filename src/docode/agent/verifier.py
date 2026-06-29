@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import shlex
+import json
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
@@ -51,11 +52,12 @@ class VerificationPlan:
 class VerificationEvidence:
     successful_fetch_urls: list[str]
     successful_web_search_queries: list[str]
+    relevant_fetch_urls: list[str] | None = None
     no_test_reason: str | None = None
 
     @property
     def has_external_source_evidence(self) -> bool:
-        return bool(self.successful_fetch_urls or self.successful_web_search_queries)
+        return bool((self.relevant_fetch_urls or []) or self.successful_web_search_queries)
 
     @property
     def has_no_test_reason(self) -> bool:
@@ -66,6 +68,7 @@ class VerificationEvidence:
         return VerificationEvidence(
             successful_fetch_urls=self.successful_fetch_urls,
             successful_web_search_queries=self.successful_web_search_queries,
+            relevant_fetch_urls=self.relevant_fetch_urls,
             no_test_reason=reason,
         )
 
@@ -425,6 +428,7 @@ def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvi
 
 def verification_evidence_from_steps(steps) -> VerificationEvidence:
     fetch_urls: list[str] = []
+    relevant_fetch_urls: list[str] = []
     web_search_queries: list[str] = []
     for step in steps:
         content = getattr(step, "content", step)
@@ -436,15 +440,48 @@ def verification_evidence_from_steps(steps) -> VerificationEvidence:
             url = metadata.get("url")
             if isinstance(url, str) and url and url not in fetch_urls:
                 fetch_urls.append(url)
+            if isinstance(url, str) and fetch_result_relevant(content, metadata) and url not in relevant_fetch_urls:
+                relevant_fetch_urls.append(url)
         elif tool == "web_search":
             query = metadata.get("query")
             if isinstance(query, str) and query and query not in web_search_queries:
                 web_search_queries.append(query)
-    return VerificationEvidence(successful_fetch_urls=fetch_urls, successful_web_search_queries=web_search_queries)
+    return VerificationEvidence(successful_fetch_urls=fetch_urls, successful_web_search_queries=web_search_queries, relevant_fetch_urls=relevant_fetch_urls)
 
 
 def empty_verification_evidence() -> VerificationEvidence:
-    return VerificationEvidence(successful_fetch_urls=[], successful_web_search_queries=[])
+    return VerificationEvidence(successful_fetch_urls=[], successful_web_search_queries=[], relevant_fetch_urls=[])
+
+
+def fetch_result_relevant(content: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    goal = str(metadata.get("goal") or "").strip()
+    returned_bytes = int_or_zero(metadata.get("returned_bytes"))
+    status_code = int_or_zero(metadata.get("status_code"))
+    if not goal or returned_bytes <= 0 or (status_code and status_code >= 400):
+        return False
+    payload = parse_json_payload(content.get("output"))
+    confidence = str(payload.get("confidence") or metadata.get("confidence") or "").lower()
+    sections = payload.get("relevant_sections")
+    if confidence == "low":
+        return False
+    return isinstance(sections, list) and bool(sections)
+
+
+def parse_json_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def has_untracked_workspace_files(status: str) -> bool:

@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+"""
+Compatibility import surface for DoCode LLM runtime primitives.
+
+New code should import focused modules directly:
+- docode.llm.decision for AgentDecision and decision parsing
+- docode.llm.runtime_builder for runtime assembly
+- docode.llm.usage for usage metering
+- docode.llm.verifier_judge for verifier LLM judging
+
+Legacy provider compatibility helpers remain importable from this module for
+older callers, but are intentionally omitted from __all__.
+"""
+
 from .decision import AgentDecision, DecisionLLM, DoCodeDecisionAdapter, WeavDecisionLLM, parse_decision, parse_json_object
 from .dev_llms import GitHubTrendingCrawlerDecisionLLM, ScriptedDecisionLLM, is_github_trending_araneae_instruction, objective_id_from_instruction
 from .provider_compat import (
@@ -43,16 +56,19 @@ __all__ = [
     "DecisionLLM",
     "DoCodeDecisionAdapter",
     "DocodeRuntime",
-    "GitHubTrendingCrawlerDecisionLLM",
     "LLMUsageMeter",
-    "LocalLLMRouter",
-    "OpenAICompatibleChatClient",
-    "ProviderCallResult",
-    "ScriptedDecisionLLM",
     "WeavDecisionLLM",
     "WeavVerifierJudge",
     "build_docode_llm",
     "build_docode_runtime",
+]
+
+LEGACY_RUNTIME_EXPORTS = [
+    "GitHubTrendingCrawlerDecisionLLM",
+    "LocalLLMRouter",
+    "OpenAICompatibleChatClient",
+    "ProviderCallResult",
+    "ScriptedDecisionLLM",
     "build_provider_client",
     "build_runtime_policy",
     "build_runtime_router_async",
