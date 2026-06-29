@@ -57,6 +57,12 @@ def main() -> None:
     eval_jobs.add_argument("--user-id", default="eval")
     eval_jobs.add_argument("--start-dobox", action="store_true", help="Temporarily start the local DoBox backend for eval jobs if needed.")
     eval_jobs.add_argument("--no-serve-local-repos", action="store_true", help="Do not expose local eval repos through a temporary git server.")
+    eval_jobs.add_argument(
+        "--sandbox-retention",
+        choices=["keep", "delete_on_success", "delete_always"],
+        default="delete_always",
+        help="Sandbox retention policy for eval jobs.",
+    )
 
     args = parser.parse_args()
     if args.command == "scripted-job":
@@ -172,6 +178,7 @@ async def run_eval_jobs_command(args: argparse.Namespace) -> None:
 
 
 async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
+    config.sandbox_retention = args.sandbox_retention
     runner_cls = JobRunnerService
     if runner_cls is None:
         from docode.worker.runner import JobRunnerService as runner_cls

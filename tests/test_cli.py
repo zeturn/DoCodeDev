@@ -28,8 +28,11 @@ class FakeRunner:
 
 
 class CompletingFakeRunner(FakeRunner):
+    seen_retention: list[str] = []
+
     async def run_job(self, job_id: str) -> None:
         self.ran_job_ids.append(job_id)
+        self.seen_retention.append(self.config.sandbox_retention)
         await self.repository.add_step(job_id, "llm", {"type": "llm_decision", "usage": {"total_tokens": 25, "cost": 0.02}})
         await self.repository.add_step(job_id, "tool", {"type": "tool_call", "tool": "run_tests"})
         await self.repository.add_step(
@@ -43,6 +46,7 @@ class CompletingFakeRunner(FakeRunner):
 class CliTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         FakeRunner.ran_job_ids = []
+        CompletingFakeRunner.seen_retention = []
 
     async def test_scripted_job_uses_shared_job_creation_policy(self) -> None:
         repo = InMemoryJobRepository()
@@ -134,6 +138,7 @@ class CliTests(IsolatedAsyncioTestCase):
                 user_id="eval",
                 start_dobox=False,
                 no_serve_local_repos=True,
+                sandbox_retention="delete_always",
             )
 
             with (
@@ -147,6 +152,7 @@ class CliTests(IsolatedAsyncioTestCase):
             jobs = await repo.list_jobs()
             self.assertEqual(len(jobs), 1)
             self.assertEqual(CompletingFakeRunner.ran_job_ids, [jobs[0].id])
+            self.assertEqual(CompletingFakeRunner.seen_retention, ["delete_always"])
             result = json.loads((results_dir / "readme-only.json").read_text(encoding="utf-8"))
             self.assertTrue(result["success"])
             self.assertEqual(result["tokens"], 25)
@@ -205,6 +211,7 @@ class CliTests(IsolatedAsyncioTestCase):
                 user_id="eval",
                 start_dobox=True,
                 no_serve_local_repos=True,
+                sandbox_retention="delete_always",
             )
 
             with (
@@ -266,6 +273,7 @@ class CliTests(IsolatedAsyncioTestCase):
                 user_id="eval",
                 start_dobox=True,
                 no_serve_local_repos=True,
+                sandbox_retention="delete_always",
             )
 
             with (
