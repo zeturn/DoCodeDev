@@ -9,7 +9,7 @@ from docode.api.job_actions import CreateJobInput, create_coding_job
 from docode.config import load_config
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
-from docode.eval import run_eval, write_eval_report
+from docode.eval import run_eval, scaffold_eval_suite, write_eval_report
 from docode.storage.db import build_repository
 from docode.storage.models import public_job_dict
 from docode.worker.queue import AsyncJobQueue
@@ -44,6 +44,9 @@ def main() -> None:
     eval_run = eval_subcommands.add_parser("run", help="Aggregate eval fixture results into a report.")
     eval_run.add_argument("fixtures_dir")
     eval_run.add_argument("--report", default=".docode/eval-report.json")
+    eval_scaffold = eval_subcommands.add_parser("scaffold", help="Create the standard small-repository eval suite.")
+    eval_scaffold.add_argument("output_dir")
+    eval_scaffold.add_argument("--force", action="store_true", help="Replace an existing suite directory.")
 
     args = parser.parse_args()
     if args.command == "scripted-job":
@@ -54,6 +57,8 @@ def main() -> None:
         asyncio.run(run_smoke_run_command(args))
     if args.command == "eval" and args.eval_command == "run":
         run_eval_command(args)
+    if args.command == "eval" and args.eval_command == "scaffold":
+        run_eval_scaffold_command(args)
 
 
 async def run_scripted_job(args: argparse.Namespace) -> None:
@@ -112,6 +117,11 @@ def run_eval_command(args: argparse.Namespace) -> None:
     report = run_eval(Path(args.fixtures_dir))
     write_eval_report(report, Path(args.report))
     print(report.to_dict())
+
+
+def run_eval_scaffold_command(args: argparse.Namespace) -> None:
+    manifest = scaffold_eval_suite(Path(args.output_dir), force=args.force)
+    print({"manifest": str(Path(args.output_dir) / "manifest.json"), "cases": len(manifest["cases"])})
 
 
 if __name__ == "__main__":

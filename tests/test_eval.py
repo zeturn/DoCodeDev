@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import io
+import shutil
 from argparse import Namespace
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from docode.cli import run_eval_command
-from docode.eval import run_eval
+from docode.cli import run_eval_command, run_eval_scaffold_command
+from docode.eval import run_eval, scaffold_eval_suite
 
 
 class EvalTests(TestCase):
@@ -70,3 +71,43 @@ class EvalTests(TestCase):
             data = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(data["total"], 1)
             self.assertEqual(data["succeeded"], 1)
+
+    def test_scaffold_eval_suite_creates_ten_small_repos_and_manifest(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "suite"
+
+            manifest = scaffold_eval_suite(root)
+
+            self.assertEqual(len(manifest["cases"]), 10)
+            names = {case["name"] for case in manifest["cases"]}
+            self.assertEqual(
+                names,
+                {
+                    "python-bugfix",
+                    "python-cli",
+                    "crawler",
+                    "api-adapter",
+                    "readme-only",
+                    "js-bugfix",
+                    "no-test-project",
+                    "bad-web-source-repair",
+                    "large-command-output",
+                    "github-pr-artifact-export",
+                },
+            )
+            crawler_repo = root / "repos" / "crawler"
+            self.assertTrue((crawler_repo / "crawler.py").exists())
+            self.assertTrue((root / "manifest.json").exists())
+            if shutil.which("git") is not None:
+                self.assertTrue((crawler_repo / ".git").exists())
+                self.assertTrue(all(case["git_initialized"] for case in manifest["cases"]))
+
+    def test_eval_scaffold_command_writes_manifest(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "suite"
+
+            with redirect_stdout(io.StringIO()):
+                run_eval_scaffold_command(Namespace(output_dir=str(root), force=False))
+
+            data = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(data["cases"]), 10)
