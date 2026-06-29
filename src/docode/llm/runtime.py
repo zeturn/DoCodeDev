@@ -1,737 +1,88 @@
 from __future__ import annotations
 
-import json
-import re
-from dataclasses import dataclass, field
-from typing import Any, Protocol
-
-from docode.agent.output import prompt_safe_output
-from docode.agent.verifier import VerifierJudgement
-from docode.agent.weav_tools import build_agent_tool_registry
-from docode.dobox.tools import ToolDefinition
-from docode.dobox.types import ToolResult
-from docode.storage.models import CodingJob
-
-from .credentials import APICredCredentialResolver
-from .weav_apicred_store import APICredCredentialStore, APICredUsageSink, normalize_openai_compatible_provider
-
-
-@dataclass(frozen=True, slots=True)
-class AgentDecision:
-    type: str
-    tool_name: str | None = None
-    args: dict[str, Any] | None = None
-    summary: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderCallResult:
-    text: str
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    total_tokens: int | None = None
-    cost: float | None = None
-    tool_calls: list[Any] = field(default_factory=list)
-    raw: Any = None
-
-
-class DecisionLLM(Protocol):
-    async def decide(self, *, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> AgentDecision: ...
-
-
-class LocalLLMRouter:
-    """Small LLMRouter-compatible fallback for local development and tests."""
-
-    def __init__(self) -> None:
-        self.providers: dict[str, Any] = {}
-
-    def register(self, provider: str, client: Any) -> None:
-        self.providers[provider] = client
-
-    def get(self, provider: str) -> Any | None:
-        return self.providers.get(provider)
-
-
-@dataclass(slots=True)
-class DocodeRuntime:
-    provider: str
-    model: str
-    llm: DecisionLLM
-    router: Any = field(repr=False)
-    tools: Any = field(repr=False)
-    provider_client: Any | None = field(default=None, repr=False)
-    usage_sink: Any | None = field(default=None, repr=False)
-    usage_meter: LLMUsageMeter = field(default_factory=lambda: LLMUsageMeter(), repr=False)
-
-
-@dataclass(slots=True)
-class LLMUsageMeter:
-    calls: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    cost: float = 0.0
-    estimated: bool = True
-
-    @property
-    def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
-
-    def record_text_call(self, *, prompt: str, response: str, cost: float = 0.0) -> None:
-        self.calls += 1
-        self.prompt_tokens += estimate_tokens(prompt)
-        self.completion_tokens += estimate_tokens(response)
-        self.cost += cost
-
-    def record_provider_call(self, *, prompt: str, result: ProviderCallResult) -> None:
-        if result.prompt_tokens is None and result.completion_tokens is None and result.total_tokens is None:
-            self.record_text_call(prompt=prompt, response=result.text, cost=result.cost or 0.0)
-            return
-
-        prompt_tokens = result.prompt_tokens if result.prompt_tokens is not None else (0 if result.total_tokens is not None else estimate_tokens(prompt))
-        if result.completion_tokens is not None:
-            completion_tokens = result.completion_tokens
-        elif result.total_tokens is not None:
-            completion_tokens = max(0, result.total_tokens - prompt_tokens)
-        else:
-            completion_tokens = estimate_tokens(result.text)
-
-        self.calls += 1
-        self.prompt_tokens += prompt_tokens
-        self.completion_tokens += completion_tokens
-        self.cost += result.cost or 0.0
-        self.estimated = False
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "calls": self.calls,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "cost": self.cost,
-            "estimated": self.estimated,
-        }
-
-
-class DoCodeDecisionAdapter:
-    def __init__(self, provider_client: Any, model: str, usage_meter: LLMUsageMeter | None = None) -> None:
-        self.provider_client = provider_client
-        self.model = model
-        self.usage_meter = usage_meter
-
-    async def decide(self, *, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> AgentDecision:
-        prompt = self._format_prompt(system, messages, tools, context)
-        result = await call_provider(self.provider_client, prompt, self.model)
-        if self.usage_meter is not None:
-            self.usage_meter.record_provider_call(prompt=prompt, result=result)
-        return parse_decision(result.text)
-
-    def _format_prompt(self, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> str:
-        tool_specs = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema(),
-            }
-            for tool in tools
-        ]
-        return (
-            f"{system}\n\nAvailable tools JSON schema:\n{json.dumps(tool_specs, ensure_ascii=False)}\n\n"
-            "Respond as JSON: {\"type\":\"tool_call\",\"tool_name\":\"...\",\"args\":{...}} "
-            "or {\"type\":\"final_candidate\",\"summary\":\"...\"}.\n\n"
-            f"Context:\n{context}"
-        )
-
-
-WeavDecisionLLM = DoCodeDecisionAdapter
-
-
-class WeavVerifierJudge:
-    def __init__(self, provider_client: Any, model: str, usage_meter: LLMUsageMeter | None = None) -> None:
-        self.provider_client = provider_client
-        self.model = model
-        self.usage_meter = usage_meter
-
-    async def judge(
-        self,
-        *,
-        instruction: str,
-        status: ToolResult | None = None,
-        diff: str,
-        tests: ToolResult,
-        build: ToolResult,
-        lint: ToolResult,
-        smoke: ToolResult | None = None,
-    ) -> VerifierJudgement:
-        prompt = self._format_prompt(instruction=instruction, status=status, diff=diff, tests=tests, build=build, lint=lint, smoke=smoke)
-        result = await call_provider(self.provider_client, prompt, self.model)
-        if self.usage_meter is not None:
-            self.usage_meter.record_provider_call(prompt=prompt, result=result)
-        return parse_verifier_judgement(result.text)
-
-    def _format_prompt(
-        self,
-        *,
-        instruction: str,
-        status: ToolResult | None = None,
-        diff: str,
-        tests: ToolResult,
-        build: ToolResult,
-        lint: ToolResult,
-        smoke: ToolResult | None = None,
-    ) -> str:
-        status_section = f"Git status:\n{tool_result_for_prompt(status)}\n\n" if status is not None else ""
-        smoke_section = f"\n\nSmoke:\n{tool_result_for_prompt(smoke)}" if smoke is not None else ""
-        return (
-            "You are DoCode's independent verifier. Review whether the code diff satisfies the user's instruction.\n"
-            "You must consider the diff and the verification command outputs. Respond only as JSON with this shape:\n"
-            "{\"passed\":true,\"confidence\":0.86,\"reason\":\"...\",\"required_fixes\":[]}.\n\n"
-            f"Instruction:\n{instruction}\n\n"
-            f"{status_section}"
-            f"Diff:\n{truncate_for_prompt(diff, 30000)}\n\n"
-            f"Tests:\n{tool_result_for_prompt(tests)}\n\n"
-            f"Build:\n{tool_result_for_prompt(build)}\n\n"
-            f"Lint:\n{tool_result_for_prompt(lint)}"
-            f"{smoke_section}"
-        )
-
-
-class OpenAICompatibleChatClient:
-    def __init__(self, api_key: str | None, base_url: str | None = None, timeout_seconds: float = 120.0) -> None:
-        self.api_key = api_key or ""
-        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
-        self.timeout_seconds = timeout_seconds
-
-    async def achat(self, *, messages: list[dict[str, Any]], model: str) -> dict[str, Any]:
-        import httpx
-
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0,
-        }
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(f"{self.base_url}/chat/completions", json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        return data if isinstance(data, dict) else {"data": data}
-
-
-class ScriptedDecisionLLM:
-    """Deterministic development LLM for smoke tests and local end-to-end runs."""
-
-    def __init__(self, instruction: str) -> None:
-        self.instruction = instruction
-        self.calls = 0
-
-    async def decide(self, *, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> AgentDecision:
-        _ = system, messages, tools, context
-        self.calls += 1
-        if self.calls == 1:
-            return AgentDecision(
-                type="tool_call",
-                tool_name="write_file",
-                args={
-                    "path": "DOCODE_RESULT.md",
-                    "content": f"# DoCode Result\n\nInstruction: {self.instruction}\n\nStatus: implemented by scripted development agent.\n",
-                },
-            )
-        return AgentDecision(type="final_candidate", summary="Created DOCODE_RESULT.md and verified the workspace.")
-
-
-class GitHubTrendingCrawlerDecisionLLM:
-    def __init__(self, instruction: str) -> None:
-        from docode.llm.crawler_templates import github_trending_files
-
-        self.calls = 0
-        self.files = github_trending_files(objective_id=objective_id_from_instruction(instruction))
-        self.paths = list(self.files)
-
-    async def decide(self, *, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> AgentDecision:
-        _ = system, messages, tools, context
-        self.calls += 1
-        if self.calls == 1:
-            return AgentDecision(type="tool_call", tool_name="fetch_url", args={"url": "https://github.com/trending"})
-        file_index = self.calls - 2
-        if 0 <= file_index < len(self.paths):
-            path = self.paths[file_index]
-            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": path, "content": self.files[path]})
-        if self.calls == len(self.paths) + 2:
-            return AgentDecision(
-                type="tool_call",
-                tool_name="run_command",
-                args={
-                    "command": (
-                        "python3 -m unittest discover -s tests && "
-                        "python3 crawler.py --preflight && "
-                        "python3 crawler.py --dry-run && "
-                        "python3 crawler.py"
-                    ),
-                    "cwd": "/workspace",
-                },
-            )
-        return AgentDecision(
-            type="final_candidate",
-            summary="Built a standard-library GitHub Trending crawler artifact with parser tests, preflight, dry-run, CSV output, and Araneae structured sink events.",
-        )
-
-
-async def build_docode_llm(job: CodingJob, resolver: APICredCredentialResolver) -> DecisionLLM:
-    runtime = await build_docode_runtime(job, resolver)
-    return runtime.llm
-
-
-async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolver, dobox_tools: Any | None = None) -> DocodeRuntime:
-    tool_registry = build_agent_tool_registry(dobox_tools) if dobox_tools is not None else None
-    usage_meter = LLMUsageMeter()
-    usage_sink = APICredUsageSink(resolver)
-    if job.provider in {"scripted", "dev"} or job.model == "scripted":
-        return DocodeRuntime(
-            provider="scripted",
-            model="scripted",
-            llm=ScriptedDecisionLLM(job.instruction),
-            router=LocalLLMRouter(),
-            tools=tool_registry,
-            usage_sink=usage_sink,
-            usage_meter=usage_meter,
-        )
-    if is_github_trending_araneae_instruction(job.instruction):
-        return DocodeRuntime(
-            provider=job.provider,
-            model=job.model,
-            llm=GitHubTrendingCrawlerDecisionLLM(job.instruction),
-            router=LocalLLMRouter(),
-            tools=tool_registry,
-            usage_sink=usage_sink,
-            usage_meter=usage_meter,
-        )
-
-    runtime_context, ai_runtime = build_weav_runtime(job, resolver, usage_sink)
-    model_spec = await resolve_model_async(ai_runtime, provider=job.provider, model=job.model)
-    router = await build_runtime_router_async(ai_runtime, runtime_context)
-    provider_client = registered_provider(router, model_spec.provider)
-    if provider_client is None:
-        raise RuntimeError(f"provider_not_registered:{model_spec.provider}")
-    return DocodeRuntime(
-        provider=model_spec.provider,
-        model=model_spec.model,
-        llm=DoCodeDecisionAdapter(provider_client, model_spec.model, usage_meter),
-        router=router,
-        tools=tool_registry,
-        provider_client=provider_client,
-        usage_sink=usage_sink,
-        usage_meter=usage_meter,
-    )
-
-
-def build_weav_runtime(job: CodingJob, resolver: APICredCredentialResolver, usage_sink: APICredUsageSink) -> tuple[Any, Any]:
-    try:
-        from weav_ai_runtime import AIRuntime, AIRuntimeContext
-    except Exception as exc:  # pragma: no cover - only used with an out-of-date runtime install
-        raise RuntimeError(f"weav_ai_runtime_unavailable:{exc}") from exc
-
-    context = AIRuntimeContext(tenant=job.user_id, user_id=job.user_id, purpose="docode")
-    credential_store = APICredCredentialStore(resolver=resolver, user_id=job.user_id, provider=job.provider, model=job.model)
-    kwargs = {
-        "context": context,
-        "credentials": credential_store,
-        "model_catalog": credential_store,
-        "usage_sink": usage_sink,
-    }
-    try:
-        kwargs["policy"] = build_runtime_policy(job)
-        return context, AIRuntime(**kwargs)
-    except TypeError:
-        kwargs.pop("policy", None)
-        return context, AIRuntime(**kwargs)
-
-
-def build_runtime_policy(job: CodingJob) -> Any | None:
-    try:
-        from weav_ai_runtime import ModelSpec, RuntimePolicy
-    except Exception:
-        return None
-    provider = normalize_openai_compatible_provider(job.provider) if job.provider and job.provider not in {"scripted", "dev"} else ""
-    allowed_providers = [provider] if provider else []
-    return RuntimePolicy(
-        purpose="docode",
-        max_tokens=job.max_llm_tokens,
-        max_cost=job.max_llm_cost,
-        allowed_providers=allowed_providers,
-        fallback_chain=[ModelSpec(provider=provider, model=job.model)] if provider and job.model else [],
-    )
-
-
-async def resolve_model_async(ai_runtime: Any, *, provider: str, model: str) -> Any:
-    if hasattr(ai_runtime, "resolve_model_async"):
-        return await ai_runtime.resolve_model_async(provider=provider, model=model)
-    if ai_runtime.model_catalog is not None and hasattr(ai_runtime.model_catalog, "resolve_model"):
-        resolved = ai_runtime.model_catalog.resolve_model(ai_runtime.context, provider=provider, model=model)
-        if hasattr(resolved, "__await__"):
-            return await resolved
-        return resolved
-    return ai_runtime.resolve_model(provider=provider, model=model)
-
-
-async def build_runtime_router_async(ai_runtime: Any, context: Any) -> Any:
-    if hasattr(ai_runtime, "build_router_async"):
-        return await ai_runtime.build_router_async()
-    try:
-        from weav_ai_runtime import build_router_async
-    except Exception as exc:  # pragma: no cover - only used with an out-of-date runtime install
-        raise RuntimeError(f"weav_ai_runtime_async_router_unavailable:{exc}") from exc
-    return await build_router_async(context, ai_runtime.credentials)
-
-
-def registered_provider(router: Any, provider: str) -> Any | None:
-    if hasattr(router, "get"):
-        try:
-            found = router.get(provider)
-        except TypeError:
-            found = None
-        if found is not None:
-            return found
-    providers = getattr(router, "providers", None)
-    if isinstance(providers, dict):
-        return providers.get(provider)
-    return None
-
-
-def is_github_trending_araneae_instruction(instruction: str) -> bool:
-    lowered = instruction.lower()
-    return "github" in lowered and "trending" in lowered and "araneae-ready" in lowered and "crawler" in lowered
-
-
-def objective_id_from_instruction(instruction: str) -> str:
-    match = re.search(r"(?im)^Objective id:\s*([A-Za-z0-9_.:-]+)\s*$", instruction)
-    return match.group(1) if match else "obj_github_trending"
-
-
-def build_provider_client(provider: str, api_key: str | None, base_url: str | None) -> Any:
-    kwargs: dict[str, str] = {}
-    if api_key:
-        kwargs["api_key"] = api_key
-    if base_url:
-        kwargs["base_url"] = base_url
-    try:
-        from weav_ai_providers import build_provider
-
-        return build_provider(provider, **kwargs)
-    except Exception:
-        if provider.lower() in {"openai", "openai-compatible", "apicred"}:
-            return OpenAICompatibleChatClient(api_key=api_key, base_url=base_url)
-        raise
-
-
-async def call_provider(client: Any, prompt: str, model: str) -> ProviderCallResult:
-    try:
-        from weav_ai_runtime import call_llm_provider
-    except Exception:
-        return await call_provider_legacy(client, prompt, model)
-    result = await call_llm_provider(client, prompt=prompt, model=model, purpose="docode")
-    return provider_result_from_runtime_result(result)
-
-
-async def call_provider_legacy(client: Any, prompt: str, model: str) -> ProviderCallResult:
-    config = provider_completion_config(model)
-    if hasattr(client, "acomplete"):
-        try:
-            response = await client.acomplete(prompt=prompt, model=model)
-        except TypeError:
-            response = await client.acomplete(prompt, config)
-        return provider_call_result(response)
-    if hasattr(client, "complete"):
-        try:
-            response = client.complete(prompt=prompt, model=model)
-        except TypeError:
-            response = client.complete(prompt, config)
-            if hasattr(response, "__await__"):
-                response = await response
-        return provider_call_result(response)
-    if hasattr(client, "achat"):
-        try:
-            response = await client.achat(messages=[{"role": "user", "content": prompt}], model=model)
-        except TypeError:
-            response = await client.achat([{"role": "user", "content": prompt}], config)
-        return provider_call_result(response)
-    if hasattr(client, "chat"):
-        try:
-            response = client.chat(messages=[{"role": "user", "content": prompt}], model=model)
-        except TypeError:
-            response = client.chat([{"role": "user", "content": prompt}], config)
-            if hasattr(response, "__await__"):
-                response = await response
-        return provider_call_result(response)
-    raise RuntimeError("provider client does not expose a supported chat/completion method")
-
-
-async def call_provider_text(client: Any, prompt: str, model: str) -> str:
-    return (await call_provider(client, prompt, model)).text
-
-
-def provider_completion_config(model: str) -> Any:
-    try:
-        from weav_provider_router.base import CompletionConfig
-    except Exception:
-        return {"model": model}
-    return CompletionConfig(model=model, temperature=0.0)
-
-
-def provider_call_result(response: Any) -> ProviderCallResult:
-    runtime_result = normalize_provider_response(response)
-    if runtime_result is not None:
-        return provider_result_from_runtime_result(runtime_result)
-
-    usage = extract_usage(response)
-    text = extract_text(response)
-    if text is None:
-        text = str(response)
-    return ProviderCallResult(
-        text=text,
-        prompt_tokens=int_or_none(usage.get("prompt_tokens")),
-        completion_tokens=int_or_none(usage.get("completion_tokens")),
-        total_tokens=int_or_none(usage.get("total_tokens")),
-        cost=float_or_none(usage.get("cost")),
-        raw=response,
-    )
-
-
-def normalize_provider_response(response: Any) -> Any | None:
-    try:
-        from weav_ai_runtime import normalize_llm_call_result
-    except Exception:
-        return None
-    return normalize_llm_call_result(response, purpose="docode")
-
-
-def provider_result_from_runtime_result(response: Any) -> ProviderCallResult:
-    usage = getattr(response, "usage", None)
-    return ProviderCallResult(
-        text=str(getattr(response, "text")),
-        prompt_tokens=int_or_none(get_field(usage, "prompt_tokens")),
-        completion_tokens=int_or_none(get_field(usage, "completion_tokens")),
-        total_tokens=int_or_none(get_field(usage, "tokens") or get_field(usage, "total_tokens")),
-        cost=float_or_none(get_field(usage, "cost")),
-        tool_calls=list(getattr(response, "tool_calls", []) or []),
-        raw=getattr(response, "raw", response),
-    )
-
-
-def create_llm_router() -> Any:
-    router_cls = import_llm_router()
-    if router_cls is None:
-        return LocalLLMRouter()
-    try:
-        return router_cls()
-    except Exception:
-        return LocalLLMRouter()
-
-
-def import_llm_router() -> Any | None:
-    try:
-        from weav_ai_core import LLMRouter
-
-        return LLMRouter
-    except Exception:
-        pass
-    try:
-        from weav_ai_core.llm import LLMRouter
-
-        return LLMRouter
-    except Exception:
-        return None
-
-
-def register_provider(router: Any, provider: str, client: Any) -> None:
-    if hasattr(router, "register"):
-        try:
-            router.register(provider, client)
-            return
-        except TypeError:
-            router.register(client)
-            return
-    if hasattr(router, "providers"):
-        router.providers[provider] = client
-        return
-    raise RuntimeError("LLM router does not expose a supported register method")
-
-
-def parse_decision(raw: str) -> AgentDecision:
-    data = parse_json_object(raw)
-    decision_type = str(data.get("type", ""))
-    if decision_type == "tool_call":
-        return AgentDecision(type="tool_call", tool_name=str(data["tool_name"]), args=dict(data.get("args") or {}))
-    if decision_type == "final_candidate":
-        return AgentDecision(type="final_candidate", summary=str(data.get("summary") or ""))
-    raise ValueError(f"unsupported decision type: {decision_type}")
-
-
-def parse_verifier_judgement(raw: str) -> VerifierJudgement:
-    data = parse_json_object(raw)
-    required_fixes = data.get("required_fixes") or []
-    if not isinstance(required_fixes, list):
-        required_fixes = [str(required_fixes)]
-    return VerifierJudgement(
-        passed=bool(data.get("passed", False)),
-        confidence=clamp_confidence(data.get("confidence", 0.0)),
-        reason=str(data.get("reason") or ""),
-        required_fixes=[str(fix) for fix in required_fixes if str(fix)],
-    )
-
-
-def parse_json_object(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    start = text.find("{")
-    if start >= 0:
-        text = text[start:]
-    data, _ = json.JSONDecoder().raw_decode(text)
-    if not isinstance(data, dict):
-        raise ValueError("expected JSON object")
-    return data
-
-
-def clamp_confidence(value: object) -> float:
-    try:
-        confidence = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(1.0, confidence))
-
-
-def tool_result_for_prompt(result: ToolResult) -> str:
-    command = result.metadata.get("command") if result.metadata else None
-    detected = result.metadata.get("detected") if result.metadata else None
-    output = prompt_safe_output(result.output)
-    return json.dumps(
-        {
-            "tool": result.tool,
-            "command": command,
-            "detected": detected,
-            "exit_code": result.exit_code,
-            "truncated": result.truncated or output.truncated,
-            "original_output_lines": output.original_lines if output.truncated else None,
-            "original_output_bytes": output.original_bytes if output.truncated else None,
-            "output": output.text,
-        },
-        ensure_ascii=False,
-    )
-
-
-def truncate_for_prompt(text: str, limit: int) -> str:
-    encoded = text.encode("utf-8")
-    if len(encoded) <= limit:
-        return text
-    return encoded[:limit].decode("utf-8", errors="replace") + "\n<truncated>"
-
-
-def estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    # Conservative provider-agnostic estimate for billing guardrails when the
-    # provider adapter does not expose structured usage metadata.
-    return max(1, (len(text.encode("utf-8")) + 3) // 4)
-
-
-def extract_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        direct = first_present(value, "output_text", "text", "content")
-        if direct is not None:
-            return content_to_text(direct)
-        choices = value.get("choices")
-        if isinstance(choices, list) and choices:
-            return extract_text(choices[0])
-        message = value.get("message")
-        if message is not None:
-            return extract_text(message)
-        data = value.get("data")
-        if data is not None:
-            return extract_text(data)
-        output = value.get("output")
-        if output is not None:
-            return content_to_text(output)
-        return None
-
-    for attr in ("output_text", "text", "content"):
-        if hasattr(value, attr):
-            return content_to_text(getattr(value, attr))
-    if hasattr(value, "choices"):
-        choices = getattr(value, "choices")
-        if isinstance(choices, list) and choices:
-            return extract_text(choices[0])
-    if hasattr(value, "message"):
-        return extract_text(getattr(value, "message"))
-    return None
-
-
-def content_to_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        parts: list[str] = []
-        for item in value:
-            text = extract_text(item)
-            if text is not None:
-                parts.append(text)
-        return "\n".join(parts) if parts else None
-    if isinstance(value, dict):
-        direct = first_present(value, "text", "content", "value")
-        return content_to_text(direct) if direct is not None else None
-    return str(value)
-
-
-def extract_usage(value: Any) -> dict[str, object]:
-    usage = get_field(value, "usage") or get_field(value, "usage_metadata") or {}
-    result: dict[str, object] = {}
-    for target, candidates in {
-        "prompt_tokens": ("prompt_tokens", "input_tokens", "prompt", "input"),
-        "completion_tokens": ("completion_tokens", "output_tokens", "completion", "output"),
-        "total_tokens": ("total_tokens", "tokens", "total"),
-        "cost": ("cost", "total_cost", "amount"),
-    }.items():
-        result[target] = first_present(usage, *candidates)
-    for target in ("prompt_tokens", "completion_tokens", "total_tokens", "cost"):
-        if result.get(target) is None:
-            result[target] = get_field(value, target)
-    return result
-
-
-def first_present(value: Any, *keys: str) -> object | None:
-    for key in keys:
-        candidate = get_field(value, key)
-        if candidate is not None:
-            return candidate
-    return None
-
-
-def get_field(value: Any, key: str) -> object | None:
-    if isinstance(value, dict):
-        return value.get(key)
-    if hasattr(value, key):
-        return getattr(value, key)
-    return None
-
-
-def int_or_none(value: object) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def float_or_none(value: object) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+from .decision import AgentDecision, DecisionLLM, DoCodeDecisionAdapter, WeavDecisionLLM, parse_decision, parse_json_object
+from .dev_llms import GitHubTrendingCrawlerDecisionLLM, ScriptedDecisionLLM, is_github_trending_araneae_instruction, objective_id_from_instruction
+from .provider_compat import (
+    LocalLLMRouter,
+    OpenAICompatibleChatClient,
+    ProviderCallResult,
+    build_provider_client,
+    call_provider,
+    call_provider_legacy,
+    call_provider_text,
+    content_to_text,
+    create_llm_router,
+    extract_text,
+    extract_usage,
+    first_present,
+    float_or_none,
+    get_field,
+    import_llm_router,
+    int_or_none,
+    normalize_provider_response,
+    provider_call_result,
+    provider_completion_config,
+    provider_result_from_runtime_result,
+    register_provider,
+)
+from .runtime_builder import (
+    DocodeRuntime,
+    build_docode_llm,
+    build_docode_runtime,
+    build_runtime_policy,
+    build_runtime_router_async,
+    build_weav_runtime,
+    registered_provider,
+    resolve_model_async,
+)
+from .usage import LLMUsageMeter, estimate_tokens
+from .verifier_judge import WeavVerifierJudge, clamp_confidence, parse_verifier_judgement, tool_result_for_prompt, truncate_for_prompt
+
+__all__ = [
+    "AgentDecision",
+    "DecisionLLM",
+    "DoCodeDecisionAdapter",
+    "DocodeRuntime",
+    "GitHubTrendingCrawlerDecisionLLM",
+    "LLMUsageMeter",
+    "LocalLLMRouter",
+    "OpenAICompatibleChatClient",
+    "ProviderCallResult",
+    "ScriptedDecisionLLM",
+    "WeavDecisionLLM",
+    "WeavVerifierJudge",
+    "build_docode_llm",
+    "build_docode_runtime",
+    "build_provider_client",
+    "build_runtime_policy",
+    "build_runtime_router_async",
+    "build_weav_runtime",
+    "call_provider",
+    "call_provider_legacy",
+    "call_provider_text",
+    "clamp_confidence",
+    "content_to_text",
+    "create_llm_router",
+    "estimate_tokens",
+    "extract_text",
+    "extract_usage",
+    "first_present",
+    "float_or_none",
+    "get_field",
+    "import_llm_router",
+    "int_or_none",
+    "is_github_trending_araneae_instruction",
+    "normalize_provider_response",
+    "objective_id_from_instruction",
+    "parse_decision",
+    "parse_json_object",
+    "parse_verifier_judgement",
+    "provider_call_result",
+    "provider_completion_config",
+    "provider_result_from_runtime_result",
+    "registered_provider",
+    "register_provider",
+    "resolve_model_async",
+    "tool_result_for_prompt",
+    "truncate_for_prompt",
+]

@@ -259,15 +259,19 @@ def extract_url_content(
     title = extract_title(content, content_type)
     section_limit = max(1, min(int_or_default(max_sections, 8), 20))
     sections = select_relevant_sections(text, goal, section_limit)
+    confidence = extraction_confidence(goal, sections)
     payload: dict[str, Any] = {
         "url": url,
         "title": title,
         "summary": summarize_sections(sections),
         "relevant_sections": sections,
+        "confidence": confidence,
         "original_bytes": len(content.encode("utf-8")),
         "returned_bytes": 0,
         "truncated": False,
     }
+    if confidence == "low":
+        payload["warning"] = "No section strongly matched the goal; inspect another source or refine goal."
     payload, returned_bytes, truncated = fit_extraction_payload(payload, output_limit_bytes)
     payload["truncated"] = truncated
     payload["returned_bytes"] = len(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -332,6 +336,14 @@ def section_payload(chunk: str, goal_terms: set[str], *, matched_score: int) -> 
 def summarize_sections(sections: list[dict[str, str]]) -> str:
     text = "\n\n".join(section["text"] for section in sections)
     return text[:1200] + ("\n<truncated>" if len(text) > 1200 else "")
+
+
+def extraction_confidence(goal: str, sections: list[dict[str, str]]) -> str:
+    if not relevant_terms(goal):
+        return "medium"
+    if any(str(section.get("why_relevant", "")).startswith("matched") for section in sections):
+        return "medium"
+    return "low"
 
 
 def fit_extraction_payload(payload: dict[str, Any], output_limit_bytes: int) -> tuple[dict[str, Any], int, bool]:

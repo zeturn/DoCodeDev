@@ -7,7 +7,7 @@ from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.state import AgentState
 from docode.agent.stop_policy import StopPolicy
-from docode.agent.verifier import CodingVerifier, VerificationResult
+from docode.agent.verifier import CodingVerifier, VerificationResult, verification_evidence_from_steps
 from docode.artifacts.exporter import ArtifactExporter, terminal_artifact_id
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
@@ -121,7 +121,8 @@ class CodingAgentLoop:
                     )
                     continue
                 await self.repository.update_job(job.id, status=JobStatus.VERIFYING)
-                verification = await self.verifier.verify(job, self.tools)
+                evidence = verification_evidence_from_steps(await self.repository.list_steps(job.id)).with_no_test_reason(final_summary)
+                verification = await self.verifier.verify(job, self.tools, evidence=evidence)
                 self.sync_llm_usage(state)
                 await self.repository.add_step(job.id, "verifier", verification_to_dict(verification))
                 stop = self.stop_policy.evaluate(state)
@@ -306,6 +307,13 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
             "require_external_source_verified": result.verification_plan.require_external_source_verified,
         }
         if result.verification_plan
+        else None,
+        "evidence": {
+            "successful_fetch_urls": result.evidence.successful_fetch_urls,
+            "successful_web_search_queries": result.evidence.successful_web_search_queries,
+            "no_test_reason": result.evidence.no_test_reason,
+        }
+        if result.evidence
         else None,
     }
 
