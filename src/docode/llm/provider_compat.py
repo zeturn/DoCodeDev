@@ -73,7 +73,12 @@ async def call_provider(client: Any, prompt: str, model: str) -> ProviderCallRes
         from weav_ai_runtime import call_llm_provider
     except Exception:
         return await call_provider_legacy(client, prompt, model)
-    result = await call_llm_provider(client, prompt=prompt, model=model, purpose="docode")
+    try:
+        result = await call_llm_provider(client, prompt=prompt, model=model, purpose="docode")
+    except (AttributeError, TypeError):
+        result = await call_provider_legacy(client, prompt, model)
+    if isinstance(result, ProviderCallResult):
+        return result
     return provider_result_from_runtime_result(result)
 
 

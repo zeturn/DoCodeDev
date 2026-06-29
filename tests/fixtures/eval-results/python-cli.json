@@ -1,0 +1,13 @@
+{
+  "name": "python-cli",
+  "status": "succeeded",
+  "success": true,
+  "iterations": 2,
+  "tool_calls": 6,
+  "tokens": 900,
+  "cost": 0.03,
+  "verification": {
+    "passed": true,
+    "required_fixes": []
+  }
+}

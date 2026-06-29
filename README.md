@@ -50,10 +50,11 @@ docode smoke-run --start-dobox --report .docode/smoke-run.json
 docode eval scaffold .docode/eval-suite --force
 docode eval jobs .docode/eval-suite/manifest.json --results-dir .docode/eval-results --quality balanced
 docode eval run .docode/eval-results --report .docode/eval-report.json
+docode eval assert .docode/eval-report.json --min-success-rate 0.8 --max-avg-tool-calls 30 --max-cost 1.00
 ```
 
 `smoke-check` verifies configured DoBox health, local DoBox backend path, Docker CLI/daemon access, APICred model access, local `gh` availability, database path, and artifact directory. `smoke-run` first runs those checks and then executes a `provider=scripted` end-to-end job when DoBox is reachable. Pass `--start-dobox` to temporarily run `go run ./cmd/server` from the configured local DoBox backend directory for the duration of the smoke check or smoke job.
-`eval scaffold` creates ten small git repositories covering Python bugfix, Python CLI, crawler, API adapter, README-only, JS bugfix, no-test project, bad web source repair, large command output, and GitHub PR artifact export scenarios. `eval jobs` runs manifest cases through DoCode jobs and writes per-case result JSON files. `eval run` aggregates those saved eval results into a report with success rate, iterations, tool calls, token/cost totals, failure reasons, and verification-plan failures.
+`eval scaffold` creates ten small git repositories covering Python bugfix, Python CLI, crawler, API adapter, README-only, JS bugfix, no-test project, bad web source repair, large command output, and GitHub PR artifact export scenarios. `eval jobs` runs manifest cases through DoCode jobs and writes per-case result JSON files. `eval run` aggregates those saved eval results into a report with success rate, iterations, tool calls, token/cost totals, failure reasons, and verification-plan failures. `eval run` and `eval assert` accept `--min-success-rate`, `--max-avg-tool-calls`, and `--max-cost`; when a threshold fails, the report includes `regression`, `thresholds`, and `threshold_failures`, and the command exits non-zero.
 
 Workers claim queued jobs by atomically moving them to `preparing` before APICred authorization or DoBox project creation, so duplicate queue deliveries do not start duplicate sandboxes for the same job. On API startup, jobs interrupted in `preparing`, `running`, or `verifying` are requeued with an audit step before the worker begins claiming jobs.
 

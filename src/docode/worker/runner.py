@@ -12,6 +12,7 @@ from docode.artifacts.github import GitHubExporter
 from docode.config import DocodeConfig
 from docode.dobox.client import DoBoxClient
 from docode.dobox.tools import DoBoxTools
+from docode.dobox.types import CommandResult, FileResult
 from docode.integrations.basaltpass import BasaltPassTokenExchangeClient
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.runtime import WeavVerifierJudge, build_docode_runtime
@@ -139,6 +140,14 @@ class JobRunnerService:
                 command_timeout_seconds=self.config.command_timeout_seconds,
                 output_limit_bytes=self.config.output_limit_bytes,
             )
+            probe = await probe_workspace_consistency(dobox, project.project_id, session.session_id)
+            await self.repository.add_step(job.id, "system", probe)
+            if not probe["passed"]:
+                reason = "infrastructure_failed: workspace_inconsistent"
+                artifact_id = await self.export_failure_artifacts(job, reason, dobox)
+                failed = await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=reason, artifact_id=artifact_id)
+                await self.cleanup_sandbox_if_needed(dobox, failed)
+                return
             agent_tools = CompositeAgentTools(tools, self.build_web_tools())
             runtime = await build_docode_runtime(job, resolver, agent_tools)
             await self.repository.add_step(
@@ -436,3 +445,80 @@ class JobRunnerService:
 def runtime_budget(job_budget, apicred_budget):
     budgets = [budget for budget in (job_budget, apicred_budget) if budget is not None and budget > 0]
     return min(budgets) if budgets else None
+
+
+WORKSPACE_PROBE_COMMAND = """pwd
+id
+ls -la /workspace
+printf 'probe-ok\\n' > /workspace/.docode_probe
+cat /workspace/.docode_probe
+stat /workspace/.docode_probe
+python3 - <<'PY'
+from pathlib import Path
+p = Path("/workspace/.docode_probe")
+print(p.exists(), p.read_text())
+PY"""
+
+
+async def probe_workspace_consistency(dobox: DoBoxClient, project_id: str, agent_session_id: str | None) -> dict[str, object]:
+    diagnostics: dict[str, object] = {}
+    try:
+        command_result = await dobox.run_command(
+            project_id,
+            ["bash", "-lc", WORKSPACE_PROBE_COMMAND],
+            cwd="/workspace",
+            timeout_sec=30,
+            output_limit=200_000,
+            agent_session_id=agent_session_id,
+        )
+        diagnostics["command_probe"] = command_result_snapshot(command_result)
+        command_ok = command_result.exit_code == 0 and "probe-ok" in command_result.output and "True" in command_result.output
+
+        await dobox.write_file(project_id, ".docode_probe_api", "api-ok", agent_session_id=agent_session_id)
+        api_read_result = await dobox.read_file(project_id, ".docode_probe_api", agent_session_id=agent_session_id)
+        api_read = file_content(api_read_result)
+        diagnostics["file_api_read"] = file_result_snapshot(api_read_result)
+        cat_result = await dobox.run_command(
+            project_id,
+            ["bash", "-lc", "cat /workspace/.docode_probe_api"],
+            cwd="/workspace",
+            timeout_sec=30,
+            output_limit=20_000,
+            agent_session_id=agent_session_id,
+        )
+        diagnostics["file_api_exec_probe"] = command_result_snapshot(cat_result)
+        api_ok = api_read == "api-ok" and cat_result.exit_code == 0 and "api-ok" in cat_result.output
+        return {
+            "type": "workspace_probe",
+            "passed": command_ok and api_ok,
+            "category": None if command_ok and api_ok else "workspace_inconsistent",
+            "diagnostics": diagnostics,
+        }
+    except Exception as exc:
+        diagnostics["exception"] = {"type": type(exc).__name__, "message": str(exc)}
+        return {
+            "type": "workspace_probe",
+            "passed": False,
+            "category": "workspace_inconsistent",
+            "diagnostics": diagnostics,
+        }
+
+
+def command_result_snapshot(result: CommandResult) -> dict[str, object]:
+    return {"exit_code": result.exit_code, "output": result.output, "truncated": result.truncated}
+
+
+def file_content(result: FileResult | str) -> str:
+    return result.content if isinstance(result, FileResult) else str(result)
+
+
+def file_result_snapshot(result: FileResult | str) -> dict[str, object]:
+    if isinstance(result, FileResult):
+        return {
+            "content": result.content,
+            "path": result.path,
+            "file_name": result.file_name,
+            "bytes_read": result.bytes_read,
+            "truncated": result.truncated,
+        }
+    return {"content": str(result)}

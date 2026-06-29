@@ -336,11 +336,19 @@ async def run_smoke_verification(
     exit_code = result.exit_code
     if exit_code == 0 and smoke_output_indicates_failure(result.output):
         exit_code = 1
+    metadata = {"detected": True, "command": command, "changed_files": changed_files}
+    if exit_code != 0 and smoke_output_indicates_missing_file(result.output):
+        diagnostic = await safe_optional_tool_call("run_command", tools, workspace_diagnostic_command(), "/workspace")
+        metadata["workspace_diagnostic"] = {
+            "exit_code": diagnostic.exit_code,
+            "output": diagnostic.output,
+            "truncated": diagnostic.truncated,
+        }
     return ToolResult(
         tool="run_smoke",
         output=result.output,
         exit_code=exit_code,
-        metadata={"detected": True, "command": command, "changed_files": changed_files},
+        metadata=metadata,
         truncated=result.truncated,
     )
 
@@ -357,6 +365,15 @@ def changed_files_from_diff(diff: str) -> list[str]:
         if path and path != "/dev/null" and path not in files:
             files.append(path)
     return files
+
+
+def workspace_diagnostic_command() -> str:
+    return (
+        "pwd; "
+        "ls -la; "
+        "find /workspace -maxdepth 3 -type f | sort | head -200; "
+        "git -C /workspace status --short"
+    )
 
 
 def build_verification_plan(instruction: str) -> VerificationPlan:
@@ -619,6 +636,20 @@ def smoke_output_indicates_missing_endpoint(output: str) -> bool:
             "no such endpoint",
             '"status":404',
             "'status': 404",
+        )
+    )
+
+
+def smoke_output_indicates_missing_file(output: str) -> bool:
+    lowered = (output or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "no such file or directory",
+            "can't open file",
+            "cannot open",
+            "cannot find module",
+            "stat: cannot stat",
         )
     )
 

@@ -1,0 +1,13 @@
+{
+  "name": "python-bugfix",
+  "status": "succeeded",
+  "success": true,
+  "iterations": 3,
+  "tool_calls": 8,
+  "tokens": 1200,
+  "cost": 0.04,
+  "verification": {
+    "passed": true,
+    "required_fixes": []
+  }
+}

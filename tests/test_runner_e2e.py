@@ -62,6 +62,11 @@ class StatefulFakeDoBoxClient:
     ) -> CommandResult:
         self.agent_session_ids.append(agent_session_id)
         command_text = " ".join(command) if isinstance(command, list) else str(command)
+        if ".docode_probe_api" in command_text:
+            output = self.files.get(".docode_probe_api", "")
+            return CommandResult(output, 0 if output else 1)
+        if ".docode_probe" in command_text:
+            return CommandResult("/workspace\nuid=10001 gid=10001\nprobe-ok\nTrue probe-ok\n", 0)
         if "test -f" in command_text:
             return CommandResult("", 1)
         return CommandResult(f"ran {command_text}", 0)
@@ -118,6 +123,25 @@ class FailingArchiveDoBoxClient(StatefulFakeDoBoxClient):
         self.agent_session_ids.append(agent_session_id)
         lines = [f" A {path}" for path in sorted(self.files) if path != "README.md"]
         return CommandResult("\n".join(lines) + ("\n" if lines else ""), 0)
+
+
+class InconsistentWorkspaceDoBoxClient(StatefulFakeDoBoxClient):
+    async def run_command(
+        self,
+        project_id: str,
+        command,
+        cwd: str = "/workspace",
+        timeout_sec: int = 120,
+        output_limit: int = 1_000_000,
+        agent_session_id: str | None = None,
+    ) -> CommandResult:
+        self.agent_session_ids.append(agent_session_id)
+        command_text = " ".join(command) if isinstance(command, list) else str(command)
+        if ".docode_probe_api" in command_text:
+            return CommandResult("cat: /workspace/.docode_probe_api: No such file or directory\n", 1)
+        if ".docode_probe" in command_text:
+            return CommandResult("/workspace\nprobe-ok\nTrue probe-ok\n", 0)
+        return CommandResult(f"ran {command_text}", 0)
 
 
 class SlowCreateDoBoxClient(StatefulFakeDoBoxClient):
@@ -429,6 +453,41 @@ class RunnerE2ETests(IsolatedAsyncioTestCase):
             steps = await repo.list_steps(job.id)
             exchange_step = next(step for step in steps if step.content.get("type") == "basaltpass_token_exchange")
             self.assertEqual(exchange_step.content["status"], "exchanged")
+
+    async def test_runner_fails_before_llm_when_workspace_probe_is_inconsistent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            fake_dobox = InconsistentWorkspaceDoBoxClient()
+            runner = JobRunnerService(
+                config=DocodeConfig(artifact_dir=Path(tmp), sandbox_retention="delete_always"),
+                repository=repo,
+                dobox_client_factory=lambda: fake_dobox,
+                credential_resolver_factory=FakeCredentialResolver,
+            )
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="user-1",
+                    instruction="create a result file",
+                    provider="scripted",
+                    model="scripted",
+                    max_iterations=5,
+                    max_tool_calls=10,
+                )
+            )
+
+            await runner.run_job(job.id)
+
+            completed = await repo.get_job(job.id)
+            assert completed is not None
+            self.assertEqual(completed.status, JobStatus.FAILED)
+            self.assertEqual(completed.failure_reason, "infrastructure_failed: workspace_inconsistent")
+            self.assertEqual(fake_dobox.deleted_projects, ["project-1"])
+            steps = await repo.list_steps(job.id)
+            probe_step = next(step for step in steps if step.content.get("type") == "workspace_probe")
+            self.assertFalse(probe_step.content["passed"])
+            self.assertEqual(probe_step.content["category"], "workspace_inconsistent")
+            self.assertFalse(any(step.content.get("type") == "runtime_assembly" for step in steps))
 
     async def test_runner_keeps_success_when_usage_report_fails(self) -> None:
         with TemporaryDirectory() as tmp:

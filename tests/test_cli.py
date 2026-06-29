@@ -135,6 +135,12 @@ class CliTests(IsolatedAsyncioTestCase):
                 model=None,
                 quality=None,
                 limit=None,
+                max_iterations=80,
+                max_runtime_seconds=3600,
+                max_consecutive_failures=20,
+                max_tool_calls=300,
+                max_llm_tokens=500_000,
+                max_llm_cost=2.0,
                 user_id="eval",
                 start_dobox=False,
                 no_serve_local_repos=True,
@@ -153,6 +159,12 @@ class CliTests(IsolatedAsyncioTestCase):
             self.assertEqual(len(jobs), 1)
             self.assertEqual(CompletingFakeRunner.ran_job_ids, [jobs[0].id])
             self.assertEqual(CompletingFakeRunner.seen_retention, ["delete_always"])
+            self.assertEqual(jobs[0].max_iterations, 80)
+            self.assertEqual(jobs[0].max_runtime_seconds, 3600)
+            self.assertEqual(jobs[0].max_consecutive_failures, 20)
+            self.assertEqual(jobs[0].max_tool_calls, 300)
+            self.assertEqual(jobs[0].max_llm_tokens, 500_000)
+            self.assertEqual(jobs[0].max_llm_cost, 2.0)
             result = json.loads((results_dir / "readme-only.json").read_text(encoding="utf-8"))
             self.assertTrue(result["success"])
             self.assertEqual(result["tokens"], 25)
@@ -208,6 +220,12 @@ class CliTests(IsolatedAsyncioTestCase):
                 model=None,
                 quality=None,
                 limit=None,
+                max_iterations=None,
+                max_runtime_seconds=None,
+                max_consecutive_failures=None,
+                max_tool_calls=None,
+                max_llm_tokens=None,
+                max_llm_cost=None,
                 user_id="eval",
                 start_dobox=True,
                 no_serve_local_repos=True,
@@ -270,6 +288,12 @@ class CliTests(IsolatedAsyncioTestCase):
                 model=None,
                 quality=None,
                 limit=1,
+                max_iterations=None,
+                max_runtime_seconds=None,
+                max_consecutive_failures=None,
+                max_tool_calls=None,
+                max_llm_tokens=None,
+                max_llm_cost=None,
                 user_id="eval",
                 start_dobox=True,
                 no_serve_local_repos=True,

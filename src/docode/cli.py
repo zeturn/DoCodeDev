@@ -9,7 +9,18 @@ from docode.api.job_actions import CreateJobInput, create_coding_job
 from docode.config import load_config
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
-from docode.eval import eval_case_result_from_job, load_eval_manifest, managed_local_repo_server, run_eval, scaffold_eval_suite, write_eval_case_result, write_eval_report
+from docode.eval import (
+    EvalThresholds,
+    eval_case_result_from_job,
+    load_eval_manifest,
+    load_eval_report,
+    managed_local_repo_server,
+    run_eval,
+    scaffold_eval_suite,
+    with_eval_assertion,
+    write_eval_case_result,
+    write_eval_report,
+)
 from docode.storage.db import build_repository
 from docode.storage.models import public_job_dict
 from docode.worker.queue import AsyncJobQueue
@@ -44,6 +55,10 @@ def main() -> None:
     eval_run = eval_subcommands.add_parser("run", help="Aggregate eval fixture results into a report.")
     eval_run.add_argument("fixtures_dir")
     eval_run.add_argument("--report", default=".docode/eval-report.json")
+    add_eval_threshold_arguments(eval_run)
+    eval_assert = eval_subcommands.add_parser("assert", help="Fail when an eval report does not meet configured thresholds.")
+    eval_assert.add_argument("report")
+    add_eval_threshold_arguments(eval_assert)
     eval_scaffold = eval_subcommands.add_parser("scaffold", help="Create the standard small-repository eval suite.")
     eval_scaffold.add_argument("output_dir")
     eval_scaffold.add_argument("--force", action="store_true", help="Replace an existing suite directory.")
@@ -54,6 +69,12 @@ def main() -> None:
     eval_jobs.add_argument("--model")
     eval_jobs.add_argument("--quality")
     eval_jobs.add_argument("--limit", type=int)
+    eval_jobs.add_argument("--max-iterations", type=int)
+    eval_jobs.add_argument("--max-runtime-seconds", type=int)
+    eval_jobs.add_argument("--max-consecutive-failures", type=int)
+    eval_jobs.add_argument("--max-tool-calls", type=int)
+    eval_jobs.add_argument("--max-llm-tokens", type=int)
+    eval_jobs.add_argument("--max-llm-cost", type=float)
     eval_jobs.add_argument("--user-id", default="eval")
     eval_jobs.add_argument("--start-dobox", action="store_true", help="Temporarily start the local DoBox backend for eval jobs if needed.")
     eval_jobs.add_argument("--no-serve-local-repos", action="store_true", help="Do not expose local eval repos through a temporary git server.")
@@ -73,6 +94,8 @@ def main() -> None:
         asyncio.run(run_smoke_run_command(args))
     if args.command == "eval" and args.eval_command == "run":
         run_eval_command(args)
+    if args.command == "eval" and args.eval_command == "assert":
+        run_eval_assert_command(args)
     if args.command == "eval" and args.eval_command == "scaffold":
         run_eval_scaffold_command(args)
     if args.command == "eval" and args.eval_command == "jobs":
@@ -132,9 +155,38 @@ async def run_smoke_run_command(args: argparse.Namespace) -> None:
 
 
 def run_eval_command(args: argparse.Namespace) -> None:
-    report = run_eval(Path(args.fixtures_dir))
+    thresholds = eval_thresholds_from_args(args)
+    report = run_eval(Path(args.fixtures_dir), thresholds=thresholds)
     write_eval_report(report, Path(args.report))
     print(report.to_dict())
+    if report.assertion is not None and report.assertion.regression:
+        raise SystemExit(1)
+
+
+def run_eval_assert_command(args: argparse.Namespace) -> None:
+    thresholds = eval_thresholds_from_args(args)
+    if thresholds is None:
+        raise SystemExit("at least one eval threshold is required")
+    report = with_eval_assertion(load_eval_report(Path(args.report)), thresholds)
+    write_eval_report(report, Path(args.report))
+    print(report.assertion.to_dict() if report.assertion is not None else {"regression": False})
+    if report.assertion is not None and report.assertion.regression:
+        raise SystemExit(1)
+
+
+def add_eval_threshold_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--min-success-rate", type=float)
+    parser.add_argument("--max-avg-tool-calls", type=float, dest="max_average_tool_calls")
+    parser.add_argument("--max-cost", type=float, dest="max_total_cost")
+
+
+def eval_thresholds_from_args(args: argparse.Namespace) -> EvalThresholds | None:
+    thresholds = EvalThresholds(
+        min_success_rate=args.min_success_rate,
+        max_average_tool_calls=args.max_average_tool_calls,
+        max_total_cost=args.max_total_cost,
+    )
+    return thresholds if thresholds.to_dict() else None
 
 
 def run_eval_scaffold_command(args: argparse.Namespace) -> None:
@@ -206,6 +258,12 @@ async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
                     provider=args.provider,
                     model=args.model,
                     quality=args.quality,
+                    max_iterations=args.max_iterations,
+                    max_runtime_seconds=args.max_runtime_seconds,
+                    max_consecutive_failures=args.max_consecutive_failures,
+                    max_tool_calls=args.max_tool_calls,
+                    max_llm_tokens=args.max_llm_tokens,
+                    max_llm_cost=args.max_llm_cost,
                     artifact_mode=str(case.get("artifact_mode") or "patch"),
                     sandbox_network_mode=config.sandbox_network_mode,
                 ),

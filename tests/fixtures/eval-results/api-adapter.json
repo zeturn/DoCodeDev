@@ -1,0 +1,13 @@
+{
+  "name": "api-adapter",
+  "status": "succeeded",
+  "success": true,
+  "iterations": 3,
+  "tool_calls": 7,
+  "tokens": 1100,
+  "cost": 0.04,
+  "verification": {
+    "passed": true,
+    "required_fixes": []
+  }
+}

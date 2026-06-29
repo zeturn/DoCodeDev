@@ -24,6 +24,53 @@ class EvalCaseResult:
     cost: float = 0.0
     failure_reason: str | None = None
     verification_plan_failures: list[str] = field(default_factory=list)
+    failure_class: str | None = None
+    failure_category: str | None = None
+    infra_diagnostics: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EvalThresholds:
+    min_success_rate: float | None = None
+    max_average_tool_calls: float | None = None
+    max_total_cost: float | None = None
+
+    def to_dict(self) -> dict[str, float]:
+        values: dict[str, float] = {}
+        if self.min_success_rate is not None:
+            values["min_success_rate"] = self.min_success_rate
+        if self.max_average_tool_calls is not None:
+            values["max_average_tool_calls"] = self.max_average_tool_calls
+        if self.max_total_cost is not None:
+            values["max_total_cost"] = self.max_total_cost
+        return values
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any] | None) -> "EvalThresholds":
+        data = data or {}
+        return cls(
+            min_success_rate=optional_float(data.get("min_success_rate")),
+            max_average_tool_calls=optional_float(data.get("max_average_tool_calls")),
+            max_total_cost=optional_float(data.get("max_total_cost")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvalAssertion:
+    passed: bool
+    failures: list[str]
+    thresholds: EvalThresholds
+
+    @property
+    def regression(self) -> bool:
+        return not self.passed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "regression": self.regression,
+            "thresholds": self.thresholds.to_dict(),
+            "threshold_failures": self.failures,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,11 +106,14 @@ class EvalReport:
     tokens: int
     cost: float
     failure_reasons: dict[str, int]
+    failure_classes: dict[str, int]
+    failure_categories: dict[str, int]
     verification_plan_failures: dict[str, int]
     cases: list[EvalCaseResult]
+    assertion: EvalAssertion | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "total": self.total,
             "succeeded": self.succeeded,
             "failed": self.failed,
@@ -73,9 +123,14 @@ class EvalReport:
             "tokens": self.tokens,
             "cost": self.cost,
             "failure_reasons": self.failure_reasons,
+            "failure_classes": self.failure_classes,
+            "failure_categories": self.failure_categories,
             "verification_plan_failures": self.verification_plan_failures,
             "cases": [asdict(case) for case in self.cases],
         }
+        if self.assertion is not None:
+            data.update(self.assertion.to_dict())
+        return data
 
 
 def load_eval_manifest(path: Path) -> dict[str, Any]:
@@ -89,6 +144,9 @@ def eval_case_result_from_job(case: dict[str, Any], job: Any, steps: list[Any]) 
     status = status_value(getattr(job, "status", "missing"))
     usage = latest_usage_snapshot(steps)
     verification = latest_verification_step(steps)
+    failure_reason = getattr(job, "failure_reason", None)
+    infra_diagnostics = collect_infra_diagnostics(steps, verification)
+    failure_class, failure_category = classify_failure(status, failure_reason, steps, verification, infra_diagnostics)
     result = {
         "name": str(case.get("name") or getattr(job, "id", "unknown")),
         "category": case.get("category"),
@@ -100,10 +158,14 @@ def eval_case_result_from_job(case: dict[str, Any], job: Any, steps: list[Any]) 
         "tool_calls": count_steps(steps, "tool_call"),
         "tokens": int_or_zero(usage.get("total_tokens") or usage.get("tokens")),
         "cost": float_or_zero(usage.get("cost")),
-        "failure_reason": getattr(job, "failure_reason", None),
+        "failure_reason": failure_reason,
+        "failure_class": failure_class,
+        "infra_diagnostics": infra_diagnostics or None,
         "artifact_id": getattr(job, "artifact_id", None),
         "verification": verification,
     }
+    if failure_category:
+        result["failure_category"] = failure_category
     return result
 
 
@@ -115,12 +177,12 @@ def write_eval_case_result(result: dict[str, Any], results_dir: Path) -> Path:
     return path
 
 
-def run_eval(fixtures_dir: Path) -> EvalReport:
+def run_eval(fixtures_dir: Path, thresholds: EvalThresholds | None = None) -> EvalReport:
     cases = [load_eval_case(path) for path in sorted(fixtures_dir.glob("*.json"))]
     total = len(cases)
     succeeded = sum(1 for case in cases if case.success)
     failed = total - succeeded
-    return EvalReport(
+    report = EvalReport(
         total=total,
         succeeded=succeeded,
         failed=failed,
@@ -130,8 +192,76 @@ def run_eval(fixtures_dir: Path) -> EvalReport:
         tokens=sum(case.tokens for case in cases),
         cost=sum(case.cost for case in cases),
         failure_reasons=count_values(case.failure_reason for case in cases if case.failure_reason),
+        failure_classes=count_values(case.failure_class for case in cases if case.failure_class),
+        failure_categories=count_values(case.failure_category for case in cases if case.failure_category),
         verification_plan_failures=count_values(failure for case in cases for failure in case.verification_plan_failures),
         cases=cases,
+    )
+    if thresholds is None or not thresholds.to_dict():
+        return report
+    return with_eval_assertion(report, thresholds)
+
+
+def with_eval_assertion(report: EvalReport, thresholds: EvalThresholds) -> EvalReport:
+    return EvalReport(
+        total=report.total,
+        succeeded=report.succeeded,
+        failed=report.failed,
+        success_rate=report.success_rate,
+        iterations=report.iterations,
+        tool_calls=report.tool_calls,
+        tokens=report.tokens,
+        cost=report.cost,
+        failure_reasons=report.failure_reasons,
+        failure_classes=report.failure_classes,
+        failure_categories=report.failure_categories,
+        verification_plan_failures=report.verification_plan_failures,
+        cases=report.cases,
+        assertion=assert_eval_report(report, thresholds),
+    )
+
+
+def assert_eval_report(report: EvalReport, thresholds: EvalThresholds) -> EvalAssertion:
+    failures: list[str] = []
+    if thresholds.min_success_rate is not None and report.success_rate < thresholds.min_success_rate:
+        failures.append(f"success_rate {report.success_rate:.3f} < min_success_rate {thresholds.min_success_rate:.3f}")
+    average_tool_calls = (report.tool_calls / report.total) if report.total else 0.0
+    if thresholds.max_average_tool_calls is not None and average_tool_calls > thresholds.max_average_tool_calls:
+        failures.append(
+            f"average_tool_calls {average_tool_calls:.3f} > max_average_tool_calls {thresholds.max_average_tool_calls:.3f}"
+        )
+    if thresholds.max_total_cost is not None and report.cost > thresholds.max_total_cost:
+        failures.append(f"total_cost {report.cost:.6f} > max_total_cost {thresholds.max_total_cost:.6f}")
+    return EvalAssertion(passed=not failures, failures=failures, thresholds=thresholds)
+
+
+def load_eval_report(path: Path) -> EvalReport:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"eval report must be an object: {path}")
+    cases = [eval_case_from_mapping(item) for item in data.get("cases", []) if isinstance(item, dict)]
+    assertion = None
+    if isinstance(data.get("thresholds"), dict):
+        assertion = EvalAssertion(
+            passed=not bool(data.get("regression")),
+            failures=[str(failure) for failure in data.get("threshold_failures", [])],
+            thresholds=EvalThresholds.from_mapping(data.get("thresholds")),
+        )
+    return EvalReport(
+        total=int_or_zero(data.get("total")),
+        succeeded=int_or_zero(data.get("succeeded")),
+        failed=int_or_zero(data.get("failed")),
+        success_rate=float_or_zero(data.get("success_rate")),
+        iterations=int_or_zero(data.get("iterations")),
+        tool_calls=int_or_zero(data.get("tool_calls")),
+        tokens=int_or_zero(data.get("tokens")),
+        cost=float_or_zero(data.get("cost")),
+        failure_reasons=dict(data.get("failure_reasons") or {}),
+        failure_classes=dict(data.get("failure_classes") or {}),
+        failure_categories=dict(data.get("failure_categories") or {}),
+        verification_plan_failures=dict(data.get("verification_plan_failures") or {}),
+        cases=cases,
+        assertion=assertion,
     )
 
 
@@ -404,12 +534,26 @@ def load_eval_case(path: Path) -> EvalCaseResult:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"eval case must be an object: {path}")
+    return eval_case_from_mapping(data, default_name=path.stem)
+
+
+def eval_case_from_mapping(data: dict[str, Any], *, default_name: str = "case") -> EvalCaseResult:
     status = str(data.get("status") or "")
     success = bool(data.get("success", status.lower() in {"succeeded", "success", "passed"}))
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     verification = data.get("verification") if isinstance(data.get("verification"), dict) else {}
+    failure_class = str(data.get("failure_class") or "") or None
+    failure_category = str(data.get("failure_category") or "") or None
+    infra_diagnostics = data.get("infra_diagnostics") if isinstance(data.get("infra_diagnostics"), dict) else None
+    failure_class, failure_category = normalize_loaded_failure_class(
+        failure_class,
+        failure_category,
+        failure_reason=str(data.get("failure_reason") or "") or None,
+        verification_failures=verification_failures(verification),
+        infra_diagnostics=infra_diagnostics,
+    )
     return EvalCaseResult(
-        name=str(data.get("name") or path.stem),
+        name=str(data.get("name") or default_name),
         status=status or ("succeeded" if success else "failed"),
         success=success,
         iterations=int_or_zero(data.get("iterations")),
@@ -418,7 +562,32 @@ def load_eval_case(path: Path) -> EvalCaseResult:
         cost=float_or_zero(data.get("cost") or usage.get("cost")),
         failure_reason=str(data.get("failure_reason") or "") or None,
         verification_plan_failures=verification_failures(verification),
+        failure_class=failure_class,
+        failure_category=failure_category,
+        infra_diagnostics=infra_diagnostics,
     )
+
+
+def normalize_loaded_failure_class(
+    failure_class: str | None,
+    failure_category: str | None,
+    *,
+    failure_reason: str | None,
+    verification_failures: list[str],
+    infra_diagnostics: dict[str, Any] | None,
+) -> tuple[str | None, str | None]:
+    probe = (infra_diagnostics or {}).get("workspace_probe")
+    if (
+        failure_class == "infra_failed"
+        and failure_category == "workspace_inconsistent"
+        and isinstance(probe, dict)
+        and probe.get("passed") is True
+    ):
+        if verification_failures:
+            return "verifier_failed", "verifier_plan_failed"
+        if failure_reason == "max_consecutive_failures_exceeded":
+            return "agent_failed", "max_consecutive_failures_exceeded"
+    return failure_class, failure_category
 
 
 def verification_failures(verification: dict[str, Any]) -> list[str]:
@@ -449,8 +618,83 @@ def latest_verification_step(steps: list[Any]) -> dict[str, Any]:
                 "required_fixes": content.get("required_fixes") or [],
                 "verification_plan": content.get("verification_plan"),
                 "evidence": content.get("evidence"),
+                "smoke_result": content.get("smoke_result"),
             }
     return {}
+
+
+def classify_failure(
+    status: str,
+    failure_reason: str | None,
+    steps: list[Any],
+    verification: dict[str, Any],
+    infra_diagnostics: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    if status == "succeeded":
+        return None, None
+    reason = (failure_reason or "").lower()
+    step_contents = [step_content(step) for step in steps]
+    combined = " ".join(str(content) for content in step_contents).lower()
+
+    probe = infra_diagnostics.get("workspace_probe") if isinstance(infra_diagnostics.get("workspace_probe"), dict) else {}
+    if reason.startswith("infrastructure_failed:") or probe.get("passed") is False:
+        return "infra_failed", infra_category_from_reason(reason) or "workspace_inconsistent"
+    if "post /api/projects failed" in reason or "failed to create project" in reason:
+        return "infra_failed", "provider_call_failed"
+    if "server disconnected" in reason or "connection refused" in reason or "connection reset" in reason:
+        return "infra_failed", "provider_call_failed"
+    if "model_not_found" in combined or "model_not_available" in combined or "model unavailable" in combined:
+        return "model_unavailable", "model_catalog_mismatch"
+    if reason.startswith("apicred_authorize_failed"):
+        return "model_unavailable", "provider_call_failed"
+    if "provider_call_failed" in combined:
+        return "model_unavailable", "provider_call_failed"
+    if "max_llm_tokens_exceeded" in reason:
+        return "budget_exceeded", "max_llm_tokens_exceeded"
+    if "max_iterations_exceeded" in reason:
+        return "budget_exceeded", "max_iterations_exceeded"
+    if "max_tool_calls_exceeded" in reason:
+        return "budget_exceeded", "max_tool_calls_exceeded"
+    if "max_consecutive_failures_exceeded" in reason:
+        if "unsupported decision type" in combined:
+            return "agent_failed", "parser_failed"
+        if verification.get("passed") is False:
+            return "verifier_failed", "verifier_plan_failed"
+        return "agent_failed", "max_consecutive_failures_exceeded"
+    if "unsupported decision type" in combined:
+        return "agent_failed", "parser_failed"
+    if verification.get("passed") is False or verification.get("required_fixes"):
+        return "verifier_failed", "verifier_plan_failed"
+    if "workspace_diagnostic" in infra_diagnostics:
+        return "verifier_failed", "workspace_inconsistent"
+    return "agent_failed", None
+
+
+def infra_category_from_reason(reason: str) -> str | None:
+    if ":" not in reason:
+        return None
+    category = reason.split(":", 1)[1].strip().replace(" ", "_")
+    return category or None
+
+
+def collect_infra_diagnostics(steps: list[Any], verification: dict[str, Any]) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {}
+    for step in steps:
+        content = step_content(step)
+        if content.get("type") == "workspace_probe":
+            diagnostics["workspace_probe"] = {
+                "passed": content.get("passed"),
+                "category": content.get("category"),
+                "diagnostics": content.get("diagnostics"),
+            }
+        metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+        if "workspace_diagnostic" in metadata:
+            diagnostics["workspace_diagnostic"] = metadata["workspace_diagnostic"]
+    smoke = verification.get("smoke_result") if isinstance(verification.get("smoke_result"), dict) else {}
+    smoke_metadata = smoke.get("metadata") if isinstance(smoke.get("metadata"), dict) else {}
+    if "workspace_diagnostic" in smoke_metadata:
+        diagnostics["workspace_diagnostic"] = smoke_metadata["workspace_diagnostic"]
+    return diagnostics
 
 
 def count_steps(steps: list[Any], step_type: str) -> int:
@@ -487,6 +731,12 @@ def float_or_zero(value: Any) -> float:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 def initialize_git_repo(path: Path) -> bool:

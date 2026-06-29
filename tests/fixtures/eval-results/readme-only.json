@@ -1,0 +1,13 @@
+{
+  "name": "readme-only",
+  "status": "succeeded",
+  "success": true,
+  "iterations": 1,
+  "tool_calls": 3,
+  "tokens": 500,
+  "cost": 0.01,
+  "verification": {
+    "passed": true,
+    "required_fixes": []
+  }
+}

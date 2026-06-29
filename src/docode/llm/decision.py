@@ -76,6 +76,8 @@ def parse_decision(raw: str) -> AgentDecision:
             no_test_reason=str(no_test_reason) if no_test_reason else None,
             remaining_risks=[str(risk) for risk in risks if str(risk)],
         )
+    if decision_type and isinstance(data.get("args"), dict):
+        return AgentDecision(type="tool_call", tool_name=decision_type, args=dict(data.get("args") or {}))
     raise ValueError(f"unsupported decision type: {decision_type}")
 
 

@@ -9,8 +9,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from docode.cli import run_eval_command, run_eval_scaffold_command
-from docode.eval import eval_case_result_from_job, manifest_with_served_local_repos, run_eval, scaffold_eval_suite
+from docode.cli import run_eval_assert_command, run_eval_command, run_eval_scaffold_command
+from docode.eval import EvalThresholds, eval_case_result_from_job, manifest_with_served_local_repos, run_eval, scaffold_eval_suite
 from docode.storage.models import JobStatus, CodingJob, new_id
 
 
@@ -58,6 +58,7 @@ class EvalTests(TestCase):
             self.assertAlmostEqual(report.cost, 0.12)
             self.assertEqual(report.failure_reasons, {"external source blocked": 1})
             self.assertEqual(report.verification_plan_failures, {"verify data source": 1})
+            self.assertEqual(report.failure_classes, {})
 
     def test_eval_run_command_writes_report(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -67,11 +68,91 @@ class EvalTests(TestCase):
             (fixtures / "readme.json").write_text('{"status":"succeeded","iterations":1}', encoding="utf-8")
 
             with redirect_stdout(io.StringIO()):
-                run_eval_command(Namespace(fixtures_dir=str(fixtures), report=str(report_path)))
+                run_eval_command(
+                    Namespace(
+                        fixtures_dir=str(fixtures),
+                        report=str(report_path),
+                        min_success_rate=None,
+                        max_average_tool_calls=None,
+                        max_total_cost=None,
+                    )
+                )
 
             data = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(data["total"], 1)
             self.assertEqual(data["succeeded"], 1)
+
+    def test_run_eval_records_threshold_assertion(self) -> None:
+        with TemporaryDirectory() as tmp:
+            fixtures = Path(tmp)
+            (fixtures / "ok.json").write_text('{"status":"succeeded","tool_calls":10,"cost":0.20}', encoding="utf-8")
+            (fixtures / "bad.json").write_text('{"status":"failed","tool_calls":20,"cost":0.30}', encoding="utf-8")
+
+            report = run_eval(fixtures, thresholds=EvalThresholds(min_success_rate=0.8, max_average_tool_calls=12, max_total_cost=1.0))
+
+            data = report.to_dict()
+            self.assertTrue(data["regression"])
+            self.assertEqual(data["thresholds"]["min_success_rate"], 0.8)
+            self.assertEqual(len(data["threshold_failures"]), 2)
+
+    def test_eval_run_command_exits_nonzero_when_threshold_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            fixtures = Path(tmp) / "fixtures"
+            fixtures.mkdir()
+            report_path = Path(tmp) / "report.json"
+            (fixtures / "bad.json").write_text('{"status":"failed"}', encoding="utf-8")
+
+            with self.assertRaises(SystemExit) as raised, redirect_stdout(io.StringIO()):
+                run_eval_command(
+                    Namespace(
+                        fixtures_dir=str(fixtures),
+                        report=str(report_path),
+                        min_success_rate=0.8,
+                        max_average_tool_calls=None,
+                        max_total_cost=None,
+                    )
+                )
+
+            self.assertEqual(raised.exception.code, 1)
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(data["regression"])
+
+    def test_eval_assert_command_updates_existing_report(self) -> None:
+        with TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "report.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "total": 2,
+                        "succeeded": 1,
+                        "failed": 1,
+                        "success_rate": 0.5,
+                        "iterations": 2,
+                        "tool_calls": 8,
+                        "tokens": 100,
+                        "cost": 0.1,
+                        "failure_reasons": {},
+                        "verification_plan_failures": {},
+                        "cases": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit) as raised, redirect_stdout(io.StringIO()):
+                run_eval_assert_command(
+                    Namespace(
+                        report=str(report_path),
+                        min_success_rate=0.8,
+                        max_average_tool_calls=10,
+                        max_total_cost=1.0,
+                    )
+                )
+
+            self.assertEqual(raised.exception.code, 1)
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(data["regression"])
+            self.assertIn("min_success_rate", data["thresholds"])
 
     def test_scaffold_eval_suite_creates_ten_small_repos_and_manifest(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -135,6 +216,78 @@ class EvalTests(TestCase):
         self.assertEqual(result["cost"], 0.01)
         self.assertEqual(result["artifact_id"], "artifact-1")
         self.assertEqual(result["verification"]["passed"], True)
+
+    def test_eval_case_result_classifies_workspace_probe_failure(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="infrastructure_failed: workspace_inconsistent",
+        )
+        steps = [
+            {
+                "type": "workspace_probe",
+                "passed": False,
+                "category": "workspace_inconsistent",
+                "diagnostics": {"file_api_exec_probe": {"exit_code": 1}},
+            }
+        ]
+
+        result = eval_case_result_from_job({"name": "python-cli", "instruction": "fix"}, job, steps)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failure_class"], "infra_failed")
+        self.assertEqual(result["failure_category"], "workspace_inconsistent")
+        self.assertIn("workspace_probe", result["infra_diagnostics"])
+
+    def test_run_eval_aggregates_failure_classes_and_categories(self) -> None:
+        with TemporaryDirectory() as tmp:
+            fixtures = Path(tmp)
+            (fixtures / "budget.json").write_text(
+                json.dumps(
+                    {
+                        "name": "budget",
+                        "status": "failed",
+                        "failure_reason": "max_llm_tokens_exceeded",
+                        "failure_class": "budget_exceeded",
+                        "failure_category": "max_llm_tokens_exceeded",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (fixtures / "infra.json").write_text(
+                json.dumps(
+                    {
+                        "name": "infra",
+                        "status": "failed",
+                        "failure_reason": "infrastructure_failed: workspace_inconsistent",
+                        "failure_class": "infra_failed",
+                        "failure_category": "workspace_inconsistent",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = run_eval(fixtures)
+
+            self.assertEqual(report.failure_classes, {"budget_exceeded": 1, "infra_failed": 1})
+            self.assertEqual(report.failure_categories, {"max_llm_tokens_exceeded": 1, "workspace_inconsistent": 1})
+
+    def test_eval_case_result_classifies_parser_failures_under_agent_failed(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="max_consecutive_failures_exceeded",
+        )
+        steps = [{"type": "llm_error", "detail": "unsupported decision type: run_command"}]
+
+        result = eval_case_result_from_job({"name": "python-cli", "instruction": "fix"}, job, steps)
+
+        self.assertEqual(result["failure_class"], "agent_failed")
+        self.assertEqual(result["failure_category"], "parser_failed")
 
     def test_manifest_with_served_local_repos_rewrites_container_clone_url(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -1,0 +1,14 @@
+{
+  "name": "crawler",
+  "status": "failed",
+  "success": false,
+  "iterations": 5,
+  "tool_calls": 14,
+  "tokens": 1800,
+  "cost": 0.06,
+  "failure_reason": "fixture_expected_failure",
+  "verification": {
+    "passed": false,
+    "required_fixes": ["verify output records"]
+  }
+}

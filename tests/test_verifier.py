@@ -282,6 +282,26 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertEqual(result.smoke_result.exit_code, 0)
         self.assertIn("python3 crawler.py", result.smoke_result.metadata["command"])
 
+    async def test_python_smoke_missing_file_attaches_workspace_diagnostic(self) -> None:
+        class MissingFileTools(NoDetectedPythonVerifierTools):
+            async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+                self.commands.append(command)
+                _ = cwd
+                if "find /workspace" in command:
+                    return ToolResult(tool="run_command", output="/workspace\nREADME.md\n", exit_code=0)
+                return ToolResult(tool="run_command", output="python3: can't open file '/workspace/crawler.py': [Errno 2] No such file or directory", exit_code=2)
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="生成一个可运行的 Python 爬虫脚本抓取每日数据"),
+            MissingFileTools(smoke_exit_code=1),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIsNotNone(result.smoke_result)
+        diagnostic = result.smoke_result.metadata["workspace_diagnostic"]
+        self.assertEqual(diagnostic["exit_code"], 0)
+        self.assertIn("README.md", diagnostic["output"])
+
     async def test_python_crawler_smoke_checks_for_csv_output(self) -> None:
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)
 

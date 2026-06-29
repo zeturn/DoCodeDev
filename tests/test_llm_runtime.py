@@ -21,6 +21,7 @@ from docode.llm.runtime import (
     build_runtime_policy,
     build_docode_llm,
     build_docode_runtime,
+    call_provider,
     build_provider_client,
     estimate_tokens,
     parse_verifier_judgement,
@@ -178,6 +179,13 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertIn("No automated test", decision.no_test_reason)
         self.assertEqual(decision.remaining_risks, ["depends on prod config"])
 
+    async def test_parse_decision_accepts_tool_name_as_type(self) -> None:
+        decision = runtime_surface.parse_decision('{"type":"run_command","args":{"command":"python3 cli.py"}}')
+
+        self.assertEqual(decision.type, "tool_call")
+        self.assertEqual(decision.tool_name, "run_command")
+        self.assertEqual(decision.args, {"command": "python3 cli.py"})
+
     def test_runtime_all_excludes_legacy_provider_helpers(self) -> None:
         self.assertIn("build_docode_runtime", runtime_surface.__all__)
         self.assertNotIn("call_provider_legacy", runtime_surface.__all__)
@@ -206,6 +214,29 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertEqual(usage.prompt_tokens, 11)
         self.assertEqual(usage.completion_tokens, 7)
         self.assertFalse(usage.estimated)
+
+    async def test_call_provider_falls_back_when_runtime_uses_incompatible_config_shape(self) -> None:
+        runtime = types.ModuleType("weav_ai_runtime")
+
+        async def incompatible_call_llm_provider(client, *, prompt, model, purpose=None):
+            _ = client, prompt, model, purpose
+            raise AttributeError("'dict' object has no attribute 'model'")
+
+        runtime.call_llm_provider = incompatible_call_llm_provider
+        sys.modules["weav_ai_runtime"] = runtime
+
+        class Provider:
+            def complete(self, *args, **kwargs):
+                if kwargs:
+                    raise TypeError("positional config required")
+                prompt, config = args
+                self.prompt = prompt
+                self.model = config.model
+                return '{"type": "final_candidate", "summary": "fallback"}'
+
+        result = await call_provider(Provider(), "prompt", "gpt-test")
+
+        self.assertEqual(result.text, '{"type": "final_candidate", "summary": "fallback"}')
 
     async def test_provider_call_result_extracts_sdk_style_object(self) -> None:
         install_weav_stubs()
