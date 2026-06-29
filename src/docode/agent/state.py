@@ -6,6 +6,7 @@ from typing import Any
 
 from docode.agent.output import prompt_safe_output
 from docode.agent.inspector import ProjectInspection
+from docode.agent.task_contract import TaskContract
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
 
@@ -21,6 +22,10 @@ class AgentState:
     started_monotonic: float = field(default_factory=monotonic)
     consecutive_failures: int = 0
     inspection: ProjectInspection | None = None
+    task_contract: TaskContract | None = None
+    latest_git_status: ToolResult | None = None
+    repair_mode: str | None = None
+    stuck_count: int = 0
 
     def add_observation(self, content: str) -> None:
         self.messages.append({"role": "system", "kind": "observation", "content": content})

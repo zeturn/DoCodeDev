@@ -51,14 +51,28 @@ class ModelPolicyTests(IsolatedAsyncioTestCase):
         self.assertEqual(result.provider, "local")
         self.assertEqual(result.model, "codellm")
 
+    async def test_resolve_allows_dated_snapshot_when_base_model_is_available(self) -> None:
+        policy = DocodeModelPolicy(
+            DocodeConfig(default_provider="openai", default_model="gpt-4o-mini"),
+            FakeCatalogResolver({"openai": ["gpt-4o-mini"]}),
+        )
+
+        result = await policy.resolve(provider="openai", model="gpt-4o-mini-2024-07-18", user_id="user-1")
+
+        self.assertTrue(result.allowed)
+        self.assertEqual((result.provider, result.model), ("openai", "gpt-4o-mini-2024-07-18"))
+
     async def test_defaults_and_scripted_work_without_apicred_catalog(self) -> None:
         policy = DocodeModelPolicy(DocodeConfig(default_provider="openai", default_model="gpt-4o"), FakeCatalogResolver({}))
 
         default_result = await policy.resolve(provider=None, model=None, user_id="user-1")
+        explicit_result = await policy.resolve(provider="openai", model="gpt-4o-mini-2024-07-18", user_id="user-1")
         scripted_result = await policy.resolve(provider="dev", model=None, user_id="user-1")
 
         self.assertTrue(default_result.allowed)
         self.assertEqual((default_result.provider, default_result.model), ("openai", "gpt-4o"))
+        self.assertTrue(explicit_result.allowed)
+        self.assertEqual((explicit_result.provider, explicit_result.model), ("openai", "gpt-4o-mini-2024-07-18"))
         self.assertTrue(scripted_result.allowed)
         self.assertEqual((scripted_result.provider, scripted_result.model), ("scripted", "scripted"))
 

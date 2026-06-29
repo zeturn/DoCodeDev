@@ -9,7 +9,7 @@ from docode.storage.models import CodingJob
 from .credentials import APICredCredentialResolver
 from .decision import DecisionLLM, DoCodeDecisionAdapter
 from .dev_llms import GitHubTrendingCrawlerDecisionLLM, ScriptedDecisionLLM, is_github_trending_araneae_instruction
-from .provider_compat import LocalLLMRouter
+from .provider_compat import LocalLLMRouter, build_provider_client, register_provider
 from .usage import LLMUsageMeter
 from .weav_apicred_store import APICredCredentialStore, APICredUsageSink, normalize_openai_compatible_provider
 
@@ -56,7 +56,12 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
             usage_meter=usage_meter,
         )
 
-    runtime_context, ai_runtime = build_weav_runtime(job, resolver, usage_sink)
+    try:
+        runtime_context, ai_runtime = build_weav_runtime(job, resolver, usage_sink)
+    except RuntimeError as exc:
+        if not str(exc).startswith("weav_ai_runtime_unavailable:"):
+            raise
+        return await build_fallback_runtime(job, resolver, usage_sink, usage_meter, tool_registry)
     model_spec = await resolve_model_async(ai_runtime, provider=job.provider, model=job.model)
     router = await build_runtime_router_async(ai_runtime, runtime_context)
     provider_client = registered_provider(router, model_spec.provider)
@@ -69,6 +74,31 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
         router=router,
         tools=tool_registry,
         provider_client=provider_client,
+        usage_sink=usage_sink,
+        usage_meter=usage_meter,
+    )
+
+
+async def build_fallback_runtime(
+    job: CodingJob,
+    resolver: APICredCredentialResolver,
+    usage_sink: APICredUsageSink,
+    usage_meter: LLMUsageMeter,
+    tool_registry: Any | None,
+) -> DocodeRuntime:
+    credential = await resolver.resolve(user_id=job.user_id, provider=job.provider, model=job.model)
+    provider = credential.provider or job.provider
+    model = credential.model or job.model
+    client = build_provider_client(provider, credential.api_key, credential.base_url)
+    router = LocalLLMRouter()
+    register_provider(router, provider, client)
+    return DocodeRuntime(
+        provider=provider,
+        model=model,
+        llm=DoCodeDecisionAdapter(client, model, usage_meter),
+        router=router,
+        tools=tool_registry,
+        provider_client=client,
         usage_sink=usage_sink,
         usage_meter=usage_meter,
     )

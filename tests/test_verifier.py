@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from unittest import IsolatedAsyncioTestCase
 
-from docode.agent.verifier import CodingVerifier, VerificationEvidence, verification_evidence_from_steps
+from docode.agent.verifier import CodingVerifier, VerificationEvidence, build_verification_plan, verification_evidence_from_steps
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob, new_id
 
@@ -69,6 +69,22 @@ class UntrackedArtifactVerifierTools(PassingVerifierTools):
         return ToolResult(tool="run_command", output="ok", exit_code=0)
 
 
+class StatusOnlyChangeVerifierTools(PassingVerifierTools):
+    async def git_status(self) -> ToolResult:
+        return ToolResult(tool="git_status", output=" M calculator.py\n", exit_code=0)
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(tool="git_diff", output="", exit_code=0)
+
+    async def run_build(self) -> ToolResult:
+        return ToolResult(tool="run_build", output="ok", exit_code=0, metadata={"detected": False})
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        self.command = command
+        _ = cwd
+        return ToolResult(tool="run_command", output="ok", exit_code=0, metadata={"command": command})
+
+
 class RaisingVerifierTools(PassingVerifierTools):
     async def run_tests(self) -> ToolResult:
         raise RuntimeError("pytest crashed")
@@ -119,6 +135,25 @@ class DocsVerifierTools(PassingVerifierTools):
 
     async def run_build(self) -> ToolResult:
         return ToolResult(tool="run_build", output="no build command detected", exit_code=0, metadata={"detected": False})
+
+
+class CliHintVerifierTools(PassingVerifierTools):
+    def __init__(self) -> None:
+        self.command = ""
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(tool="git_diff", output="diff --git a/cli.py b/cli.py\n+print(f'Hello, {args.name}!')\n")
+
+    async def run_tests(self) -> ToolResult:
+        return ToolResult(tool="run_tests", output="no test command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_build(self) -> ToolResult:
+        return ToolResult(tool="run_build", output="no build command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        self.command = command
+        _ = cwd
+        return ToolResult(tool="run_command", output="Hello, Ada!\n", exit_code=0, metadata={"command": command})
 
 
 class ApiVerifierTools(PassingVerifierTools):
@@ -228,6 +263,16 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIn("diff --git a/crawler.py b/crawler.py", result.git_diff)
         self.assertIsNotNone(result.workspace_result)
         self.assertIn("python3 -m py_compile crawler.py", tools.command)
+
+    async def test_status_changes_count_as_change_evidence_when_git_diff_is_empty(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="ship it"),
+            StatusOnlyChangeVerifierTools(),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertIn("diff --git a/calculator.py b/calculator.py", result.git_diff)
+        self.assertNotIn("produce a non-empty git diff or explicit artifact", result.required_fixes)
 
     async def test_verifier_converts_tool_exception_to_failed_check(self) -> None:
         result = await CodingVerifier().verify(
@@ -419,6 +464,33 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(result.verification_plan)
         self.assertFalse(result.verification_plan.require_test_change)
         self.assertFalse(result.verification_plan.require_no_placeholder)
+
+    async def test_eval_verify_with_hint_becomes_smoke_command(self) -> None:
+        plan = build_verification_plan(
+            "Turn cli.py into a working command line tool that prints a greeting for --name.\n\n"
+            "Evaluation hints:\n"
+            "- verify with: python3 cli.py --name Ada"
+        )
+
+        self.assertEqual(plan.smoke_commands, ["python3 cli.py --name Ada"])
+
+    async def test_cli_verify_with_hint_is_used_for_smoke(self) -> None:
+        tools = CliHintVerifierTools()
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=(
+                    "Turn cli.py into a working command line tool that prints a greeting for --name.\n\n"
+                    "Evaluation hints:\n"
+                    "- verify with: python3 cli.py --name Ada"
+                ),
+            ),
+            tools,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertIn("python3 cli.py --name Ada", tools.command)
 
     async def test_external_source_requires_tool_evidence_not_diff_url(self) -> None:
         result = await CodingVerifier().verify(

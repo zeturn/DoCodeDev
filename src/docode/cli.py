@@ -77,6 +77,7 @@ def main() -> None:
     eval_jobs.add_argument("--max-llm-cost", type=float)
     eval_jobs.add_argument("--user-id", default="eval")
     eval_jobs.add_argument("--start-dobox", action="store_true", help="Temporarily start the local DoBox backend for eval jobs if needed.")
+    eval_jobs.add_argument("--include-hints", action="store_true", help="Append eval-only target file and command hints to each job instruction.")
     eval_jobs.add_argument("--no-serve-local-repos", action="store_true", help="Do not expose local eval repos through a temporary git server.")
     eval_jobs.add_argument(
         "--sandbox-retention",
@@ -246,6 +247,7 @@ async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
         cases = served_manifest["cases"][: args.limit] if args.limit else served_manifest["cases"]
         for case in cases:
             repo_url = case.get("repo_url") or case.get("repo_path")
+            instruction = eval_instruction_with_hints(case) if getattr(args, "include_hints", False) else str(case["instruction"])
             job = await create_coding_job(
                 repository=repository,
                 queue=queue,
@@ -253,7 +255,7 @@ async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
                 model_policy=model_policy,
                 user_id=args.user_id,
                 request=CreateJobInput(
-                    instruction=str(case["instruction"]),
+                    instruction=instruction,
                     repo_url=str(repo_url) if repo_url else None,
                     provider=args.provider,
                     model=args.model,
@@ -275,6 +277,40 @@ async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
             write_eval_case_result(result, Path(args.results_dir))
             results.append(result)
     print({"results_dir": args.results_dir, "cases": len(results), "succeeded": sum(1 for result in results if result.get("success"))})
+
+
+def eval_instruction_with_hints(case: dict[str, object]) -> str:
+    instruction = str(case["instruction"])
+    hints: list[str] = []
+    configured_hints = case.get("hints") if isinstance(case.get("hints"), dict) else {}
+    target_files = list_hint_values(configured_hints.get("target_files")) if configured_hints else []
+    expected_behavior = str(configured_hints.get("expected_behavior") or "").strip() if configured_hints else ""
+    suggested_commands = list_hint_values(configured_hints.get("suggested_commands")) if configured_hints else []
+    if target_files:
+        hints.append("target file: " + ", ".join(target_files[:5]))
+    if expected_behavior:
+        hints.append("expected behavior: " + expected_behavior)
+    if suggested_commands:
+        hints.append("verify with: " + "; ".join(suggested_commands[:5]))
+    files = case.get("files")
+    if not target_files and isinstance(files, dict):
+        target_files = [str(path) for path in files if not str(path).startswith("tests/")]
+        if target_files:
+            hints.append("Likely target files: " + ", ".join(target_files[:5]))
+    checks = case.get("expected_checks")
+    if not suggested_commands and isinstance(checks, list) and checks:
+        hints.append("Suggested verification commands: " + "; ".join(str(check) for check in checks[:5]))
+    if not hints:
+        return instruction
+    return instruction + "\n\nEvaluation hints:\n" + "\n".join(f"- {hint}" for hint in hints)
+
+
+def list_hint_values(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def write_eval_preflight_failures(args: argparse.Namespace, failure_reason: str) -> int:

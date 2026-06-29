@@ -97,6 +97,12 @@ class DoBoxTools:
                 {"path": "string", "old_text": "string", "new_text": "string", "expected_occurrences": "integer"},
                 self.edit_file,
             ),
+            ToolDefinition(
+                "replace_in_file",
+                "Alias for edit_file using find/replace arguments for small targeted changes.",
+                {"path": "string", "find": "string", "replace": "string", "expected_occurrences": "integer"},
+                self.replace_in_file,
+            ),
             ToolDefinition("apply_patch", "Apply a unified diff patch in the workspace and return a diff preview.", {"patch": "string"}, self.apply_patch),
             ToolDefinition("list_files", "List files under a workspace path.", {"path": "string"}, self.list_files),
             ToolDefinition("search", "Search project files for text.", {"query": "string", "path": "string"}, self.search),
@@ -186,6 +192,16 @@ class DoBoxTools:
         await self.client.write_file(self.project_id, path, updated, agent_session_id=self.agent_session_id)
         preview = unified_diff_preview(path, original, updated)
         return self._compress("edit_file", preview or "file edited; no diff preview", 0, metadata)
+
+    async def replace_in_file(self, path: str, find: str, replace: str, expected_occurrences: int = 1) -> ToolResult:
+        result = await self.edit_file(path, find, replace, expected_occurrences)
+        return ToolResult(
+            tool="replace_in_file",
+            output=result.output,
+            exit_code=result.exit_code,
+            metadata=result.metadata,
+            truncated=result.truncated,
+        )
 
     async def apply_patch(self, patch: str) -> ToolResult:
         if not isinstance(patch, str) or not patch.strip():

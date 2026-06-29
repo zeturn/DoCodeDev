@@ -4,6 +4,7 @@ from unittest import TestCase
 
 from docode.agent.context import ContextManager
 from docode.agent.inspector import ProjectInspection
+from docode.agent.task_contract import TaskContract
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob, new_id
 
@@ -46,6 +47,7 @@ class ContextManagerTests(TestCase):
             tool_calls_count=36,
             llm_tokens_used=1234,
             llm_cost_used=0.12,
+            task_contract=TaskContract(must_modify_files=["src/payments.py"], must_run_commands=["python3 -m unittest"]),
         )
         rendered = pack.render()
 
@@ -55,6 +57,11 @@ class ContextManagerTests(TestCase):
         self.assertIn("AssertionError: retry missing", rendered)
         self.assertIn("restore retry behavior", rendered)
         self.assertIn("src/payments.py", rendered)
+        self.assertIn("You must modify src/payments.py", rendered)
+        self.assertIn("You must produce non-empty git diff before final_candidate", rendered)
+        self.assertIn("Current Git Diff State", rendered)
+        self.assertIn('"src/payments.py"', rendered)
+        self.assertIn("final_candidate_allowed: yes after tests pass", rendered)
         self.assertLess(len(rendered.encode("utf-8")), 30_000)
         self.assertEqual(len(pack.recent_messages), 5)
         self.assertNotIn("line\n" * 1000, rendered)

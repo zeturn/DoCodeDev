@@ -156,13 +156,13 @@ class CredentialResolverTests(IsolatedAsyncioTestCase):
         self.assertEqual(credential.api_key, "apicred-api-token")
         self.assertEqual([call["path"] for call in resolver.calls], ["/runtime/authorize"])
 
-    async def test_proxy_mode_requires_apicred_token(self) -> None:
+    async def test_proxy_mode_allows_empty_apicred_token_for_local_proxy(self) -> None:
         resolver = APICredCredentialResolver("https://apicred.example/v1", "", mode="proxy")
 
-        with self.assertRaises(RuntimeError) as raised:
-            await resolver.resolve(user_id="user-1", provider="openai", model="gpt-5.4")
+        credential = await resolver.resolve(user_id="user-1", provider="openai", model="gpt-5.4")
 
-        self.assertEqual(str(raised.exception), "apicred_proxy_token_required")
+        self.assertEqual(credential.api_key, "")
+        self.assertEqual(credential.base_url, "https://apicred.example/v1")
 
     async def test_runtime_authorization_repr_hides_raw_payload(self) -> None:
         authorization = RuntimeAuthorization(

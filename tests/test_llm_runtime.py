@@ -84,6 +84,22 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertIsInstance(client, OpenAICompatibleChatClient)
         self.assertEqual(client.base_url, "https://llm.example/v1")
 
+    async def test_build_docode_runtime_falls_back_without_weav_runtime(self) -> None:
+        sys.modules.pop("weav_ai_runtime", None)
+        sys.modules.pop("weav_ai_providers", None)
+        resolver = RuntimeResolver()
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="change code", provider="openai", model="gpt-test")
+
+        runtime = await build_docode_runtime(job, resolver, DoBoxTools(object(), "project-1"))
+
+        self.assertEqual(runtime.provider, "openai")
+        self.assertEqual(runtime.model, "gpt-test")
+        self.assertEqual(resolver.resolve_calls, 1)
+        self.assertIsInstance(runtime.router, LocalLLMRouter)
+        self.assertIsInstance(runtime.provider_client, OpenAICompatibleChatClient)
+        self.assertEqual(runtime.provider_client.base_url, "https://llm.example/v1")
+        self.assertIsNotNone(runtime.tools.get("run_command"))
+
     async def test_scripted_runtime_does_not_resolve_credentials(self) -> None:
         resolver = RuntimeResolver()
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="script it", provider="scripted", model="scripted")

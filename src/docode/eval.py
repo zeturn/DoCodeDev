@@ -80,10 +80,11 @@ class EvalScenario:
     instruction: str
     files: dict[str, str]
     expected_checks: list[str]
+    hints: dict[str, Any] | None = None
     artifact_mode: str = "patch"
 
     def to_manifest_entry(self, repo_dir: Path, git_initialized: bool) -> dict[str, Any]:
-        return {
+        entry = {
             "name": self.name,
             "category": self.category,
             "instruction": self.instruction,
@@ -93,6 +94,9 @@ class EvalScenario:
             "expected_checks": self.expected_checks,
             "git_initialized": git_initialized,
         }
+        if self.hints:
+            entry["hints"] = self.hints
+        return entry
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,16 +395,21 @@ def free_tcp_port() -> int:
 
 
 def wait_for_git_repo_server(git: str, url: str, process: subprocess.Popen[str]) -> None:
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 20.0
     last_error = "not checked"
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"git daemon exited with code {process.returncode}")
-        result = subprocess.run([git, "ls-remote", url, "HEAD"], capture_output=True, text=True, check=False, timeout=2)
+        try:
+            result = subprocess.run([git, "ls-remote", url, "HEAD"], capture_output=True, text=True, check=False, timeout=5)
+        except subprocess.TimeoutExpired:
+            last_error = "git ls-remote timed out"
+            time.sleep(0.25)
+            continue
         if result.returncode == 0:
             return
         last_error = (result.stderr or result.stdout or "").strip()
-        time.sleep(0.1)
+        time.sleep(0.25)
     raise RuntimeError(f"git daemon did not become ready for {url}: {last_error}")
 
 
@@ -427,6 +436,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "README.md": "# Python Bugfix Fixture\n",
             },
             expected_checks=["python3 -m unittest discover -s tests"],
+            hints={
+                "target_files": ["calculator.py"],
+                "expected_behavior": "retry_count(3) should return 3 by returning attempts unchanged.",
+                "suggested_commands": ["python3 -m unittest discover -s tests"],
+            },
         ),
         EvalScenario(
             name="python-cli",
@@ -437,6 +451,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "README.md": "# Python CLI Fixture\nRun `python3 cli.py --name Ada`.\n",
             },
             expected_checks=["python3 cli.py --name Ada"],
+            hints={
+                "target_files": ["cli.py"],
+                "expected_behavior": "python3 cli.py --name Ada should print a greeting that includes Ada.",
+                "suggested_commands": ["python3 cli.py --name Ada"],
+            },
         ),
         EvalScenario(
             name="crawler",
@@ -448,6 +467,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "README.md": "# Crawler Fixture\n",
             },
             expected_checks=["python3 crawler.py", "python3 -c \"import json; assert len(json.load(open('data/output.json'))) >= 2\""],
+            hints={
+                "target_files": ["crawler.py"],
+                "expected_behavior": "data/output.json should contain at least two records parsed from fixtures/source.html.",
+                "suggested_commands": ["python3 crawler.py", "python3 -c \"import json; assert len(json.load(open('data/output.json'))) >= 2\""],
+            },
         ),
         EvalScenario(
             name="api-adapter",
@@ -458,6 +482,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "tests/test_client.py": "import unittest\nfrom client import parse_items_response\n\nclass ClientTests(unittest.TestCase):\n    def test_parse_items(self):\n        payload = '{\"items\":[{\"name\":\"north\"},{\"name\":\"south\"}]}'\n        self.assertEqual(parse_items_response(payload), ['north', 'south'])\n\nif __name__ == '__main__':\n    unittest.main()\n",
             },
             expected_checks=["python3 -m unittest discover -s tests"],
+            hints={
+                "target_files": ["client.py"],
+                "expected_behavior": "parse_items_response should return item names from the API response in order.",
+                "suggested_commands": ["python3 -m unittest discover -s tests"],
+            },
         ),
         EvalScenario(
             name="readme-only",
@@ -468,6 +497,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "tool.py": "def run():\n    return 'ok'\n",
             },
             expected_checks=["README contains installation and usage sections"],
+            hints={
+                "target_files": ["README.md"],
+                "expected_behavior": "README should include installation and usage sections.",
+                "suggested_commands": ["README contains installation and usage sections"],
+            },
         ),
         EvalScenario(
             name="js-bugfix",
@@ -479,6 +513,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "test.js": "const { sum } = require('./sum');\nif (sum([1,2,3]) !== 6) throw new Error('bad sum');\nconsole.log('ok');\n",
             },
             expected_checks=["npm test"],
+            hints={
+                "target_files": ["sum.js"],
+                "expected_behavior": "sum([1,2,3]) should return 6.",
+                "suggested_commands": ["npm test"],
+            },
         ),
         EvalScenario(
             name="no-test-project",
@@ -489,6 +528,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "README.md": "# No Test Fixture\n",
             },
             expected_checks=["python3 -m py_compile config_parser.py"],
+            hints={
+                "target_files": ["config_parser.py"],
+                "expected_behavior": "parse_enabled should recognize 'on' as enabled, not the typo 'onn'.",
+                "suggested_commands": ["python3 -m py_compile config_parser.py"],
+            },
         ),
         EvalScenario(
             name="bad-web-source-repair",
@@ -499,6 +543,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "README.md": "# Source Repair Fixture\n",
             },
             expected_checks=["fetch_url evidence required", "python3 -m py_compile source_config.py"],
+            hints={
+                "target_files": ["source_config.py"],
+                "expected_behavior": "SOURCE_URL should point to a documented working source and include verification evidence.",
+                "suggested_commands": ["fetch_url evidence required", "python3 -m py_compile source_config.py"],
+            },
         ),
         EvalScenario(
             name="large-command-output",
@@ -510,6 +559,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "generate_output.py": "for i in range(5000):\n    print('line', i)\n",
             },
             expected_checks=["python3 generate_output.py", "python3 -m unittest discover -s tests"],
+            hints={
+                "target_files": ["noisy.py"],
+                "expected_behavior": "status_line(999) should return 'done 999'.",
+                "suggested_commands": ["python3 generate_output.py", "python3 -m unittest discover -s tests"],
+            },
         ),
         EvalScenario(
             name="github-pr-artifact-export",
@@ -520,6 +574,11 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "module.py": "VALUE = 'old'\n",
             },
             expected_checks=["git diff is non-empty", "artifact_mode=pr"],
+            hints={
+                "target_files": ["module.py"],
+                "expected_behavior": "Make a minimal code change suitable for PR artifact export.",
+                "suggested_commands": ["git diff is non-empty", "artifact_mode=pr"],
+            },
             artifact_mode="pr",
         ),
     ]
@@ -645,6 +704,8 @@ def classify_failure(
         return "infra_failed", "provider_call_failed"
     if "model_not_found" in combined or "model_not_available" in combined or "model unavailable" in combined:
         return "model_unavailable", "model_catalog_mismatch"
+    if "llm_auth_failed" in reason or "401 unauthorized" in combined or "403 forbidden" in combined:
+        return "model_unavailable", "provider_auth_failed"
     if reason.startswith("apicred_authorize_failed"):
         return "model_unavailable", "provider_call_failed"
     if "provider_call_failed" in combined:

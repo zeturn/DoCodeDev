@@ -180,6 +180,10 @@ class EvalTests(TestCase):
             crawler_repo = root / "repos" / "crawler"
             self.assertTrue((crawler_repo / "crawler.py").exists())
             self.assertTrue((root / "manifest.json").exists())
+            bugfix = next(case for case in manifest["cases"] if case["name"] == "python-bugfix")
+            self.assertEqual(bugfix["hints"]["target_files"], ["calculator.py"])
+            self.assertIn("retry_count(3)", bugfix["hints"]["expected_behavior"])
+            self.assertEqual(bugfix["hints"]["suggested_commands"], ["python3 -m unittest discover -s tests"])
             if shutil.which("git") is not None:
                 self.assertTrue((crawler_repo / ".git").exists())
                 self.assertTrue(all(case["git_initialized"] for case in manifest["cases"]))
@@ -288,6 +292,21 @@ class EvalTests(TestCase):
 
         self.assertEqual(result["failure_class"], "agent_failed")
         self.assertEqual(result["failure_category"], "parser_failed")
+
+    def test_eval_case_result_classifies_llm_auth_failures_as_provider_auth(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="llm_auth_failed",
+        )
+        steps = [{"type": "llm_error", "reason": "llm_auth_failed", "detail": "401 Unauthorized"}]
+
+        result = eval_case_result_from_job({"name": "python-cli", "instruction": "fix"}, job, steps)
+
+        self.assertEqual(result["failure_class"], "model_unavailable")
+        self.assertEqual(result["failure_category"], "provider_auth_failed")
 
     def test_manifest_with_served_local_repos_rewrites_container_clone_url(self) -> None:
         with TemporaryDirectory() as tmp:

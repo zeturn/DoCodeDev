@@ -244,7 +244,7 @@ class JobActionTests(IsolatedAsyncioTestCase):
             (CreateJobInput(instruction="fix build", artifact_mode="tar"), "artifact_mode must be patch, zip, commit, or pr"),
             (CreateJobInput(instruction="fix build", max_iterations=0), "max_iterations must be between 1 and 200"),
             (CreateJobInput(instruction="fix build", max_runtime_seconds=29), "max_runtime_seconds must be between 30 and 86400"),
-            (CreateJobInput(instruction="fix build", max_consecutive_failures=0), "max_consecutive_failures must be between 1 and 50"),
+            (CreateJobInput(instruction="fix build", max_consecutive_failures=0), "max_consecutive_failures must be between 1 and 200"),
             (CreateJobInput(instruction="fix build", max_tool_calls=0), "max_tool_calls must be between 1 and 1000"),
             (CreateJobInput(instruction="fix build", max_llm_tokens=0), "max_llm_tokens must be between 1 and 10000000"),
             (CreateJobInput(instruction="fix build", max_llm_cost=0), "max_llm_cost must be greater than 0 and at most 10000"),

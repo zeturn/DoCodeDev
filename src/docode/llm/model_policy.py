@@ -109,6 +109,10 @@ class DocodeModelPolicy:
             return ModelPolicyResult(provider=requested_provider, model=requested_model, allowed=True, quality=requested_quality)
 
         provider_options = [option for option in options if option.provider == requested_provider]
+        if provider_options and dated_snapshot_base_model(requested_model) in {option.model for option in provider_options}:
+            return ModelPolicyResult(provider=requested_provider, model=requested_model, allowed=True, quality=requested_quality)
+        if provider_options and all(option.source == "config" for option in provider_options):
+            return ModelPolicyResult(provider=requested_provider, model=requested_model, allowed=True, quality=requested_quality)
         if provider_options and any(option.model == "" for option in provider_options):
             return ModelPolicyResult(provider=requested_provider, model=requested_model, allowed=True, quality=requested_quality)
         if provider_options:
@@ -162,6 +166,18 @@ def normalize_quality(value: str | None) -> str:
     if quality not in QUALITY_TIERS:
         raise ValueError("quality must be fast, balanced, or strong")
     return quality
+
+
+def dated_snapshot_base_model(model: str | None) -> str:
+    if model is None:
+        return ""
+    parts = model.rsplit("-", 3)
+    if len(parts) != 4:
+        return model
+    year, month, day = parts[1:]
+    if len(year) == 4 and len(month) == 2 and len(day) == 2 and year.isdigit() and month.isdigit() and day.isdigit():
+        return parts[0]
+    return model
 
 
 def best_option_for_quality(options: list[ModelOption], quality: str, config: DocodeConfig) -> ModelOption:

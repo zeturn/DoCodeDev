@@ -202,6 +202,17 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertIn("+hello there", result.output)
         self.assertEqual(client.files["README.md"], "hello there\nworld\n")
 
+    async def test_replace_in_file_alias_uses_find_replace_arguments(self) -> None:
+        client = FakeDoBoxClient()
+        tools = DoBoxTools(client, "project-123")
+
+        result = await tools.replace_in_file("README.md", "hello\n", "hello Ada\n")
+
+        self.assertEqual(result.tool, "replace_in_file")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("+hello Ada", result.output)
+        self.assertEqual(client.files["README.md"], "hello Ada\nworld\n")
+
     async def test_edit_file_rejects_missing_or_ambiguous_match(self) -> None:
         client = FakeDoBoxClient()
         client.files["README.md"] = "alpha\nbeta\nalpha\n"
@@ -286,6 +297,7 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertEqual(spec.input_schema["properties"]["command"]["type"], "string")
         self.assertEqual(spec.input_schema["required"], ["command"])
         self.assertIsNotNone(registry.get("edit_file"))
+        self.assertIsNotNone(registry.get("replace_in_file"))
         self.assertIsNotNone(registry.get("apply_patch"))
         self.assertIsNotNone(registry.get("preview"))
         self.assertIsNotNone(registry.get("logs"))

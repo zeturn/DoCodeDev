@@ -9,7 +9,7 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
 from docode.api.job_actions import JobActionError
-from docode.cli import run_eval_jobs_command, run_scripted_job
+from docode.cli import eval_instruction_with_hints, run_eval_jobs_command, run_scripted_job
 from docode.config import DocodeConfig
 from docode.runtime.smoke import SmokeCheck
 from docode.storage.models import JobStatus
@@ -44,6 +44,39 @@ class CompletingFakeRunner(FakeRunner):
 
 
 class CliTests(IsolatedAsyncioTestCase):
+    def test_eval_instruction_with_hints_appends_targets_and_checks(self) -> None:
+        instruction = eval_instruction_with_hints(
+            {
+                "instruction": "Fix the bug.",
+                "files": {"calculator.py": "...", "tests/test_calculator.py": "..."},
+                "expected_checks": ["python3 -m unittest discover -s tests"],
+            }
+        )
+
+        self.assertIn("Fix the bug.", instruction)
+        self.assertIn("Likely target files: calculator.py", instruction)
+        self.assertIn("Suggested verification commands: python3 -m unittest discover -s tests", instruction)
+
+    def test_eval_instruction_with_hints_prefers_manifest_hints(self) -> None:
+        instruction = eval_instruction_with_hints(
+            {
+                "instruction": "Fix the retry bug.",
+                "files": {"README.md": "..."},
+                "expected_checks": ["legacy check"],
+                "hints": {
+                    "target_files": ["calculator.py"],
+                    "expected_behavior": "retry_count(3) should return 3",
+                    "suggested_commands": ["python3 -m unittest discover -s tests"],
+                },
+            }
+        )
+
+        self.assertIn("Evaluation hints:", instruction)
+        self.assertIn("target file: calculator.py", instruction)
+        self.assertIn("expected behavior: retry_count(3) should return 3", instruction)
+        self.assertIn("verify with: python3 -m unittest discover -s tests", instruction)
+        self.assertNotIn("legacy check", instruction)
+
     async def asyncSetUp(self) -> None:
         FakeRunner.ran_job_ids = []
         CompletingFakeRunner.seen_retention = []

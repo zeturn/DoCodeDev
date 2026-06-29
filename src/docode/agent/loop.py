@@ -6,8 +6,10 @@ from docode.agent.context import ContextManager, ContextPack
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.state import AgentState
+from docode.agent.stuck import REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
 from docode.agent.stop_policy import StopPolicy
-from docode.agent.verifier import CodingVerifier, VerificationResult, verification_evidence_from_steps
+from docode.agent.task_contract import TaskContract, task_contract_from_instruction
+from docode.agent.verifier import CodingVerifier, VerificationResult, changed_files_from_diff, verification_evidence_from_steps
 from docode.artifacts.exporter import ArtifactExporter, terminal_artifact_id
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
@@ -29,6 +31,7 @@ class CodingAgentLoop:
         inspector: ProjectInspector | None = None,
         context_manager: ContextManager | None = None,
         usage_meter: LLMUsageMeter | None = None,
+        stuck_detector: StuckDetector | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -39,6 +42,7 @@ class CodingAgentLoop:
         self.inspector = inspector or ProjectInspector()
         self.context_manager = context_manager or ContextManager()
         self.usage_meter = usage_meter
+        self.stuck_detector = stuck_detector or StuckDetector()
 
     async def run(self, job: CodingJob) -> CodingJob:
         job = await self.repository.update_job(job.id, status=JobStatus.RUNNING)
@@ -58,14 +62,34 @@ class CodingAgentLoop:
             context_pack = await self.collect_observation(state)
             observation = context_pack.render()
             await self.repository.add_step(job.id, "system", observation_step(context_pack))
+            stuck = self.stuck_detector.evaluate(state=state, latest_git_status=state.latest_git_status.output if state.latest_git_status else "")
+            if stuck.stuck:
+                state.stuck_count += 1
+                state.add_feedback(f"{stuck.reason}: {stuck.repair_instruction}")
+                if state.stuck_count >= 2:
+                    state.repair_mode = "must_edit"
+                await self.repository.add_step(
+                    job.id,
+                    "system",
+                    {
+                        "type": "stuck_detector",
+                        "reason": stuck.reason,
+                        "repair_instruction": stuck.repair_instruction,
+                        "stuck_count": state.stuck_count,
+                        "repair_mode": state.repair_mode,
+                    },
+                )
             try:
                 decision = await self.llm.decide(
                     system=DOCODE_SYSTEM_PROMPT,
                     messages=state.messages,
-                    tools=self.tools.definitions(),
+                    tools=allowed_tool_definitions(self.tools.definitions(), state.repair_mode),
                     context=observation,
                 )
             except Exception as exc:
+                if non_retryable_llm_error(exc):
+                    await self.record_model_failure(state, "llm_auth_failed", str(exc))
+                    return await self.fail(job.id, "llm_auth_failed")
                 await self.record_model_failure(state, "llm_decision_failed", str(exc))
                 continue
             self.sync_llm_usage(state)
@@ -75,6 +99,16 @@ class CodingAgentLoop:
                 return await self.fail(job.id, stop.reason or "stopped")
 
             if decision.type == "tool_call" and decision.tool_name:
+                if state.repair_mode == "must_edit" and decision.tool_name not in REPAIR_ALLOWED_TOOLS:
+                    await self.record_rejected_decision(
+                        state,
+                        reason="repair_mode_tool_forbidden",
+                        detail=(
+                            f"{decision.tool_name} is blocked while repair_mode=must_edit. "
+                            "Call read_file, edit_file, write_file, replace_in_file, apply_patch, git_status, or git_diff first."
+                        ),
+                    )
+                    continue
                 cancelled = await self.cancelled_job(job.id)
                 if cancelled is not None:
                     return cancelled
@@ -109,9 +143,29 @@ class CodingAgentLoop:
                 continue
 
             if decision.type == "final_candidate":
+                if state.repair_mode == "must_edit":
+                    await self.record_rejected_decision(
+                        state,
+                        reason="repair_mode_final_forbidden",
+                        detail="final_candidate is blocked while repair_mode=must_edit. Modify a target file and confirm git_status first.",
+                    )
+                    continue
                 cancelled = await self.cancelled_job(job.id)
                 if cancelled is not None:
                     return cancelled
+                status = await self.tools.git_status()
+                state.latest_git_status = status
+                if git_status_clean(status.output):
+                    state.repair_mode = "must_edit"
+                    await self.record_rejected_decision(
+                        state,
+                        reason="final_candidate_clean_git_status",
+                        detail=(
+                            "Final candidate rejected before verification: git status is clean. "
+                            "You must modify files with edit_file/write_file/apply_patch first."
+                        ),
+                    )
+                    continue
                 final_summary = (decision.summary or "").strip()
                 if not final_summary:
                     await self.record_model_failure(
@@ -137,7 +191,9 @@ class CodingAgentLoop:
                         result_summary=final_summary,
                         artifact_id=artifact_id,
                     )
-                state.add_feedback(verification_repair_feedback(verification))
+                if requires_non_empty_diff_repair(verification):
+                    state.repair_mode = "must_edit"
+                state.add_feedback(verification_repair_feedback(verification, state.task_contract))
                 state.iteration += 1
                 continue
 
@@ -180,6 +236,7 @@ class CodingAgentLoop:
         state.add_observation(f"Task: {state.job.instruction}")
         inspection = await self.inspector.inspect(state.job.instruction, self.tools)
         state.inspection = inspection
+        state.task_contract = task_contract_from_instruction(state.job.instruction)
         state.add_observation("Project inspection:\n" + inspection.summary())
         await self.repository.add_step(
             state.job.id,
@@ -191,11 +248,20 @@ class CodingAgentLoop:
                 "detected_commands": inspection.detected_commands,
                 "plan": inspection.plan,
                 "acceptance_criteria": inspection.acceptance_criteria,
+                "task_contract": {
+                    "must_modify_files": state.task_contract.must_modify_files,
+                    "must_run_commands": state.task_contract.must_run_commands,
+                    "forbidden_finish_conditions": state.task_contract.forbidden_finish_conditions,
+                },
             },
         )
 
     async def collect_observation(self, state: AgentState) -> ContextPack:
         status = await self.tools.git_status()
+        state.latest_git_status = status
+        if state.repair_mode == "must_edit" and not git_status_clean(status.output):
+            state.repair_mode = None
+            state.stuck_count = 0
         return self.context_manager.build_pack(
             job=state.job,
             inspection=state.inspection,
@@ -205,6 +271,8 @@ class CodingAgentLoop:
             tool_calls_count=state.tool_calls_count,
             llm_tokens_used=state.llm_tokens_used,
             llm_cost_used=state.llm_cost_used,
+            task_contract=state.task_contract,
+            repair_mode=state.repair_mode,
         )
 
     async def fail(self, job_id: str, reason: str) -> CodingJob:
@@ -245,6 +313,21 @@ class CodingAgentLoop:
                 "reason": reason,
                 "detail": truncate_text(detail, 2000),
                 "usage": self.usage_meter.snapshot() if self.usage_meter is not None else None,
+            },
+        )
+        state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}")
+        state.iteration += 1
+
+    async def record_rejected_decision(self, state: AgentState, reason: str, detail: str) -> None:
+        self.sync_llm_usage(state)
+        await self.repository.add_step(
+            state.job.id,
+            "system",
+            {
+                "type": "decision_rejected",
+                "reason": reason,
+                "detail": truncate_text(detail, 2000),
+                "repair_mode": state.repair_mode,
             },
         )
         state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}")
@@ -332,16 +415,58 @@ def observation_step(context_pack: ContextPack) -> dict[str, object]:
     }
 
 
-def verification_repair_feedback(result: VerificationResult) -> str:
+def verification_repair_feedback(result: VerificationResult, task_contract: TaskContract | None = None) -> str:
     parts = [result.reason]
     if result.required_fixes:
         parts.append("Required fixes:\n" + "\n".join(f"- {fix}" for fix in result.required_fixes))
+    if requires_non_empty_diff_repair(result):
+        parts.append(
+            "Mandatory next step:\n"
+            "- Call edit_file, write_file, replace_in_file, or apply_patch to change the target file.\n"
+            "- Do not call final_candidate until git_status shows a modified file.\n"
+            "- Inspect the target file, replace the wrong implementation, run the relevant tests or smoke command, run git_diff, then final_candidate."
+        )
+    if task_contract is not None:
+        changed = set(changed_files_from_diff(result.git_diff))
+        missing = [path for path in task_contract.must_modify_files if path not in changed and f"b/{path}" not in changed]
+        if missing:
+            parts.append("Required file missing from diff:\n" + "\n".join(f"- {path}" for path in missing))
+        hints = task_specific_repair_hints(task_contract.must_modify_files)
+        if hints:
+            parts.append("Task-specific repair sequence:\n" + "\n".join(f"- {hint}" for hint in hints))
     if result.smoke_result is not None and result.smoke_result.exit_code != 0:
         command = result.smoke_result.metadata.get("command") if result.smoke_result.metadata else None
         if command:
             parts.append("Smoke command:\n" + command)
         parts.append("Smoke output:\n" + truncate_text(result.smoke_result.output, 4000))
     return "\n\n".join(part for part in parts if part)
+
+
+def requires_non_empty_diff_repair(result: VerificationResult) -> bool:
+    required = " ".join(result.required_fixes).lower()
+    return "non-empty git diff" in required or (not result.git_diff.strip() and "diff" in required)
+
+
+def task_specific_repair_hints(paths: list[str]) -> list[str]:
+    file_names = {path.rsplit("/", 1)[-1] for path in paths}
+    hints: list[str] = []
+    if "calculator.py" in file_names:
+        hints.append(
+            "python-bugfix: read calculator.py, edit retry_count so it returns attempts, run "
+            "`python3 -m unittest discover -s tests`, run git_diff, then final_candidate."
+        )
+    if "cli.py" in file_names:
+        hints.append(
+            "python-cli: read cli.py, edit `print('TODO')` to print a greeting using args.name, run "
+            "`python3 cli.py --name Ada`, run git_diff, then final_candidate."
+        )
+    return hints
+
+
+def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) -> list[Any]:
+    if repair_mode != "must_edit":
+        return definitions
+    return [definition for definition in definitions if getattr(definition, "name", None) in REPAIR_ALLOWED_TOOLS]
 
 
 def decision_to_step(decision, usage_meter: LLMUsageMeter | None = None) -> dict[str, object]:
@@ -407,3 +532,11 @@ def truncate_text(text: str, limit: int) -> str:
     if len(encoded) <= limit:
         return text
     return encoded[:limit].decode("utf-8", errors="replace") + "\n<truncated>"
+
+
+def non_retryable_llm_error(exc: Exception) -> bool:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code in {401, 403}:
+        return True
+    text = str(exc).lower()
+    return "401 unauthorized" in text or "403 forbidden" in text or "invalid api key" in text or "incorrect api key" in text

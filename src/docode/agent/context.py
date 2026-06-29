@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from docode.agent.inspector import ProjectInspection
+from docode.agent.stuck import git_status_clean
+from docode.agent.task_contract import TaskContract
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
 
@@ -46,8 +48,10 @@ class ContextManager:
         tool_calls_count: int,
         llm_tokens_used: int,
         llm_cost_used: float,
+        task_contract: TaskContract | None = None,
+        repair_mode: str | None = None,
     ) -> ContextPack:
-        task_contract = self.task_contract(job)
+        task_contract_text = self.task_contract(job, task_contract=task_contract, repair_mode=repair_mode)
         repo_map = self.repo_map(inspection)
         working_memory = self.working_memory(
             inspection=inspection,
@@ -58,10 +62,10 @@ class ContextManager:
             llm_cost_used=llm_cost_used,
         )
         file_memory = self.file_memory(inspection, messages)
-        latest_evidence = self.latest_evidence(git_status, messages)
+        latest_evidence = self.latest_evidence(git_status, messages, repair_mode=repair_mode)
         recent_messages = [compact_message(message) for message in messages[-self.recent_message_limit :]]
         return ContextPack(
-            task_contract=clip_text(task_contract, self.section_bytes),
+            task_contract=clip_text(task_contract_text, self.section_bytes),
             repo_map=clip_text(repo_map, self.section_bytes),
             working_memory=clip_text(working_memory, self.section_bytes),
             file_memory=clip_text(file_memory, self.section_bytes),
@@ -69,8 +73,8 @@ class ContextManager:
             recent_messages=recent_messages,
         )
 
-    def task_contract(self, job: CodingJob) -> str:
-        return (
+    def task_contract(self, job: CodingJob, *, task_contract: TaskContract | None = None, repair_mode: str | None = None) -> str:
+        parts = [
             f"Instruction:\n{job.instruction}\n\n"
             "Constraints:\n"
             f"- provider/model: {job.provider}/{job.model}\n"
@@ -79,7 +83,21 @@ class ContextManager:
             f"- max_tool_calls: {job.max_tool_calls}\n"
             f"- artifact_mode: {job.artifact_mode}\n"
             f"- sandbox_network_mode: {job.sandbox_network_mode}"
-        )
+        ]
+        if task_contract is not None:
+            mandatory: list[str] = []
+            mandatory.extend(f"You must modify {path}" for path in task_contract.must_modify_files)
+            mandatory.append("You must produce non-empty git diff before final_candidate")
+            mandatory.extend(f"You must run suggested command: {command}" for command in task_contract.must_run_commands)
+            mandatory.extend(task_contract.forbidden_finish_conditions)
+            parts.append("Mandatory:\n" + "\n".join(f"- {item}" for item in mandatory))
+        if repair_mode:
+            parts.append(
+                "Repair Mode:\n"
+                "- The next action must be read_file, edit_file, write_file, replace_in_file, apply_patch, git_status, or git_diff.\n"
+                "- final_candidate and run_command are blocked until git_status shows a modified file."
+            )
+        return "\n\n".join(parts)
 
     def repo_map(self, inspection: ProjectInspection | None) -> str:
         if inspection is None:
@@ -121,11 +139,18 @@ class ContextManager:
             parts.append("Touched or inspected paths:\n" + "\n".join(f"- {path}" for path in touched))
         return "\n\n".join(parts) if parts else "No file memory yet."
 
-    def latest_evidence(self, git_status: ToolResult, messages: list[dict[str, Any]]) -> str:
+    def latest_evidence(self, git_status: ToolResult, messages: list[dict[str, Any]], *, repair_mode: str | None = None) -> str:
         latest_tools = [message for message in messages if message.get("role") == "tool"][-5:]
         tool_summaries = "\n".join(tool_evidence(message) for message in latest_tools)
+        clean = git_status_clean(git_status.output)
+        changed = changed_files_from_status(git_status.output)
+        final_allowed = "no" if clean or repair_mode == "must_edit" else "yes"
         return (
             f"Git status:\n{git_status.output or '<clean>'}\n\n"
+            "Current Git Diff State:\n"
+            f"- git_status_clean: {str(clean).lower()}\n"
+            f"- changed_files: {json.dumps(changed, ensure_ascii=False)}\n"
+            f"- final_candidate_allowed: {final_allowed}{final_candidate_reason(clean, repair_mode)}\n\n"
             f"Latest tool evidence:\n{tool_summaries or '- No tool calls yet.'}"
         )
 
@@ -212,6 +237,27 @@ def touched_paths(messages: list[dict[str, Any]]) -> set[str]:
         if isinstance(metadata, dict) and isinstance(metadata.get("path"), str):
             paths.add(metadata["path"])
     return paths
+
+
+def changed_files_from_status(output: str) -> list[str]:
+    files: list[str] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[-1].strip()
+        if path and path not in files:
+            files.append(path)
+    return files
+
+
+def final_candidate_reason(clean: bool, repair_mode: str | None) -> str:
+    if clean:
+        return " because no file changes exist"
+    if repair_mode == "must_edit":
+        return " because repair_mode requires an edit confirmation first"
+    return " after tests pass"
 
 
 def clip_text(text: str, limit: int) -> str:

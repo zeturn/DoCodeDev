@@ -111,7 +111,8 @@ class CodingVerifier:
         status_complete = not status_result.truncated
         has_diff = diff_result.exit_code == 0 and bool(diff_result.output.strip())
         diff_complete = not diff_result.truncated
-        has_change_evidence = has_diff or has_explicit_artifact
+        has_status_change_evidence = status_result.exit_code == 0 and bool(changed_paths_from_status(status_result.output))
+        has_change_evidence = has_diff or has_explicit_artifact or has_status_change_evidence
         tests_ok = test_result.exit_code == 0
         build_ok = build_result.exit_code == 0
         lint_ok = lint_result.exit_code == 0
@@ -308,7 +309,10 @@ async def run_smoke_verification(
         if runnable or plan.require_entrypoint_run:
             runnable = runnable or runnable_python_entrypoints(python_files)
         if runnable:
-            commands.extend("python3 " + shlex.quote(path) for path in runnable[:1])
+            if plan.smoke_commands:
+                commands.extend(plan.smoke_commands)
+            else:
+                commands.extend("python3 " + shlex.quote(path) for path in runnable[:1])
             if requires_csv_output_check(job.instruction):
                 commands.append("python3 -c " + double_quote_shell_arg(csv_output_check_script()))
             elif requires_json_output_check(job.instruction):
@@ -329,7 +333,7 @@ async def run_smoke_verification(
             return ToolResult(tool="run_smoke", output="standard verification commands were detected; no additional smoke command selected", exit_code=0, metadata={"detected": False})
         return ToolResult(tool="run_smoke", output="no task-appropriate smoke command detected", exit_code=1, metadata={"detected": False, "changed_files": changed_files})
 
-    commands.extend(plan.smoke_commands)
+    commands.extend(command for command in plan.smoke_commands if command not in commands)
 
     command = " && ".join(commands)
     result = await safe_optional_tool_call("run_command", tools, command, "/workspace")
@@ -392,14 +396,30 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
         required_commands.append("api_contract_or_mock")
     if is_bugfix and not is_docs:
         required_commands.append("related_test")
+    smoke_commands = extracted_verification_commands(instruction)
     return VerificationPlan(
         required_commands=required_commands,
-        smoke_commands=[],
+        smoke_commands=smoke_commands,
         require_test_change=is_bugfix and not is_docs,
         require_entrypoint_run=is_crawler or is_cli,
         require_no_placeholder=not is_docs,
         require_external_source_verified=is_crawler or is_api,
     )
+
+
+def extracted_verification_commands(instruction: str) -> list[str]:
+    commands: list[str] = []
+    for raw_line in (instruction or "").splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
+            continue
+        _, value = line.split(":", 1)
+        for command in re.split(r"\s*;\s*", value.strip()):
+            command = command.strip(" -`")
+            if command and command not in commands:
+                commands.append(command)
+    return commands[:5]
 
 
 def evaluate_verification_plan(

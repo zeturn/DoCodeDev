@@ -7,6 +7,7 @@ from unittest import IsolatedAsyncioTestCase
 
 from docode.agent.loop import CodingAgentLoop, verification_repair_feedback
 from docode.agent.stop_policy import StopPolicy
+from docode.agent.task_contract import TaskContract
 from docode.agent.verifier import CodingVerifier, VerificationResult
 from docode.artifacts.exporter import ArtifactExporter
 from docode.dobox.types import ToolResult
@@ -108,6 +109,49 @@ class UnusableDecisionLLM:
         return AgentDecision(type="nonsense")
 
 
+class UnauthorizedLLM:
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, tools, context
+        raise RuntimeError("Client error '401 Unauthorized' for url 'http://localhost:8103/v1/chat/completions'")
+
+
+class PrematureFinalLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.observed_clean_status_feedback = False
+
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, tools, context
+        self.calls += 1
+        if self.calls == 1:
+            return AgentDecision(type="final_candidate", summary="Done without edits.")
+        if self.calls == 2:
+            self.observed_clean_status_feedback = any(
+                message.get("kind") == "feedback" and "Final candidate rejected before verification" in str(message.get("content"))
+                for message in messages
+            )
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "done\n"})
+        return AgentDecision(type="final_candidate", summary="Updated README after rejection.")
+
+
+class RepairModeForbiddenToolLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.tool_names_seen: list[list[str]] = []
+
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, context
+        self.calls += 1
+        self.tool_names_seen.append([getattr(tool, "name", "") for tool in tools])
+        if self.calls == 1:
+            return AgentDecision(type="final_candidate", summary="Done without edits.")
+        if self.calls == 2:
+            return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo nope"})
+        if self.calls == 3:
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "done\n"})
+        return AgentDecision(type="final_candidate", summary="Updated README after repair mode.")
+
+
 class FakeTools:
     def __init__(self, *, fail_first_write: bool = False) -> None:
         self.files: dict[str, str] = {}
@@ -184,6 +228,24 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIn("python3 -m py_compile scraper.py && python scraper.py", feedback)
         self.assertIn("Smoke output:", feedback)
         self.assertIn("SyntaxError", feedback)
+
+    def test_verification_feedback_includes_must_edit_repair_for_no_diff(self) -> None:
+        feedback = verification_repair_feedback(
+            VerificationResult(
+                passed=False,
+                confidence=0.2,
+                reason="Verification failed",
+                required_fixes=["produce a non-empty git diff or explicit artifact"],
+                git_diff="",
+            ),
+            TaskContract(must_modify_files=["calculator.py"], must_run_commands=["python3 -m unittest discover -s tests"]),
+        )
+
+        self.assertIn("Mandatory next step:", feedback)
+        self.assertIn("edit_file, write_file, replace_in_file, or apply_patch", feedback)
+        self.assertIn("Required file missing from diff:", feedback)
+        self.assertIn("calculator.py", feedback)
+        self.assertIn("python-bugfix", feedback)
 
     async def test_agent_loop_tools_verifies_and_exports_artifacts(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -377,6 +439,58 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             result_payload = json.loads((Path(tmp) / job.id / "result.json").read_text(encoding="utf-8"))
             self.assertEqual(result_payload["summary"], "Updated README after providing a final summary.")
 
+    async def test_agent_loop_rejects_final_candidate_when_git_status_is_clean(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update README.md"))
+            tools = FakeTools()
+            llm = PrematureFinalLLM()
+
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=6, max_runtime_seconds=60),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(result.result_summary, "Updated README after rejection.")
+            self.assertTrue(llm.observed_clean_status_feedback)
+            steps = await repo.list_steps(job.id)
+            rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
+            self.assertEqual(rejected[0].content["reason"], "final_candidate_clean_git_status")
+            verifier_steps = [step for step in steps if step.kind == "verifier"]
+            self.assertEqual(len(verifier_steps), 1)
+
+    async def test_agent_loop_repair_mode_rejects_forbidden_tool_until_edit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update README.md"))
+            tools = FakeTools()
+            llm = RepairModeForbiddenToolLLM()
+
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(result.result_summary, "Updated README after repair mode.")
+            self.assertEqual(tools.call_count, 1)
+            steps = await repo.list_steps(job.id)
+            rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
+            self.assertEqual([step.content["reason"] for step in rejected], ["final_candidate_clean_git_status", "repair_mode_tool_forbidden"])
+
     async def test_agent_loop_recovers_from_transient_tool_error(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
@@ -440,3 +554,52 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             llm_errors = [step for step in steps if step.content.get("type") == "llm_error"]
             self.assertEqual(len(llm_errors), 2)
             self.assertEqual(llm_errors[0].content["reason"], "model_returned_unusable_decision")
+
+    async def test_agent_loop_fails_fast_on_llm_auth_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update readme"))
+            tools = FakeTools()
+
+            loop = CodingAgentLoop(
+                llm=UnauthorizedLLM(),
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=10, max_runtime_seconds=60, max_consecutive_failures=5),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.FAILED)
+            self.assertEqual(result.failure_reason, "llm_auth_failed")
+            self.assertEqual(tools.call_count, 0)
+            steps = await repo.list_steps(job.id)
+            llm_errors = [step for step in steps if step.content.get("type") == "llm_error"]
+            self.assertEqual(len(llm_errors), 1)
+            self.assertEqual(llm_errors[0].content["reason"], "llm_auth_failed")
+
+    async def test_agent_loop_records_stuck_detector_step_after_clean_no_edit_loop(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update README.md"))
+            tools = FakeTools()
+
+            loop = CodingAgentLoop(
+                llm=UnusableDecisionLLM(),
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60, max_consecutive_failures=20),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.FAILED)
+            self.assertEqual(result.failure_reason, "max_iterations_exceeded")
+            steps = await repo.list_steps(job.id)
+            stuck_steps = [step for step in steps if step.content.get("type") == "stuck_detector"]
+            self.assertGreaterEqual(len(stuck_steps), 1)
+            self.assertEqual(stuck_steps[0].content["reason"], "no_diff_after_multiple_iterations")

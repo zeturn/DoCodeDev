@@ -169,8 +169,6 @@ class APICredCredentialResolver:
         return RuntimeAuthorization(allowed=True, reason="apicred_proxy_chat_completions", raw=raw)
 
     def _proxy_credential(self, *, provider: str, model: str) -> ProviderCredential:
-        if not self.access_token:
-            raise RuntimeError("apicred_proxy_token_required")
         return ProviderCredential(provider=provider, model=model, api_key=self.access_token, base_url=self.base_url)
 
     async def _get(self, path: str, params: dict[str, object | None] | None = None) -> dict[str, object]:
