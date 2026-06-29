@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import socket
 import subprocess
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlparse
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +164,125 @@ def scaffold_eval_suite(output_dir: Path, *, force: bool = False) -> dict[str, A
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return manifest
+
+
+@contextmanager
+def managed_local_repo_server(manifest: dict[str, Any], *, enabled: bool = True):
+    if not enabled:
+        yield manifest
+        return
+
+    repo_paths = local_repo_paths(manifest)
+    if not repo_paths:
+        yield manifest
+        return
+    git = shutil.which("git")
+    if git is None:
+        yield manifest
+        return
+
+    base_path = common_repo_base_path(repo_paths)
+    port = free_tcp_port()
+    process = subprocess.Popen(
+        [
+            git,
+            "daemon",
+            "--verbose",
+            "--export-all",
+            "--reuseaddr",
+            f"--base-path={base_path}",
+            f"--port={port}",
+            "--listen=0.0.0.0",
+            str(base_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        probe_url = git_url_for_repo(repo_paths[0], base_path, "127.0.0.1", port)
+        wait_for_git_repo_server(git, probe_url, process)
+        yield manifest_with_served_local_repos(manifest, base_path=base_path, host="host.docker.internal", port=port)
+    finally:
+        stop_process(process)
+
+
+def manifest_with_served_local_repos(manifest: dict[str, Any], *, base_path: Path, host: str, port: int) -> dict[str, Any]:
+    served = dict(manifest)
+    served_cases: list[dict[str, Any]] = []
+    for case in manifest.get("cases", []):
+        served_case = dict(case)
+        repo_path = local_repo_path_for_case(served_case)
+        if repo_path is not None:
+            served_case["repo_url"] = git_url_for_repo(repo_path, base_path, host, port)
+            served_case["local_repo_url"] = case.get("repo_url")
+        served_cases.append(served_case)
+    served["cases"] = served_cases
+    return served
+
+
+def local_repo_paths(manifest: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    for case in manifest.get("cases", []):
+        if isinstance(case, dict):
+            path = local_repo_path_for_case(case)
+            if path is not None:
+                paths.append(path)
+    return paths
+
+
+def local_repo_path_for_case(case: dict[str, Any]) -> Path | None:
+    repo_path = case.get("repo_path")
+    if repo_path:
+        path = Path(str(repo_path)).expanduser().resolve()
+        return path if path.exists() else None
+    repo_url = str(case.get("repo_url") or "")
+    parsed = urlparse(repo_url)
+    if parsed.scheme == "file":
+        path = Path(parsed.path).expanduser().resolve()
+        return path if path.exists() else None
+    return None
+
+
+def common_repo_base_path(repo_paths: list[Path]) -> Path:
+    parents = [str(path.parent) for path in repo_paths]
+    return Path(os.path.commonpath(parents)).resolve()
+
+
+def git_url_for_repo(repo_path: Path, base_path: Path, host: str, port: int) -> str:
+    relative = repo_path.resolve().relative_to(base_path.resolve()).as_posix()
+    return f"git://{host}:{port}/{quote(relative)}"
+
+
+def free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_for_git_repo_server(git: str, url: str, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 5.0
+    last_error = "not checked"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"git daemon exited with code {process.returncode}")
+        result = subprocess.run([git, "ls-remote", url, "HEAD"], capture_output=True, text=True, check=False, timeout=2)
+        if result.returncode == 0:
+            return
+        last_error = (result.stderr or result.stdout or "").strip()
+        time.sleep(0.1)
+    raise RuntimeError(f"git daemon did not become ready for {url}: {last_error}")
+
+
+def stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def default_eval_scenarios() -> list[EvalScenario]:

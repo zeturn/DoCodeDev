@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from docode.cli import run_eval_command, run_eval_scaffold_command
-from docode.eval import eval_case_result_from_job, run_eval, scaffold_eval_suite
+from docode.eval import eval_case_result_from_job, manifest_with_served_local_repos, run_eval, scaffold_eval_suite
 from docode.storage.models import JobStatus, CodingJob, new_id
 
 
@@ -135,3 +135,24 @@ class EvalTests(TestCase):
         self.assertEqual(result["cost"], 0.01)
         self.assertEqual(result["artifact_id"], "artifact-1")
         self.assertEqual(result["verification"]["passed"], True)
+
+    def test_manifest_with_served_local_repos_rewrites_container_clone_url(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repos" / "python-bugfix"
+            repo.mkdir(parents=True)
+            manifest = {
+                "cases": [
+                    {
+                        "name": "python-bugfix",
+                        "repo_path": str(repo),
+                        "repo_url": repo.resolve().as_uri(),
+                    }
+                ]
+            }
+
+            served = manifest_with_served_local_repos(manifest, base_path=root / "repos", host="host.docker.internal", port=9419)
+
+            case = served["cases"][0]
+            self.assertEqual(case["repo_url"], "git://host.docker.internal:9419/python-bugfix")
+            self.assertEqual(case["local_repo_url"], repo.resolve().as_uri())

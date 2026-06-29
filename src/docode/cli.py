@@ -9,7 +9,7 @@ from docode.api.job_actions import CreateJobInput, create_coding_job
 from docode.config import load_config
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
-from docode.eval import eval_case_result_from_job, load_eval_manifest, run_eval, scaffold_eval_suite, write_eval_case_result, write_eval_report
+from docode.eval import eval_case_result_from_job, load_eval_manifest, managed_local_repo_server, run_eval, scaffold_eval_suite, write_eval_case_result, write_eval_report
 from docode.storage.db import build_repository
 from docode.storage.models import public_job_dict
 from docode.worker.queue import AsyncJobQueue
@@ -56,6 +56,7 @@ def main() -> None:
     eval_jobs.add_argument("--limit", type=int)
     eval_jobs.add_argument("--user-id", default="eval")
     eval_jobs.add_argument("--start-dobox", action="store_true", help="Temporarily start the local DoBox backend for eval jobs if needed.")
+    eval_jobs.add_argument("--no-serve-local-repos", action="store_true", help="Do not expose local eval repos through a temporary git server.")
 
     args = parser.parse_args()
     if args.command == "scripted-job":
@@ -180,32 +181,34 @@ async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
     model_policy = DocodeModelPolicy(config, APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode))
     runner = runner_cls(config=config, repository=repository)
     manifest = load_eval_manifest(Path(args.manifest))
-    cases = manifest["cases"][: args.limit] if args.limit else manifest["cases"]
+    serve_local_repos = args.start_dobox and not args.no_serve_local_repos
     results: list[dict[str, object]] = []
-    for case in cases:
-        repo_url = case.get("repo_url") or case.get("repo_path")
-        job = await create_coding_job(
-            repository=repository,
-            queue=queue,
-            config=config,
-            model_policy=model_policy,
-            user_id=args.user_id,
-            request=CreateJobInput(
-                instruction=str(case["instruction"]),
-                repo_url=str(repo_url) if repo_url else None,
-                provider=args.provider,
-                model=args.model,
-                quality=args.quality,
-                artifact_mode=str(case.get("artifact_mode") or "patch"),
-                sandbox_network_mode=config.sandbox_network_mode,
-            ),
-        )
-        await runner.run_job(job.id)
-        completed = await repository.get_job(job.id)
-        steps = await repository.list_steps(job.id)
-        result = eval_case_result_from_job(case, completed or job, steps)
-        write_eval_case_result(result, Path(args.results_dir))
-        results.append(result)
+    with managed_local_repo_server(manifest, enabled=serve_local_repos) as served_manifest:
+        cases = served_manifest["cases"][: args.limit] if args.limit else served_manifest["cases"]
+        for case in cases:
+            repo_url = case.get("repo_url") or case.get("repo_path")
+            job = await create_coding_job(
+                repository=repository,
+                queue=queue,
+                config=config,
+                model_policy=model_policy,
+                user_id=args.user_id,
+                request=CreateJobInput(
+                    instruction=str(case["instruction"]),
+                    repo_url=str(repo_url) if repo_url else None,
+                    provider=args.provider,
+                    model=args.model,
+                    quality=args.quality,
+                    artifact_mode=str(case.get("artifact_mode") or "patch"),
+                    sandbox_network_mode=config.sandbox_network_mode,
+                ),
+            )
+            await runner.run_job(job.id)
+            completed = await repository.get_job(job.id)
+            steps = await repository.list_steps(job.id)
+            result = eval_case_result_from_job(case, completed or job, steps)
+            write_eval_case_result(result, Path(args.results_dir))
+            results.append(result)
     print({"results_dir": args.results_dir, "cases": len(results), "succeeded": sum(1 for result in results if result.get("success"))})
 
 

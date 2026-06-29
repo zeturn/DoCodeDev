@@ -133,6 +133,7 @@ class CliTests(IsolatedAsyncioTestCase):
                 limit=None,
                 user_id="eval",
                 start_dobox=False,
+                no_serve_local_repos=True,
             )
 
             with (
@@ -203,6 +204,7 @@ class CliTests(IsolatedAsyncioTestCase):
                 limit=None,
                 user_id="eval",
                 start_dobox=True,
+                no_serve_local_repos=True,
             )
 
             with (
@@ -263,6 +265,7 @@ class CliTests(IsolatedAsyncioTestCase):
                 limit=1,
                 user_id="eval",
                 start_dobox=True,
+                no_serve_local_repos=True,
             )
 
             with (
