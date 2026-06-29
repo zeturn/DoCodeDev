@@ -24,6 +24,29 @@ class ResponseResolver(APICredCredentialResolver):
         return dict(self.response)
 
 
+class CatalogCredentialResolver(APICredCredentialResolver):
+    def __init__(self, catalog: dict[str, list[str]]) -> None:
+        super().__init__("https://apicred.invalid/v1", "service-token")
+        self.catalog = catalog
+
+    async def list_providers(self, *, user_id: str | None = None) -> dict[str, list[str]]:
+        self.calls.append({"method": "GET", "path": "/runtime/providers", "user_id": user_id})
+        return self.catalog
+
+    async def resolve(self, *, user_id: str, provider: str, model: str):
+        self.calls.append({"method": "POST", "path": "/runtime/credentials/resolve", "payload": {"user_id": user_id, "provider": provider, "model": model}})
+        return type(
+            "Credential",
+            (),
+            {
+                "provider": provider,
+                "model": model,
+                "api_key": f"{provider}-{model}-key",
+                "base_url": f"https://{provider}.example/v1",
+            },
+        )()
+
+
 class MissingRuntimeResolver(APICredCredentialResolver):
     async def _post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
         self.calls.append({"method": "POST", "path": path, "payload": dict(payload)})
@@ -182,6 +205,33 @@ class CredentialResolverTests(IsolatedAsyncioTestCase):
         self.assertEqual(api_key, "provider-key")
         self.assertEqual(base_url, "https://llm.example/v1")
         self.assertEqual([call["path"] for call in resolver.calls], ["/runtime/credentials/resolve"])
+
+    async def test_apicred_credential_store_resolves_quality_from_catalog(self) -> None:
+        resolver = CatalogCredentialResolver({"openai": ["gpt-4o", "gpt-4o-mini"], "anthropic": ["claude-sonnet-4-5"]})
+        store = APICredCredentialStore(resolver=resolver, user_id="user-1", provider="", model="", quality="strong")
+        context = AIRuntimeContext(user_id="user-1", purpose="docode")
+
+        model = await store.resolve_model(context, provider=None, model=None)
+
+        self.assertEqual(model.provider, "anthropic")
+        self.assertEqual(model.model, "claude-sonnet-4-5")
+        self.assertEqual(resolver.calls[-1]["payload"]["provider"], "anthropic")
+        self.assertEqual(resolver.calls[-1]["payload"]["model"], "claude-sonnet-4-5")
+
+    async def test_apicred_credential_store_caches_per_provider_model_key(self) -> None:
+        resolver = CatalogCredentialResolver({"openai": ["gpt-4o"], "anthropic": ["claude-sonnet-4-5"]})
+        store = APICredCredentialStore(resolver=resolver, user_id="user-1", provider="", model="", quality="balanced")
+        context = AIRuntimeContext(user_id="user-1", purpose="docode")
+
+        openai_key = await store.get_api_key("openai", context)
+        anthropic_key = await store.get_api_key("anthropic", context)
+        openai_key_again = await store.get_api_key("openai", context)
+
+        self.assertEqual(openai_key, "openai-gpt-4o-key")
+        self.assertEqual(anthropic_key, "anthropic-claude-sonnet-4-5-key")
+        self.assertEqual(openai_key_again, "openai-gpt-4o-key")
+        resolve_calls = [call for call in resolver.calls if call["path"] == "/runtime/credentials/resolve"]
+        self.assertEqual([(call["payload"]["provider"], call["payload"]["model"]) for call in resolve_calls], [("openai", "gpt-4o"), ("anthropic", "claude-sonnet-4-5")])
 
     async def test_apicred_usage_sink_records_usage_record(self) -> None:
         resolver = ResponseResolver({})

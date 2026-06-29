@@ -59,7 +59,21 @@ class WebToolsTests(IsolatedAsyncioTestCase):
         self.assertIn("Use bearer tokens", result.output)
         self.assertIn("100 requests per minute", result.output)
         self.assertNotIn("x()", result.output)
+        self.assertEqual(payload["confidence"], "medium")
         self.assertEqual(result.metadata["original_bytes"], payload["original_bytes"])
+
+    async def test_fetch_url_low_confidence_when_goal_does_not_match(self) -> None:
+        tools = WebTools(WebToolsConfig(output_limit_bytes=3000))
+        with patch("docode.web.tools.is_private_or_local_host", return_value=False), patch(
+            "docode.web.tools.fetch_public_url",
+            new=AsyncMock(return_value=("<html><title>Docs</title><body><p>Welcome to the docs.</p></body></html>", "text/html", 200)),
+        ):
+            result = await tools.fetch_url("https://example.com/page", goal="authentication rate limits", max_sections=2)
+
+        self.assertEqual(result.exit_code, 0)
+        payload = json.loads(result.output)
+        self.assertEqual(payload["confidence"], "low")
+        self.assertIn("No section strongly matched", payload["warning"])
 
     def test_extract_url_content_returns_valid_json_sized_payload(self) -> None:
         extraction = extract_url_content(

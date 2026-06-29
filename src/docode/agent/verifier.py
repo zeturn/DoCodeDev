@@ -34,6 +34,7 @@ class VerificationResult:
     workspace_result: ToolResult | None = None
     llm_judgement: VerifierJudgement | None = None
     verification_plan: "VerificationPlan | None" = None
+    evidence: "VerificationEvidence | None" = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +45,29 @@ class VerificationPlan:
     require_entrypoint_run: bool = False
     require_no_placeholder: bool = True
     require_external_source_verified: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationEvidence:
+    successful_fetch_urls: list[str]
+    successful_web_search_queries: list[str]
+    no_test_reason: str | None = None
+
+    @property
+    def has_external_source_evidence(self) -> bool:
+        return bool(self.successful_fetch_urls or self.successful_web_search_queries)
+
+    @property
+    def has_no_test_reason(self) -> bool:
+        reason = (self.no_test_reason or "").lower()
+        return bool(reason) and any(marker in reason for marker in ("no automated test", "not appropriate", "manual verification", "无法自动化", "不适合自动化"))
+
+    def with_no_test_reason(self, reason: str | None) -> "VerificationEvidence":
+        return VerificationEvidence(
+            successful_fetch_urls=self.successful_fetch_urls,
+            successful_web_search_queries=self.successful_web_search_queries,
+            no_test_reason=reason,
+        )
 
 
 class VerifierJudge(Protocol):
@@ -64,7 +88,8 @@ class CodingVerifier:
     def __init__(self, judge: VerifierJudge | None = None) -> None:
         self.judge = judge
 
-    async def verify(self, job: CodingJob, tools: DoBoxTools) -> VerificationResult:
+    async def verify(self, job: CodingJob, tools: DoBoxTools, evidence: VerificationEvidence | None = None) -> VerificationResult:
+        evidence = evidence or empty_verification_evidence()
         plan = build_verification_plan(job.instruction)
         await prepare_workspace_for_diff(tools)
         status_result = await safe_tool_call("git_status", tools.git_status)
@@ -90,7 +115,7 @@ class CodingVerifier:
         verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_result.output, workspace_result)
         smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result, plan)
         smoke_ok = smoke_result.exit_code == 0
-        plan_ok, plan_fixes = evaluate_verification_plan(plan, verified_diff, test_result, build_result, lint_result, smoke_result)
+        plan_ok, plan_fixes = evaluate_verification_plan(plan, verified_diff, test_result, build_result, lint_result, smoke_result, evidence)
 
         fixes: list[str] = []
         if not status_ok:
@@ -140,6 +165,7 @@ class CodingVerifier:
                 workspace_result=workspace_result,
                 llm_judgement=judgement,
                 verification_plan=plan,
+                evidence=evidence,
             )
 
         reason = f"Verification failed for instruction: {job.instruction}"
@@ -162,6 +188,7 @@ class CodingVerifier:
             workspace_result=workspace_result,
             llm_judgement=judgement,
             verification_plan=plan,
+            evidence=evidence,
         )
 
     async def _judge(
@@ -362,18 +389,20 @@ def evaluate_verification_plan(
     build_result: ToolResult,
     lint_result: ToolResult,
     smoke_result: ToolResult,
+    evidence: VerificationEvidence | None = None,
 ) -> tuple[bool, list[str]]:
     _ = build_result, lint_result
+    evidence = evidence or empty_verification_evidence()
     fixes: list[str] = []
     changed_files = changed_files_from_diff(diff)
     diff_lowered = diff.lower()
-    if plan.require_test_change and not has_test_change(changed_files):
+    if plan.require_test_change and not has_test_change(changed_files) and not evidence.has_no_test_reason:
         fixes.append("add or update a related test for this bugfix, or record why no automated test is appropriate")
     if plan.require_entrypoint_run and not (smoke_result.metadata and smoke_result.metadata.get("detected")):
         fixes.append("run the task entrypoint or CLI command as smoke verification")
     if plan.require_no_placeholder and diff_contains_placeholder(diff_lowered):
         fixes.append("remove placeholder/TODO/stub implementation text before finishing")
-    if plan.require_external_source_verified and not external_source_verified(diff_lowered, smoke_result):
+    if plan.require_external_source_verified and not external_source_verified(smoke_result, evidence):
         fixes.append("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run")
     return not fixes, fixes
 
@@ -386,10 +415,36 @@ def diff_contains_placeholder(diff_lowered: str) -> bool:
     return any(marker in diff_lowered for marker in ("todo", "placeholder", "stub", "not implemented", "pass  #", "pass\n"))
 
 
-def external_source_verified(diff_lowered: str, smoke_result: ToolResult) -> bool:
+def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvidence) -> bool:
+    if evidence.has_external_source_evidence:
+        return True
     if smoke_result.exit_code == 0 and smoke_result.metadata and smoke_result.metadata.get("detected"):
         return True
-    return any(marker in diff_lowered for marker in ("fetch_url", "web_search", "http://", "https://", "requests.", "httpx.", "urllib."))
+    return False
+
+
+def verification_evidence_from_steps(steps) -> VerificationEvidence:
+    fetch_urls: list[str] = []
+    web_search_queries: list[str] = []
+    for step in steps:
+        content = getattr(step, "content", step)
+        if not isinstance(content, dict) or content.get("type") != "tool_result" or content.get("exit_code") != 0:
+            continue
+        tool = content.get("tool")
+        metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+        if tool == "fetch_url":
+            url = metadata.get("url")
+            if isinstance(url, str) and url and url not in fetch_urls:
+                fetch_urls.append(url)
+        elif tool == "web_search":
+            query = metadata.get("query")
+            if isinstance(query, str) and query and query not in web_search_queries:
+                web_search_queries.append(query)
+    return VerificationEvidence(successful_fetch_urls=fetch_urls, successful_web_search_queries=web_search_queries)
+
+
+def empty_verification_evidence() -> VerificationEvidence:
+    return VerificationEvidence(successful_fetch_urls=[], successful_web_search_queries=[])
 
 
 def has_untracked_workspace_files(status: str) -> bool:

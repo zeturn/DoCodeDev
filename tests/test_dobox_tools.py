@@ -225,6 +225,27 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertEqual(client.written_files[-1][0], ".docode_apply_patch.diff")
         self.assertEqual(result.metadata, {"patch_bytes": 35})
 
+    async def test_apply_patch_failure_cleans_patch_file(self) -> None:
+        class FailingPatchClient(FakeDoBoxClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.commands: list[str] = []
+
+            async def run_command(self, project_id, command, cwd="/workspace", timeout_sec=120, output_limit=1_000_000, agent_session_id=None):
+                self.commands.append(str(command))
+                if "git apply --check" in str(command):
+                    return CommandResult("patch failed", 1)
+                return CommandResult("removed", 0)
+
+        client = FailingPatchClient()
+        tools = DoBoxTools(client, "project-123")
+
+        result = await tools.apply_patch("diff --git a/README.md b/README.md\n")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("patch failed", result.output)
+        self.assertTrue(any("rm -f .docode_apply_patch.diff" in command for command in client.commands))
+
     async def test_preview_and_logs_tools_are_project_level(self) -> None:
         tools = DoBoxTools(FakeDoBoxClient(), "project-123")
 

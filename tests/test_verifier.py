@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest import IsolatedAsyncioTestCase
 
-from docode.agent.verifier import CodingVerifier
+from docode.agent.verifier import CodingVerifier, VerificationEvidence, verification_evidence_from_steps
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob, new_id
 
@@ -103,6 +103,11 @@ class BugfixWithoutTestVerifierTools(PassingVerifierTools):
     async def run_build(self) -> ToolResult:
         return ToolResult(tool="run_build", output="ok", exit_code=0, metadata={"detected": False})
 
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        self.command = command
+        _ = cwd
+        return ToolResult(tool="run_command", output="ok", exit_code=0)
+
 
 class DocsVerifierTools(PassingVerifierTools):
     async def git_diff(self) -> ToolResult:
@@ -113,6 +118,25 @@ class DocsVerifierTools(PassingVerifierTools):
 
     async def run_build(self) -> ToolResult:
         return ToolResult(tool="run_build", output="no build command detected", exit_code=0, metadata={"detected": False})
+
+
+class ApiVerifierTools(PassingVerifierTools):
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(tool="git_diff", output="diff --git a/config/api_endpoint.txt b/config/api_endpoint.txt\n+https://api.example.test/v1/items\n")
+
+    async def run_tests(self) -> ToolResult:
+        return ToolResult(tool="run_tests", output="ok", exit_code=0, metadata={"detected": True, "command": "pytest"})
+
+    async def run_build(self) -> ToolResult:
+        return ToolResult(tool="run_build", output="no build command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_lint(self) -> ToolResult:
+        return ToolResult(tool="run_lint", output="no lint command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        self.command = command
+        _ = cwd
+        return ToolResult(tool="run_command", output="ok", exit_code=0)
 
 
 class VetoingJudge:
@@ -350,6 +374,20 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.verification_plan.require_test_change)
         self.assertIn("add or update a related test for this bugfix, or record why no automated test is appropriate", result.required_fixes)
 
+    async def test_bugfix_plan_allows_missing_test_with_recorded_reason(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="fix retry bug in payment adapter"),
+            BugfixWithoutTestVerifierTools(),
+            evidence=VerificationEvidence(
+                successful_fetch_urls=[],
+                successful_web_search_queries=[],
+                no_test_reason="No automated test is appropriate because this is a configuration-only production hotfix; manual verification was performed.",
+            ),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.required_fixes, [])
+
     async def test_docs_plan_does_not_require_test_change_or_placeholder_gate(self) -> None:
         result = await CodingVerifier().verify(
             CodingJob(id=new_id("job"), user_id="u1", instruction="update README docs"),
@@ -360,6 +398,37 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(result.verification_plan)
         self.assertFalse(result.verification_plan.require_test_change)
         self.assertFalse(result.verification_plan.require_no_placeholder)
+
+    async def test_external_source_requires_tool_evidence_not_diff_url(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="add API adapter for external endpoint"),
+            ApiVerifierTools(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIn("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run", result.required_fixes)
+
+    async def test_external_source_accepts_successful_fetch_url_evidence(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="add API adapter for external endpoint"),
+            ApiVerifierTools(),
+            evidence=VerificationEvidence(successful_fetch_urls=["https://api.example.test/docs"], successful_web_search_queries=[]),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.evidence.successful_fetch_urls, ["https://api.example.test/docs"])
+
+    def test_verification_evidence_from_steps_collects_successful_source_tools(self) -> None:
+        steps = [
+            {"type": "tool_result", "tool": "fetch_url", "exit_code": 0, "metadata": {"url": "https://example.test/docs"}},
+            {"type": "tool_result", "tool": "web_search", "exit_code": 0, "metadata": {"query": "example api docs"}},
+            {"type": "tool_result", "tool": "fetch_url", "exit_code": 1, "metadata": {"url": "https://bad.test"}},
+        ]
+
+        evidence = verification_evidence_from_steps(steps)
+
+        self.assertEqual(evidence.successful_fetch_urls, ["https://example.test/docs"])
+        self.assertEqual(evidence.successful_web_search_queries, ["example api docs"])
 
     async def test_cli_plan_runs_python_entrypoint(self) -> None:
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)
