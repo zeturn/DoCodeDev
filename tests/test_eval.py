@@ -10,7 +10,8 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from docode.cli import run_eval_command, run_eval_scaffold_command
-from docode.eval import run_eval, scaffold_eval_suite
+from docode.eval import eval_case_result_from_job, run_eval, scaffold_eval_suite
+from docode.storage.models import JobStatus, CodingJob, new_id
 
 
 class EvalTests(TestCase):
@@ -111,3 +112,26 @@ class EvalTests(TestCase):
 
             data = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(len(data["cases"]), 10)
+
+    def test_eval_case_result_from_job_extracts_metrics_from_steps(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="fix", status=JobStatus.SUCCEEDED, artifact_id="artifact-1")
+        steps = [
+            {"type": "llm_decision", "usage": {"total_tokens": 10, "cost": 0.01}},
+            {"type": "tool_call", "tool": "run_tests"},
+            {
+                "passed": True,
+                "reason": "ok",
+                "required_fixes": [],
+                "verification_plan": {"required_commands": ["related_test"]},
+            },
+        ]
+
+        result = eval_case_result_from_job({"name": "python-bugfix", "instruction": "fix"}, job, steps)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["iterations"], 1)
+        self.assertEqual(result["tool_calls"], 1)
+        self.assertEqual(result["tokens"], 10)
+        self.assertEqual(result["cost"], 0.01)
+        self.assertEqual(result["artifact_id"], "artifact-1")
+        self.assertEqual(result["verification"]["passed"], True)

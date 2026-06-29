@@ -73,6 +73,43 @@ class EvalReport:
         }
 
 
+def load_eval_manifest(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("cases"), list):
+        raise ValueError(f"eval manifest must contain a cases list: {path}")
+    return data
+
+
+def eval_case_result_from_job(case: dict[str, Any], job: Any, steps: list[Any]) -> dict[str, Any]:
+    status = status_value(getattr(job, "status", "missing"))
+    usage = latest_usage_snapshot(steps)
+    verification = latest_verification_step(steps)
+    result = {
+        "name": str(case.get("name") or getattr(job, "id", "unknown")),
+        "category": case.get("category"),
+        "instruction": case.get("instruction"),
+        "job_id": getattr(job, "id", None),
+        "status": status,
+        "success": status == "succeeded",
+        "iterations": count_steps(steps, "llm_decision"),
+        "tool_calls": count_steps(steps, "tool_call"),
+        "tokens": int_or_zero(usage.get("total_tokens") or usage.get("tokens")),
+        "cost": float_or_zero(usage.get("cost")),
+        "failure_reason": getattr(job, "failure_reason", None),
+        "artifact_id": getattr(job, "artifact_id", None),
+        "verification": verification,
+    }
+    return result
+
+
+def write_eval_case_result(result: dict[str, Any], results_dir: Path) -> Path:
+    results_dir.mkdir(parents=True, exist_ok=True)
+    name = str(result.get("name") or "case").replace("/", "-")
+    path = results_dir / f"{name}.json"
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def run_eval(fixtures_dir: Path) -> EvalReport:
     cases = [load_eval_case(path) for path in sorted(fixtures_dir.glob("*.json"))]
     total = len(cases)
@@ -267,6 +304,44 @@ def verification_failures(verification: dict[str, Any]) -> list[str]:
     if isinstance(fixes, list):
         return [str(fix) for fix in fixes if str(fix)]
     return []
+
+
+def latest_usage_snapshot(steps: list[Any]) -> dict[str, Any]:
+    for step in reversed(steps):
+        content = step_content(step)
+        usage = content.get("usage")
+        if isinstance(usage, dict):
+            return usage
+    return {}
+
+
+def latest_verification_step(steps: list[Any]) -> dict[str, Any]:
+    for step in reversed(steps):
+        content = step_content(step)
+        if content.get("type") == "verification" or content.get("verification_plan") is not None:
+            return {
+                "passed": content.get("passed"),
+                "reason": content.get("reason"),
+                "required_fixes": content.get("required_fixes") or [],
+                "verification_plan": content.get("verification_plan"),
+                "evidence": content.get("evidence"),
+            }
+    return {}
+
+
+def count_steps(steps: list[Any], step_type: str) -> int:
+    return sum(1 for step in steps if step_content(step).get("type") == step_type)
+
+
+def step_content(step: Any) -> dict[str, Any]:
+    content = getattr(step, "content", step)
+    return content if isinstance(content, dict) else {}
+
+
+def status_value(value: Any) -> str:
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
 
 
 def count_values(values) -> dict[str, int]:

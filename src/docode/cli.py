@@ -9,7 +9,7 @@ from docode.api.job_actions import CreateJobInput, create_coding_job
 from docode.config import load_config
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
-from docode.eval import run_eval, scaffold_eval_suite, write_eval_report
+from docode.eval import eval_case_result_from_job, load_eval_manifest, run_eval, scaffold_eval_suite, write_eval_case_result, write_eval_report
 from docode.storage.db import build_repository
 from docode.storage.models import public_job_dict
 from docode.worker.queue import AsyncJobQueue
@@ -47,6 +47,14 @@ def main() -> None:
     eval_scaffold = eval_subcommands.add_parser("scaffold", help="Create the standard small-repository eval suite.")
     eval_scaffold.add_argument("output_dir")
     eval_scaffold.add_argument("--force", action="store_true", help="Replace an existing suite directory.")
+    eval_jobs = eval_subcommands.add_parser("jobs", help="Run eval manifest cases through DoCode jobs and write per-case results.")
+    eval_jobs.add_argument("manifest")
+    eval_jobs.add_argument("--results-dir", default=".docode/eval-results")
+    eval_jobs.add_argument("--provider")
+    eval_jobs.add_argument("--model")
+    eval_jobs.add_argument("--quality")
+    eval_jobs.add_argument("--limit", type=int)
+    eval_jobs.add_argument("--user-id", default="eval")
 
     args = parser.parse_args()
     if args.command == "scripted-job":
@@ -59,6 +67,8 @@ def main() -> None:
         run_eval_command(args)
     if args.command == "eval" and args.eval_command == "scaffold":
         run_eval_scaffold_command(args)
+    if args.command == "eval" and args.eval_command == "jobs":
+        asyncio.run(run_eval_jobs_command(args))
 
 
 async def run_scripted_job(args: argparse.Namespace) -> None:
@@ -122,6 +132,46 @@ def run_eval_command(args: argparse.Namespace) -> None:
 def run_eval_scaffold_command(args: argparse.Namespace) -> None:
     manifest = scaffold_eval_suite(Path(args.output_dir), force=args.force)
     print({"manifest": str(Path(args.output_dir) / "manifest.json"), "cases": len(manifest["cases"])})
+
+
+async def run_eval_jobs_command(args: argparse.Namespace) -> None:
+    runner_cls = JobRunnerService
+    if runner_cls is None:
+        from docode.worker.runner import JobRunnerService as runner_cls
+
+    config = load_config()
+    repository = build_repository(config)
+    queue = AsyncJobQueue()
+    model_policy = DocodeModelPolicy(config, APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode))
+    runner = runner_cls(config=config, repository=repository)
+    manifest = load_eval_manifest(Path(args.manifest))
+    cases = manifest["cases"][: args.limit] if args.limit else manifest["cases"]
+    results: list[dict[str, object]] = []
+    for case in cases:
+        repo_url = case.get("repo_url") or case.get("repo_path")
+        job = await create_coding_job(
+            repository=repository,
+            queue=queue,
+            config=config,
+            model_policy=model_policy,
+            user_id=args.user_id,
+            request=CreateJobInput(
+                instruction=str(case["instruction"]),
+                repo_url=str(repo_url) if repo_url else None,
+                provider=args.provider,
+                model=args.model,
+                quality=args.quality,
+                artifact_mode=str(case.get("artifact_mode") or "patch"),
+                sandbox_network_mode=config.sandbox_network_mode,
+            ),
+        )
+        await runner.run_job(job.id)
+        completed = await repository.get_job(job.id)
+        steps = await repository.list_steps(job.id)
+        result = eval_case_result_from_job(case, completed or job, steps)
+        write_eval_case_result(result, Path(args.results_dir))
+        results.append(result)
+    print({"results_dir": args.results_dir, "cases": len(results), "succeeded": sum(1 for result in results if result.get("success"))})
 
 
 if __name__ == "__main__":
