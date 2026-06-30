@@ -74,6 +74,66 @@ class EvalAssertion:
 
 
 @dataclass(frozen=True, slots=True)
+class EvalComparison:
+    previous_total: int
+    previous_succeeded: int
+    previous_success_rate: float
+    success_rate_delta: float
+    succeeded_delta: int
+    avg_iterations_delta: float
+    avg_tool_calls_delta: float
+    avg_tokens_delta: float
+    cost_delta: float
+    newly_succeeded: list[str]
+    newly_failed: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class EvalModelSummary:
+    model: str
+    total: int
+    succeeded: int
+    success_rate: float
+    avg_iterations: float
+    avg_tool_calls: float
+    avg_tokens: float
+    cost: float
+    main_failure: str | None
+    comparison: EvalComparison | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "model": self.model,
+            "total": self.total,
+            "succeeded": self.succeeded,
+            "success_rate": self.success_rate,
+            "avg_iterations": self.avg_iterations,
+            "avg_tool_calls": self.avg_tool_calls,
+            "avg_tokens": self.avg_tokens,
+            "cost": self.cost,
+            "main_failure": self.main_failure,
+        }
+        if self.comparison is not None:
+            data["comparison"] = self.comparison.to_dict()
+        return data
+
+
+@dataclass(frozen=True, slots=True)
+class EvalMatrixReport:
+    models: list[EvalModelSummary]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "models": [model.to_dict() for model in self.models],
+            "best_success_rate": max((model.success_rate for model in self.models), default=0.0),
+            "total_models": len(self.models),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class EvalScenario:
     name: str
     category: str
@@ -115,6 +175,7 @@ class EvalReport:
     verification_plan_failures: dict[str, int]
     cases: list[EvalCaseResult]
     assertion: EvalAssertion | None = None
+    comparison: EvalComparison | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -134,6 +195,8 @@ class EvalReport:
         }
         if self.assertion is not None:
             data.update(self.assertion.to_dict())
+        if self.comparison is not None:
+            data["comparison"] = self.comparison.to_dict()
         return data
 
 
@@ -222,6 +285,7 @@ def with_eval_assertion(report: EvalReport, thresholds: EvalThresholds) -> EvalR
         verification_plan_failures=report.verification_plan_failures,
         cases=report.cases,
         assertion=assert_eval_report(report, thresholds),
+        comparison=report.comparison,
     )
 
 
@@ -251,6 +315,9 @@ def load_eval_report(path: Path) -> EvalReport:
             failures=[str(failure) for failure in data.get("threshold_failures", [])],
             thresholds=EvalThresholds.from_mapping(data.get("thresholds")),
         )
+    comparison = None
+    if isinstance(data.get("comparison"), dict):
+        comparison = eval_comparison_from_mapping(data["comparison"])
     return EvalReport(
         total=int_or_zero(data.get("total")),
         succeeded=int_or_zero(data.get("succeeded")),
@@ -266,7 +333,103 @@ def load_eval_report(path: Path) -> EvalReport:
         verification_plan_failures=dict(data.get("verification_plan_failures") or {}),
         cases=cases,
         assertion=assertion,
+        comparison=comparison,
     )
+
+
+def with_eval_comparison(report: EvalReport, previous: EvalReport) -> EvalReport:
+    return EvalReport(
+        total=report.total,
+        succeeded=report.succeeded,
+        failed=report.failed,
+        success_rate=report.success_rate,
+        iterations=report.iterations,
+        tool_calls=report.tool_calls,
+        tokens=report.tokens,
+        cost=report.cost,
+        failure_reasons=report.failure_reasons,
+        failure_classes=report.failure_classes,
+        failure_categories=report.failure_categories,
+        verification_plan_failures=report.verification_plan_failures,
+        cases=report.cases,
+        assertion=report.assertion,
+        comparison=compare_eval_reports(report, previous),
+    )
+
+
+def compare_eval_reports(current: EvalReport, previous: EvalReport) -> EvalComparison:
+    current_cases = {case.name: case.success for case in current.cases}
+    previous_cases = {case.name: case.success for case in previous.cases}
+    shared_names = sorted(set(current_cases) & set(previous_cases))
+    newly_succeeded = [name for name in shared_names if current_cases[name] and not previous_cases[name]]
+    newly_failed = [name for name in shared_names if previous_cases[name] and not current_cases[name]]
+    return EvalComparison(
+        previous_total=previous.total,
+        previous_succeeded=previous.succeeded,
+        previous_success_rate=previous.success_rate,
+        success_rate_delta=current.success_rate - previous.success_rate,
+        succeeded_delta=current.succeeded - previous.succeeded,
+        avg_iterations_delta=average(current.iterations, current.total) - average(previous.iterations, previous.total),
+        avg_tool_calls_delta=average(current.tool_calls, current.total) - average(previous.tool_calls, previous.total),
+        avg_tokens_delta=average(current.tokens, current.total) - average(previous.tokens, previous.total),
+        cost_delta=current.cost - previous.cost,
+        newly_succeeded=newly_succeeded,
+        newly_failed=newly_failed,
+    )
+
+
+def eval_comparison_from_mapping(data: dict[str, Any]) -> EvalComparison:
+    return EvalComparison(
+        previous_total=int_or_zero(data.get("previous_total")),
+        previous_succeeded=int_or_zero(data.get("previous_succeeded")),
+        previous_success_rate=float_or_zero(data.get("previous_success_rate")),
+        success_rate_delta=float_or_zero(data.get("success_rate_delta")),
+        succeeded_delta=int_or_zero(data.get("succeeded_delta")),
+        avg_iterations_delta=float_or_zero(data.get("avg_iterations_delta")),
+        avg_tool_calls_delta=float_or_zero(data.get("avg_tool_calls_delta")),
+        avg_tokens_delta=float_or_zero(data.get("avg_tokens_delta")),
+        cost_delta=float_or_zero(data.get("cost_delta")),
+        newly_succeeded=[str(name) for name in data.get("newly_succeeded", [])],
+        newly_failed=[str(name) for name in data.get("newly_failed", [])],
+    )
+
+
+def summarize_eval_matrix(reports: dict[str, EvalReport], previous_reports: dict[str, EvalReport] | None = None) -> EvalMatrixReport:
+    previous_reports = previous_reports or {}
+    summaries = [
+        EvalModelSummary(
+            model=model,
+            total=report.total,
+            succeeded=report.succeeded,
+            success_rate=report.success_rate,
+            avg_iterations=average(report.iterations, report.total),
+            avg_tool_calls=average(report.tool_calls, report.total),
+            avg_tokens=average(report.tokens, report.total),
+            cost=report.cost,
+            main_failure=main_failure(report),
+            comparison=compare_eval_reports(report, previous_reports[model]) if model in previous_reports else None,
+        )
+        for model, report in sorted(reports.items())
+    ]
+    return EvalMatrixReport(models=summaries)
+
+
+def average(value: int | float, total: int) -> float:
+    return (float(value) / total) if total else 0.0
+
+
+def main_failure(report: EvalReport) -> str | None:
+    for counts in (report.failure_categories, report.failure_classes, report.failure_reasons, report.verification_plan_failures):
+        winner = most_common_key(counts)
+        if winner:
+            return winner
+    return None
+
+
+def most_common_key(counts: dict[str, int]) -> str | None:
+    if not counts:
+        return None
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
 def scaffold_eval_suite(output_dir: Path, *, force: bool = False) -> dict[str, Any]:
@@ -694,6 +857,7 @@ def classify_failure(
     reason = (failure_reason or "").lower()
     step_contents = [step_content(step) for step in steps]
     combined = " ".join(str(content) for content in step_contents).lower()
+    provider_combined = provider_failure_text(reason, step_contents)
 
     probe = infra_diagnostics.get("workspace_probe") if isinstance(infra_diagnostics.get("workspace_probe"), dict) else {}
     if reason.startswith("infrastructure_failed:") or probe.get("passed") is False:
@@ -702,10 +866,15 @@ def classify_failure(
         return "infra_failed", "provider_call_failed"
     if "server disconnected" in reason or "connection refused" in reason or "connection reset" in reason:
         return "infra_failed", "provider_call_failed"
-    if "model_not_found" in combined or "model_not_available" in combined or "model unavailable" in combined:
+    if "model_not_found" in provider_combined or "model_not_available" in provider_combined or "model unavailable" in provider_combined:
         return "model_unavailable", "model_catalog_mismatch"
-    if "llm_auth_failed" in reason or "401 unauthorized" in combined or "403 forbidden" in combined:
+    if "llm_auth_failed" in reason or "401 unauthorized" in provider_combined or "403 forbidden" in provider_combined:
         return "model_unavailable", "provider_auth_failed"
+    if "llm_provider_unavailable" in reason or "llm_provider_unavailable" in provider_combined:
+        return "model_unavailable", provider_unavailable_category(reason, provider_combined)
+    provider_category = provider_unavailable_category(reason, provider_combined)
+    if provider_category != "provider_call_failed":
+        return "model_unavailable", provider_category
     if reason.startswith("apicred_authorize_failed"):
         return "model_unavailable", "provider_call_failed"
     if "provider_call_failed" in combined:
@@ -736,6 +905,62 @@ def infra_category_from_reason(reason: str) -> str | None:
         return None
     category = reason.split(":", 1)[1].strip().replace(" ", "_")
     return category or None
+
+
+def provider_unavailable_category(reason: str, combined: str) -> str:
+    text = f"{reason}\n{combined}".lower()
+    for category in (
+        "provider_upstream_unavailable",
+        "provider_rate_limited",
+        "provider_timeout",
+        "provider_network_error",
+        "model_catalog_mismatch",
+        "provider_auth_failed",
+    ):
+        if category in text:
+            return category
+    if "no_upstream_capacity" in text or "502 bad gateway" in text or "503 service unavailable" in text or "504 gateway timeout" in text:
+        return "provider_upstream_unavailable"
+    if "429" in text or "rate limit" in text or "too many requests" in text:
+        return "provider_rate_limited"
+    if "timeout" in text or "timed out" in text:
+        return "provider_timeout"
+    if "connection refused" in text or "connection reset" in text or "server disconnected" in text:
+        return "provider_network_error"
+    return "provider_call_failed"
+
+
+def provider_failure_text(reason: str, step_contents: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    if provider_failure_reason_like(reason):
+        parts.append(reason)
+    for content in step_contents:
+        if provider_failure_step_like(content):
+            parts.append(str(content))
+    return " ".join(parts).lower()
+
+
+def provider_failure_reason_like(reason: str) -> bool:
+    return any(
+        marker in reason
+        for marker in (
+            "llm_",
+            "apicred_authorize_failed",
+            "provider_",
+            "model_not_found",
+            "model_not_available",
+            "model unavailable",
+            "no_upstream_capacity",
+        )
+    )
+
+
+def provider_failure_step_like(content: dict[str, Any]) -> bool:
+    content_type = str(content.get("type") or "").lower()
+    if content_type in {"llm_error", "apicred_authorize_failed"}:
+        return True
+    reason = str(content.get("reason") or "").lower()
+    return provider_failure_reason_like(reason)
 
 
 def collect_infra_diagnostics(steps: list[Any], verification: dict[str, Any]) -> dict[str, Any]:

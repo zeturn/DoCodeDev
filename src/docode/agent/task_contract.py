@@ -17,7 +17,7 @@ class TaskContract:
 
 def task_contract_from_instruction(instruction: str) -> TaskContract:
     files = unique_preserving_order(match.group(0).strip("./") for match in FILE_REF_RE.finditer(instruction or ""))
-    commands = suggested_commands(files)
+    commands = unique_preserving_order([*suggested_commands(files), *verification_commands_from_instruction(instruction)])
     forbidden = [
         "Do not call final_candidate until git_status shows at least one modified file.",
         "Do not finish with a clean git status; produce a non-empty git diff first.",
@@ -33,6 +33,21 @@ def suggested_commands(files: list[str]) -> list[str]:
     if "cli.py" in file_names:
         commands.append("python3 cli.py --name Ada")
     return commands
+
+
+def verification_commands_from_instruction(instruction: str) -> list[str]:
+    commands: list[str] = []
+    for raw_line in (instruction or "").splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
+            continue
+        _, value = line.split(":", 1)
+        for command in re.split(r"\s*;\s*", value.strip()):
+            command = command.strip(" -`")
+            if command:
+                commands.append(command)
+    return commands[:5]
 
 
 def unique_preserving_order(values: Iterable[object]) -> list[str]:

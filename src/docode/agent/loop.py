@@ -10,10 +10,11 @@ from docode.agent.stuck import REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_c
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.task_contract import TaskContract, task_contract_from_instruction
 from docode.agent.verifier import CodingVerifier, VerificationResult, changed_files_from_diff, verification_evidence_from_steps
+from docode.agent.workflow import final_candidate_gate, workflow_snapshot
 from docode.artifacts.exporter import ArtifactExporter, terminal_artifact_id
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
-from docode.llm.runtime import DecisionLLM, LLMUsageMeter
+from docode.llm.runtime import DecisionLLM, LLMUsageMeter, ProviderUnavailableError
 from docode.storage.models import CodingJob, JobStatus
 from docode.storage.repository import JobRepository
 
@@ -87,6 +88,13 @@ class CodingAgentLoop:
                     context=observation,
                 )
             except Exception as exc:
+                provider_failure = provider_failure_reason(exc)
+                if provider_failure == "llm_auth_failed":
+                    await self.record_model_failure(state, provider_failure, str(exc))
+                    return await self.fail(job.id, provider_failure)
+                if provider_failure is not None:
+                    await self.record_model_failure(state, provider_failure, str(exc))
+                    return await self.fail(job.id, provider_failure)
                 if non_retryable_llm_error(exc):
                     await self.record_model_failure(state, "llm_auth_failed", str(exc))
                     return await self.fail(job.id, "llm_auth_failed")
@@ -143,35 +151,28 @@ class CodingAgentLoop:
                 continue
 
             if decision.type == "final_candidate":
-                if state.repair_mode == "must_edit":
-                    await self.record_rejected_decision(
-                        state,
-                        reason="repair_mode_final_forbidden",
-                        detail="final_candidate is blocked while repair_mode=must_edit. Modify a target file and confirm git_status first.",
-                    )
-                    continue
                 cancelled = await self.cancelled_job(job.id)
                 if cancelled is not None:
                     return cancelled
                 status = await self.tools.git_status()
                 state.latest_git_status = status
-                if git_status_clean(status.output):
-                    state.repair_mode = "must_edit"
-                    await self.record_rejected_decision(
-                        state,
-                        reason="final_candidate_clean_git_status",
-                        detail=(
-                            "Final candidate rejected before verification: git status is clean. "
-                            "You must modify files with edit_file/write_file/apply_patch first."
-                        ),
-                    )
-                    continue
                 final_summary = (decision.summary or "").strip()
                 if not final_summary:
                     await self.record_model_failure(
                         state,
                         "final_summary_missing",
                         "final_candidate must include a non-empty summary before verification can complete",
+                    )
+                    continue
+                gate = final_candidate_gate(state, status.output)
+                if not gate.allowed:
+                    if gate.repair_mode:
+                        state.repair_mode = gate.repair_mode
+                    await self.record_rejected_decision(
+                        state,
+                        reason=gate.reason,
+                        detail=gate.detail,
+                        workflow_state=gate.snapshot.to_dict(),
                     )
                     continue
                 await self.repository.update_job(job.id, status=JobStatus.VERIFYING)
@@ -262,6 +263,14 @@ class CodingAgentLoop:
         if state.repair_mode == "must_edit" and not git_status_clean(status.output):
             state.repair_mode = None
             state.stuck_count = 0
+        await self.repository.add_step(
+            state.job.id,
+            "system",
+            {
+                "type": "workflow_state",
+                **workflow_snapshot(state, status.output).to_dict(),
+            },
+        )
         return self.context_manager.build_pack(
             job=state.job,
             inspection=state.inspection,
@@ -318,18 +327,23 @@ class CodingAgentLoop:
         state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}")
         state.iteration += 1
 
-    async def record_rejected_decision(self, state: AgentState, reason: str, detail: str) -> None:
+    async def record_rejected_decision(
+        self,
+        state: AgentState,
+        reason: str,
+        detail: str,
+        workflow_state: dict[str, object] | None = None,
+    ) -> None:
         self.sync_llm_usage(state)
-        await self.repository.add_step(
-            state.job.id,
-            "system",
-            {
-                "type": "decision_rejected",
-                "reason": reason,
-                "detail": truncate_text(detail, 2000),
-                "repair_mode": state.repair_mode,
-            },
-        )
+        payload = {
+            "type": "decision_rejected",
+            "reason": reason,
+            "detail": truncate_text(detail, 2000),
+            "repair_mode": state.repair_mode,
+        }
+        if workflow_state is not None:
+            payload["workflow_state"] = workflow_state
+        await self.repository.add_step(state.job.id, "system", payload)
         state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}")
         state.iteration += 1
 
@@ -540,3 +554,19 @@ def non_retryable_llm_error(exc: Exception) -> bool:
         return True
     text = str(exc).lower()
     return "401 unauthorized" in text or "403 forbidden" in text or "invalid api key" in text or "incorrect api key" in text
+
+
+def provider_failure_reason(exc: Exception) -> str | None:
+    if isinstance(exc, ProviderUnavailableError):
+        if exc.category == "provider_auth_failed":
+            return "llm_auth_failed"
+        return f"llm_provider_unavailable:{exc.category}"
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    text = str(exc).lower()
+    if status_code in {502, 503, 504} or any(fragment in text for fragment in ("502 bad gateway", "503 service unavailable", "504 gateway timeout", "no_upstream_capacity")):
+        return "llm_provider_unavailable:provider_upstream_unavailable"
+    if status_code == 429 or "rate limit" in text or "too many requests" in text:
+        return "llm_provider_unavailable:provider_rate_limited"
+    if "connection refused" in text or "connection reset" in text or "server disconnected" in text or "timeout" in text:
+        return "llm_provider_unavailable:provider_network_error"
+    return None

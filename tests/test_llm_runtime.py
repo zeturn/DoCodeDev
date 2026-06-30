@@ -4,6 +4,8 @@ import sys
 import types
 from unittest import IsolatedAsyncioTestCase
 
+import httpx
+
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.tools import ToolDefinition
 from docode.agent.tools import CompositeAgentTools
@@ -14,6 +16,7 @@ from docode.llm.runtime import (
     LocalLLMRouter,
     OpenAICompatibleChatClient,
     ProviderCallResult,
+    ProviderUnavailableError,
     GitHubTrendingCrawlerDecisionLLM,
     ScriptedDecisionLLM,
     WeavDecisionLLM,
@@ -80,6 +83,14 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         sys.modules.pop("weav_ai_providers", None)
 
         client = build_provider_client("openai", "secret-key", "https://llm.example/v1")
+
+        self.assertIsInstance(client, OpenAICompatibleChatClient)
+        self.assertEqual(client.base_url, "https://llm.example/v1")
+
+    async def test_openai_compatible_provider_falls_back_without_weav_package(self) -> None:
+        sys.modules.pop("weav_ai_providers", None)
+
+        client = build_provider_client("deepseek", "secret-key", "https://llm.example/v1")
 
         self.assertIsInstance(client, OpenAICompatibleChatClient)
         self.assertEqual(client.base_url, "https://llm.example/v1")
@@ -253,6 +264,52 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         result = await call_provider(Provider(), "prompt", "gpt-test")
 
         self.assertEqual(result.text, '{"type": "final_candidate", "summary": "fallback"}')
+
+    async def test_call_provider_retries_transient_provider_5xx(self) -> None:
+        sys.modules.pop("weav_ai_runtime", None)
+
+        class Provider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, prompt, model):
+                _ = prompt, model
+                self.calls += 1
+                if self.calls < 3:
+                    request = httpx.Request("POST", "http://localhost:8103/v1/chat/completions")
+                    response = httpx.Response(503, request=request, text='{"error":{"code":"no_upstream_capacity"}}')
+                    raise httpx.HTTPStatusError("service unavailable", request=request, response=response)
+                return '{"type": "final_candidate", "summary": "recovered"}'
+
+        provider = Provider()
+
+        result = await call_provider(provider, "prompt", "gpt-test", max_attempts=3, retry_delays=(0.0, 0.0))
+
+        self.assertEqual(provider.calls, 3)
+        self.assertEqual(result.text, '{"type": "final_candidate", "summary": "recovered"}')
+
+    async def test_call_provider_raises_provider_unavailable_after_retry_budget(self) -> None:
+        sys.modules.pop("weav_ai_runtime", None)
+
+        class Provider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *, prompt, model):
+                _ = prompt, model
+                self.calls += 1
+                request = httpx.Request("POST", "http://localhost:8103/v1/chat/completions")
+                response = httpx.Response(502, request=request, text="bad gateway")
+                raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
+
+        provider = Provider()
+
+        with self.assertRaises(ProviderUnavailableError) as raised:
+            await call_provider(provider, "prompt", "gpt-test", max_attempts=2, retry_delays=(0.0,))
+
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(raised.exception.category, "provider_upstream_unavailable")
+        self.assertEqual(raised.exception.attempts, 2)
 
     async def test_provider_call_result_extracts_sdk_style_object(self) -> None:
         install_weav_stubs()

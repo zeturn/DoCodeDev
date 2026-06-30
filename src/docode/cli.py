@@ -17,7 +17,9 @@ from docode.eval import (
     managed_local_repo_server,
     run_eval,
     scaffold_eval_suite,
+    summarize_eval_matrix,
     with_eval_assertion,
+    with_eval_comparison,
     write_eval_case_result,
     write_eval_report,
 )
@@ -55,10 +57,19 @@ def main() -> None:
     eval_run = eval_subcommands.add_parser("run", help="Aggregate eval fixture results into a report.")
     eval_run.add_argument("fixtures_dir")
     eval_run.add_argument("--report", default=".docode/eval-report.json")
+    eval_run.add_argument("--baseline-report", help="Previous eval report to compare against.")
     add_eval_threshold_arguments(eval_run)
     eval_assert = eval_subcommands.add_parser("assert", help="Fail when an eval report does not meet configured thresholds.")
     eval_assert.add_argument("report")
     add_eval_threshold_arguments(eval_assert)
+    eval_matrix = eval_subcommands.add_parser("matrix", help="Build a model comparison matrix from eval reports or result directories.")
+    eval_matrix.add_argument(
+        "runs",
+        nargs="+",
+        help="Model run in the form model=path, where path is an eval report JSON file or a per-case results directory.",
+    )
+    eval_matrix.add_argument("--baseline", action="append", default=[], help="Previous run in the form model=path.")
+    eval_matrix.add_argument("--report", default=".docode/eval-matrix.json")
     eval_scaffold = eval_subcommands.add_parser("scaffold", help="Create the standard small-repository eval suite.")
     eval_scaffold.add_argument("output_dir")
     eval_scaffold.add_argument("--force", action="store_true", help="Replace an existing suite directory.")
@@ -97,6 +108,8 @@ def main() -> None:
         run_eval_command(args)
     if args.command == "eval" and args.eval_command == "assert":
         run_eval_assert_command(args)
+    if args.command == "eval" and args.eval_command == "matrix":
+        run_eval_matrix_command(args)
     if args.command == "eval" and args.eval_command == "scaffold":
         run_eval_scaffold_command(args)
     if args.command == "eval" and args.eval_command == "jobs":
@@ -158,6 +171,9 @@ async def run_smoke_run_command(args: argparse.Namespace) -> None:
 def run_eval_command(args: argparse.Namespace) -> None:
     thresholds = eval_thresholds_from_args(args)
     report = run_eval(Path(args.fixtures_dir), thresholds=thresholds)
+    baseline_report = getattr(args, "baseline_report", None)
+    if baseline_report:
+        report = with_eval_comparison(report, load_eval_report(Path(baseline_report)))
     write_eval_report(report, Path(args.report))
     print(report.to_dict())
     if report.assertion is not None and report.assertion.regression:
@@ -173,6 +189,41 @@ def run_eval_assert_command(args: argparse.Namespace) -> None:
     print(report.assertion.to_dict() if report.assertion is not None else {"regression": False})
     if report.assertion is not None and report.assertion.regression:
         raise SystemExit(1)
+
+
+def run_eval_matrix_command(args: argparse.Namespace) -> None:
+    reports = load_named_eval_reports(args.runs)
+    baselines = load_named_eval_reports(args.baseline)
+    matrix = summarize_eval_matrix(reports, previous_reports=baselines)
+    path = Path(args.report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json_dumps(matrix.to_dict()), encoding="utf-8")
+    print(matrix.to_dict())
+
+
+def load_named_eval_reports(entries: list[str]) -> dict[str, object]:
+    reports = {}
+    for entry in entries:
+        if "=" not in entry:
+            raise SystemExit(f"eval matrix entries must use model=path: {entry}")
+        model, raw_path = entry.split("=", 1)
+        model = model.strip()
+        if not model:
+            raise SystemExit(f"eval matrix model name is empty: {entry}")
+        reports[model] = load_eval_report_input(Path(raw_path))
+    return reports
+
+
+def load_eval_report_input(path: Path):
+    if path.is_dir():
+        return run_eval(path)
+    return load_eval_report(path)
+
+
+def json_dumps(data: object) -> str:
+    import json
+
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
 def add_eval_threshold_arguments(parser: argparse.ArgumentParser) -> None:

@@ -10,7 +10,15 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from docode.cli import run_eval_assert_command, run_eval_command, run_eval_scaffold_command
-from docode.eval import EvalThresholds, eval_case_result_from_job, manifest_with_served_local_repos, run_eval, scaffold_eval_suite
+from docode.eval import (
+    EvalThresholds,
+    eval_case_result_from_job,
+    manifest_with_served_local_repos,
+    run_eval,
+    scaffold_eval_suite,
+    summarize_eval_matrix,
+    with_eval_comparison,
+)
 from docode.storage.models import JobStatus, CodingJob, new_id
 
 
@@ -94,6 +102,62 @@ class EvalTests(TestCase):
             self.assertTrue(data["regression"])
             self.assertEqual(data["thresholds"]["min_success_rate"], 0.8)
             self.assertEqual(len(data["threshold_failures"]), 2)
+
+    def test_eval_report_can_compare_against_previous_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous_dir = root / "previous"
+            current_dir = root / "current"
+            previous_dir.mkdir()
+            current_dir.mkdir()
+            (previous_dir / "python-bugfix.json").write_text('{"status":"failed"}', encoding="utf-8")
+            (previous_dir / "python-cli.json").write_text('{"status":"succeeded","iterations":4}', encoding="utf-8")
+            (current_dir / "python-bugfix.json").write_text('{"status":"succeeded","iterations":2}', encoding="utf-8")
+            (current_dir / "python-cli.json").write_text('{"status":"failed","iterations":6}', encoding="utf-8")
+
+            report = with_eval_comparison(run_eval(current_dir), run_eval(previous_dir))
+
+            self.assertIsNotNone(report.comparison)
+            assert report.comparison is not None
+            self.assertEqual(report.comparison.previous_succeeded, 1)
+            self.assertEqual(report.comparison.succeeded_delta, 0)
+            self.assertEqual(report.comparison.newly_succeeded, ["python-bugfix"])
+            self.assertEqual(report.comparison.newly_failed, ["python-cli"])
+            self.assertIn("comparison", report.to_dict())
+
+    def test_eval_matrix_summarizes_models_and_main_failures(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fast_dir = root / "fast"
+            strong_dir = root / "strong"
+            fast_dir.mkdir()
+            strong_dir.mkdir()
+            (fast_dir / "ok.json").write_text('{"status":"succeeded","iterations":2,"tool_calls":4,"tokens":100}', encoding="utf-8")
+            (fast_dir / "bad.json").write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "iterations": 4,
+                        "tool_calls": 8,
+                        "tokens": 300,
+                        "failure_class": "verifier_failed",
+                        "failure_category": "verifier_plan_failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (strong_dir / "ok.json").write_text('{"status":"succeeded","iterations":1,"tool_calls":2,"tokens":80}', encoding="utf-8")
+
+            matrix = summarize_eval_matrix({"fast": run_eval(fast_dir), "strong": run_eval(strong_dir)})
+            data = matrix.to_dict()
+
+            fast = next(model for model in data["models"] if model["model"] == "fast")
+            self.assertEqual(fast["success_rate"], 0.5)
+            self.assertEqual(fast["avg_iterations"], 3.0)
+            self.assertEqual(fast["avg_tool_calls"], 6.0)
+            self.assertEqual(fast["avg_tokens"], 200.0)
+            self.assertEqual(fast["main_failure"], "verifier_plan_failed")
+            self.assertEqual(data["best_success_rate"], 1.0)
 
     def test_eval_run_command_exits_nonzero_when_threshold_fails(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -307,6 +371,63 @@ class EvalTests(TestCase):
 
         self.assertEqual(result["failure_class"], "model_unavailable")
         self.assertEqual(result["failure_category"], "provider_auth_failed")
+
+    def test_eval_case_result_classifies_provider_5xx_as_model_unavailable(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="max_consecutive_failures_exceeded",
+        )
+        steps = [
+            {
+                "type": "llm_error",
+                "reason": "llm_decision_failed",
+                "detail": "Server error '503 Service Unavailable' for url 'http://localhost:8103/v1/chat/completions'; response={\"error\":{\"code\":\"no_upstream_capacity\"}}",
+            }
+        ]
+
+        result = eval_case_result_from_job({"name": "python-cli", "instruction": "fix"}, job, steps)
+
+        self.assertEqual(result["failure_class"], "model_unavailable")
+        self.assertEqual(result["failure_category"], "provider_upstream_unavailable")
+
+    def test_eval_case_result_classifies_provider_unavailable_reason(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="llm_provider_unavailable:provider_rate_limited",
+        )
+        steps = [{"type": "llm_error", "reason": "llm_provider_unavailable:provider_rate_limited", "detail": "429 Too Many Requests"}]
+
+        result = eval_case_result_from_job({"name": "python-cli", "instruction": "fix"}, job, steps)
+
+        self.assertEqual(result["failure_class"], "model_unavailable")
+        self.assertEqual(result["failure_category"], "provider_rate_limited")
+
+    def test_eval_case_result_ignores_artifact_export_network_error_for_model_availability(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="max_iterations_exceeded",
+        )
+        steps = [
+            {"type": "llm_decision", "decision": {"tool": "edit_file"}},
+            {
+                "type": "workspace_archive_provider_failed",
+                "error": "Server disconnected without sending a response.",
+            },
+        ]
+
+        result = eval_case_result_from_job({"name": "python-cli", "instruction": "fix"}, job, steps)
+
+        self.assertEqual(result["failure_class"], "budget_exceeded")
+        self.assertEqual(result["failure_category"], "max_iterations_exceeded")
 
     def test_manifest_with_served_local_repos_rewrites_container_clone_url(self) -> None:
         with TemporaryDirectory() as tmp:

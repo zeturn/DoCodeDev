@@ -1,7 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderErrorInfo:
+    category: str
+    retryable: bool
+    status_code: int | None = None
+    detail: str = ""
+
+
+class ProviderUnavailableError(RuntimeError):
+    def __init__(self, info: ProviderErrorInfo, *, attempts: int, cause: Exception) -> None:
+        self.info = info
+        self.category = info.category
+        self.retryable = info.retryable
+        self.status_code = info.status_code
+        self.attempts = attempts
+        self.cause = cause
+        super().__init__(f"{info.category}: {info.detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,12 +84,41 @@ def build_provider_client(provider: str, api_key: str | None, base_url: str | No
 
         return build_provider(provider, **kwargs)
     except Exception:
-        if provider.lower() in {"openai", "openai-compatible", "apicred"}:
+        if provider.lower() in {"openai", "openai-compatible", "apicred", "deepseek", "qwen", "zhipu"}:
             return OpenAICompatibleChatClient(api_key=api_key, base_url=base_url)
         raise
 
 
-async def call_provider(client: Any, prompt: str, model: str) -> ProviderCallResult:
+async def call_provider(
+    client: Any,
+    prompt: str,
+    model: str,
+    *,
+    max_attempts: int = 3,
+    retry_delays: tuple[float, ...] = (1.0, 2.0),
+) -> ProviderCallResult:
+    attempts = max(1, max_attempts)
+    last_info: ProviderErrorInfo | None = None
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call_provider_once(client, prompt, model)
+        except Exception as exc:
+            info = classify_provider_exception(exc)
+            if info is None:
+                raise
+            last_info = info
+            last_exc = exc
+            if not info.retryable or attempt >= attempts:
+                raise ProviderUnavailableError(info, attempts=attempt, cause=exc) from exc
+            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)] if retry_delays else 0.0
+            if delay > 0:
+                await asyncio.sleep(delay)
+    assert last_info is not None and last_exc is not None
+    raise ProviderUnavailableError(last_info, attempts=attempts, cause=last_exc) from last_exc
+
+
+async def call_provider_once(client: Any, prompt: str, model: str) -> ProviderCallResult:
     try:
         from weav_ai_runtime import call_llm_provider
     except Exception:
@@ -80,6 +130,50 @@ async def call_provider(client: Any, prompt: str, model: str) -> ProviderCallRes
     if isinstance(result, ProviderCallResult):
         return result
     return provider_result_from_runtime_result(result)
+
+
+def classify_provider_exception(exc: Exception) -> ProviderErrorInfo | None:
+    if isinstance(exc, ProviderUnavailableError):
+        return exc.info
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    response_text = response_text_or_empty(response)
+    detail = str(exc)
+    combined = f"{detail}\n{response_text}".lower()
+    if status_code in {401, 403} or "401 unauthorized" in combined or "403 forbidden" in combined:
+        return ProviderErrorInfo("provider_auth_failed", False, status_code, detail_with_body(detail, response_text))
+    if status_code == 404 or "model_not_found" in combined or "model_not_available" in combined or "model not available" in combined:
+        return ProviderErrorInfo("model_catalog_mismatch", False, status_code, detail_with_body(detail, response_text))
+    if status_code == 429 or "rate limit" in combined or "too many requests" in combined:
+        return ProviderErrorInfo("provider_rate_limited", True, status_code, detail_with_body(detail, response_text))
+    if "no_upstream_capacity" in combined:
+        return ProviderErrorInfo("provider_upstream_unavailable", True, status_code, detail_with_body(detail, response_text))
+    if status_code in {408, 409, 425, 500, 502, 503, 504}:
+        return ProviderErrorInfo("provider_upstream_unavailable", True, status_code, detail_with_body(detail, response_text))
+    if "timeout" in combined or "timed out" in combined:
+        return ProviderErrorInfo("provider_timeout", True, status_code, detail_with_body(detail, response_text))
+    if any(fragment in combined for fragment in ("connection refused", "connection reset", "server disconnected", "bad gateway", "service unavailable", "gateway timeout")):
+        return ProviderErrorInfo("provider_network_error", True, status_code, detail_with_body(detail, response_text))
+    return None
+
+
+def response_text_or_empty(response: Any) -> str:
+    if response is None:
+        return ""
+    text = getattr(response, "text", "")
+    if isinstance(text, str):
+        return text
+    try:
+        return str(text)
+    except Exception:
+        return ""
+
+
+def detail_with_body(detail: str, body: str) -> str:
+    body = body.strip()
+    if not body or body in detail:
+        return detail
+    return f"{detail}; response={body[:1000]}"
 
 
 async def call_provider_legacy(client: Any, prompt: str, model: str) -> ProviderCallResult:
@@ -123,7 +217,7 @@ def provider_completion_config(model: str) -> Any:
     try:
         from weav_provider_router.base import CompletionConfig
     except Exception:
-        return {"model": model}
+        return SimpleNamespace(model=model, temperature=0.0)
     return CompletionConfig(model=model, temperature=0.0)
 
 
