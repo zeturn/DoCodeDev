@@ -79,3 +79,12 @@ class ContextManagerTests(TestCase):
         self.assertLess(len(rendered.encode("utf-8")), 30_000)
         self.assertEqual(len(pack.recent_messages), 5)
         self.assertNotIn("line\n" * 1000, rendered)
+
+    def test_crawler_context_adds_dependency_and_artifact_contract(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="Build a GitHub Trending crawler")
+
+        text = ContextManager().task_contract(job, task_contract=TaskContract())
+
+        self.assertIn("Crawler dependency policy", text)
+        self.assertIn("dry-run must write the requested output artifact", text)
+        self.assertIn("offline fixture mode", text)

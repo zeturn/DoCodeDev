@@ -46,6 +46,8 @@ class VerificationPlan:
     require_entrypoint_run: bool = False
     require_no_placeholder: bool = True
     require_external_source_verified: bool = False
+    require_declared_python_dependencies: bool = False
+    require_crawler_artifacts: bool = False
     artifact_export: bool = False
     docs_only: bool = False
     external_source_repair: bool = False
@@ -129,6 +131,8 @@ class CodingVerifier:
         verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_result.output, workspace_result)
         if plan.required_file_contains:
             verified_diff = await augment_diff_with_required_file_content(verified_diff, plan, tools)
+        if plan.require_declared_python_dependencies or plan.require_crawler_artifacts:
+            verified_diff = await augment_diff_with_policy_file_content(verified_diff, tools)
         smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result, plan)
         smoke_ok = smoke_result.exit_code == 0
         plan_ok, plan_fixes = evaluate_verification_plan(plan, verified_diff, test_result, build_result, lint_result, smoke_result, evidence)
@@ -155,6 +159,8 @@ class CodingVerifier:
                 fixes.append("abandon the current data source, call web_search again, inspect a different machine-readable source with fetch_url, and update the crawler to use that working source")
             if smoke_output_indicates_missing_endpoint(smoke_result.output):
                 fixes.append("the current API endpoint returned 404 or not found; do not keep retrying the same endpoint, re-inspect the source documentation with fetch_url or call web_search again, then update the crawler to a verified working endpoint")
+            if smoke_output_indicates_system_pip_blocked(smoke_result.output):
+                fixes.append("do not retry system pip install; use Python standard library or create a .venv and declare dependencies")
         fixes.extend(fix for fix in plan_fixes if fix not in fixes)
 
         judgement = None if plan_uses_structured_semantics(plan) else await self._judge(job, status_result, verified_diff, test_result, build_result, lint_result, smoke_result)
@@ -319,6 +325,32 @@ async def augment_diff_with_required_file_content(diff: str, plan: VerificationP
     return diff + ("\n" if diff and not diff.endswith("\n") else "") + "\n".join(additions)
 
 
+async def augment_diff_with_policy_file_content(diff: str, tools: DoBoxTools) -> str:
+    additions: list[str] = []
+    for path in changed_files_from_diff(diff):
+        if not path.endswith(".py") or diff_has_added_content_for_file(diff, path):
+            continue
+        result = await safe_optional_tool_call("read_file", tools, path)
+        if result.exit_code != 0:
+            continue
+        additions.append("diff --git a/{0} b/{0}\n".format(path) + "\n".join(f"+{line}" for line in result.output.splitlines()) + "\n")
+    if not additions:
+        return diff
+    return diff + ("\n" if diff and not diff.endswith("\n") else "") + "\n".join(additions)
+
+
+def diff_has_added_content_for_file(diff: str, path: str) -> bool:
+    normalized = path.strip().replace("\\", "/").lower()
+    in_file = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            in_file = f" b/{normalized}" in line.lower() or line.lower().endswith(" " + normalized)
+            continue
+        if in_file and line.startswith("+") and not line.startswith("+++"):
+            return True
+    return False
+
+
 async def run_smoke_verification(
     job: CodingJob,
     tools: DoBoxTools,
@@ -348,7 +380,9 @@ async def run_smoke_verification(
             if plan.smoke_commands:
                 commands.extend(plan.smoke_commands)
             else:
-                commands.extend("python3 " + shlex.quote(path) for path in runnable[:1])
+                for path in runnable[:1]:
+                    suffix = " --dry-run" if plan.require_crawler_artifacts and diff_file_contains(diff, path, "--dry-run") else ""
+                    commands.append("python3 " + shlex.quote(path) + suffix)
             if requires_csv_output_check(job.instruction):
                 commands.append("python3 -c " + double_quote_shell_arg(csv_output_check_script()))
             elif requires_json_output_check(job.instruction):
@@ -472,6 +506,8 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
         require_entrypoint_run=(is_crawler or is_cli) and not is_bugfix and not is_artifact_export,
         require_no_placeholder=not is_docs,
         require_external_source_verified=(is_crawler or is_api or is_external_source_repair) and not is_artifact_export,
+        require_declared_python_dependencies=is_crawler,
+        require_crawler_artifacts=is_crawler,
         artifact_export=is_artifact_export,
         docs_only=is_docs,
         external_source_repair=is_external_source_repair,
@@ -588,6 +624,12 @@ def evaluate_verification_plan(
         fixes.append("remove placeholder/TODO/stub implementation text before finishing")
     if plan.require_external_source_verified and not external_source_verified(smoke_result, evidence, diff):
         fixes.append("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run")
+    if plan.require_declared_python_dependencies:
+        dependency_fixes = undeclared_dependency_fixes(diff)
+        fixes.extend(fix for fix in dependency_fixes if fix not in fixes)
+    if plan.require_crawler_artifacts:
+        crawler_fixes = crawler_artifact_fixes(diff, smoke_result)
+        fixes.extend(fix for fix in crawler_fixes if fix not in fixes)
     return not fixes, fixes
 
 
@@ -616,6 +658,19 @@ def diff_contains_file_terms(diff: str, path: str, terms: list[str]) -> bool:
     return all(term.lower() in text for term in terms)
 
 
+def diff_file_contains(diff: str, path: str, term: str) -> bool:
+    normalized = path.strip().replace("\\", "/").lower()
+    in_file = False
+    needle = term.lower()
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            in_file = f" b/{normalized}" in line.lower() or line.lower().endswith(" " + normalized)
+            continue
+        if in_file and line.startswith("+") and not line.startswith("+++") and needle in line.lower():
+            return True
+    return False
+
+
 def diff_contains_placeholder(diff_lowered: str) -> bool:
     return bool(re.search(r"\b(?:todo|placeholder|stub)\b|not implemented|pass\s+#|pass\n", diff_lowered))
 
@@ -634,6 +689,145 @@ def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvi
     if smoke_result.exit_code == 0 and smoke_result.metadata and smoke_result.metadata.get("detected"):
         return True
     return False
+
+
+PYTHON_THIRD_PARTY_DEPENDENCIES = {
+    "bs4": "beautifulsoup4",
+    "requests": "requests",
+    "httpx": "httpx",
+    "lxml": "lxml",
+    "pandas": "pandas",
+    "pydantic": "pydantic",
+    "dateutil": "python-dateutil",
+    "scrapy": "scrapy",
+    "selenium": "selenium",
+    "numpy": "numpy",
+}
+
+
+def undeclared_dependency_fixes(diff: str) -> list[str]:
+    imports = python_third_party_imports_from_diff(diff)
+    if not imports:
+        return []
+    declared = declared_python_dependencies(diff)
+    missing = sorted(package for package in imports.values() if package not in declared)
+    if not missing:
+        return []
+    return [
+        "third-party Python dependency used but not declared or verified: "
+        + ", ".join(missing)
+        + "; prefer standard library for crawler tasks, or add requirements.txt/pyproject.toml and verify imports in a venv"
+    ]
+
+
+def python_third_party_imports_from_diff(diff: str) -> dict[str, str]:
+    imports: dict[str, str] = {}
+    current_path = ""
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            match = re.search(r" b/(.+)$", line)
+            current_path = match.group(1).strip() if match else ""
+            continue
+        if not current_path.endswith(".py") or is_test_path(current_path):
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        code = line[1:].strip()
+        if code.startswith("#"):
+            continue
+        for module in imported_top_level_modules(code):
+            package = PYTHON_THIRD_PARTY_DEPENDENCIES.get(module)
+            if package:
+                imports[module] = package
+    return imports
+
+
+def imported_top_level_modules(code: str) -> list[str]:
+    modules: list[str] = []
+    import_match = re.match(r"import\s+(.+)$", code)
+    if import_match:
+        for part in import_match.group(1).split(","):
+            name = part.strip().split()[0].split(".")[0]
+            if name:
+                modules.append(name)
+    from_match = re.match(r"from\s+([A-Za-z_][\w.]*)\s+import\b", code)
+    if from_match:
+        modules.append(from_match.group(1).split(".")[0])
+    return modules
+
+
+def declared_python_dependencies(diff: str) -> set[str]:
+    declared: set[str] = set()
+    current_path = ""
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            match = re.search(r" b/(.+)$", line)
+            current_path = match.group(1).strip().lower() if match else ""
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        if not is_python_dependency_manifest(current_path):
+            continue
+        lowered = line[1:].strip().lower()
+        for package in PYTHON_THIRD_PARTY_DEPENDENCIES.values():
+            if re.search(rf"(^|[^a-z0-9_.-]){re.escape(package.lower())}([^a-z0-9_.-]|$)", lowered):
+                declared.add(package)
+    return declared
+
+
+def is_python_dependency_manifest(path: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    return normalized.endswith(("requirements.txt", "pyproject.toml", "setup.cfg", "setup.py", "pipfile"))
+
+
+def crawler_artifact_fixes(diff: str, smoke_result: ToolResult) -> list[str]:
+    fixes: list[str] = []
+    if duplicate_python_implementation_paths(diff):
+        fixes.append("crawler implementation appears duplicated; rewrite the Python file once cleanly instead of appending another implementation")
+    command_text = " ".join(str(item) for item in (smoke_result.metadata or {}).get("commands", []))
+    output_text = smoke_result.output or ""
+    combined = f"{command_text}\n{output_text}".lower()
+    if "--dry-run" in diff.lower() and "dry-run" not in combined:
+        fixes.append("run the crawler dry-run command before final verification")
+    if not crawler_output_artifact_verified(combined):
+        fixes.append("crawler dry-run must write an output artifact and verification must prove the JSON/CSV file exists and parses")
+    if "fixtures/" in diff.lower() and "--source" in diff.lower() and "--source" not in combined:
+        fixes.append("run the crawler against its offline fixture with --source before final verification")
+    return fixes
+
+
+def duplicate_python_implementation_paths(diff: str) -> list[str]:
+    counts: dict[str, dict[str, int]] = {}
+    current_path = ""
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            match = re.search(r" b/(.+)$", line)
+            current_path = match.group(1).strip() if match else ""
+            continue
+        if not current_path.endswith(".py") or not line.startswith("+") or line.startswith("+++"):
+            continue
+        text = line[1:].strip()
+        markers = counts.setdefault(current_path, {"main": 0, "dunder": 0})
+        if re.match(r"def\s+main\s*\(", text):
+            markers["main"] += 1
+        if "__name__" in text and "__main__" in text:
+            markers["dunder"] += 1
+    return [path for path, markers in counts.items() if markers["main"] > 1 or markers["dunder"] > 1]
+
+
+def crawler_output_artifact_verified(combined_smoke_text: str) -> bool:
+    if "json outputs:" in combined_smoke_text or "csv outputs:" in combined_smoke_text:
+        return True
+    if re.search(r"data/[\w.-]+\.(?:json|csv)", combined_smoke_text) and any(
+        marker in combined_smoke_text for marker in ("min_records=", "json output", "csv output", "saved", "wrote", "written")
+    ):
+        return True
+    return False
+
+
+def is_test_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized.startswith("tests/") or "/tests/" in normalized or normalized.startswith("test_") or "/test_" in normalized
 
 
 def verification_evidence_from_steps(steps) -> VerificationEvidence:
@@ -875,6 +1069,11 @@ def smoke_output_indicates_missing_endpoint(output: str) -> bool:
             "'status': 404",
         )
     )
+
+
+def smoke_output_indicates_system_pip_blocked(output: str) -> bool:
+    lowered = (output or "").lower()
+    return "externally-managed-environment" in lowered or "this environment is externally managed" in lowered
 
 
 def smoke_output_indicates_missing_file(output: str) -> bool:

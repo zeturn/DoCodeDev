@@ -90,6 +90,8 @@ class ContextManager:
             mandatory.append("You must produce non-empty git diff before final_candidate")
             mandatory.extend(f"You must run suggested command: {command}" for command in task_contract.must_run_commands)
             mandatory.extend(task_contract.forbidden_finish_conditions)
+            if is_crawler_instruction(job.instruction):
+                mandatory.extend(crawler_contract_requirements())
             parts.append("Mandatory:\n" + "\n".join(f"- {item}" for item in mandatory))
         if repair_mode:
             parts.append(
@@ -145,12 +147,14 @@ class ContextManager:
         clean = git_status_clean(git_status.output)
         changed = changed_files_from_status(git_status.output)
         final_allowed = "no" if clean or repair_mode == "must_edit" else "yes"
+        required_next = next_missing_command(messages)
         return (
             f"Git status:\n{git_status.output or '<clean>'}\n\n"
             "Current Git Diff State:\n"
             f"- git_status_clean: {str(clean).lower()}\n"
             f"- changed_files: {json.dumps(changed, ensure_ascii=False)}\n"
-            f"- final_candidate_allowed: {final_allowed}{final_candidate_reason(clean, repair_mode)}\n\n"
+            f"- final_candidate_allowed: {final_allowed}{final_candidate_reason(clean, repair_mode)}\n"
+            f"- required_next_command: {required_next or '<none>'}\n\n"
             f"Latest tool evidence:\n{tool_summaries or '- No tool calls yet.'}"
         )
 
@@ -230,6 +234,21 @@ def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return keep
 
 
+def next_missing_command(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        content = message.get("content")
+        if isinstance(content, str):
+            for line in content.splitlines():
+                if line.startswith("Next required command:"):
+                    return line.split(":", 1)[1].strip()
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict):
+            commands = metadata.get("missing_commands")
+            if isinstance(commands, list) and commands:
+                return str(commands[0])
+    return ""
+
+
 def touched_paths(messages: list[dict[str, Any]]) -> set[str]:
     paths: set[str] = set()
     for message in messages:
@@ -258,6 +277,21 @@ def final_candidate_reason(clean: bool, repair_mode: str | None) -> str:
     if repair_mode == "must_edit":
         return " because repair_mode requires an edit confirmation first"
     return " after tests pass"
+
+
+def is_crawler_instruction(instruction: str) -> bool:
+    lowered = (instruction or "").lower()
+    return any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
+
+
+def crawler_contract_requirements() -> list[str]:
+    return [
+        "Crawler dependency policy: prefer Python standard library; do not use undeclared third-party packages",
+        "If a third-party Python package is required, declare it in requirements.txt or pyproject.toml and verify imports in a venv",
+        "Do not retry system pip install after externally-managed-environment failures",
+        "Crawler dry-run must write the requested output artifact and final verification must prove it parses",
+        "Prefer an offline fixture mode so parser behavior is reproducible without live network access",
+    ]
 
 
 def clip_text(text: str, limit: int) -> str:

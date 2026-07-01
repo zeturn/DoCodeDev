@@ -393,7 +393,11 @@ class CodingAgentLoop:
         if workflow_state is not None:
             payload["workflow_state"] = workflow_state
         await self.repository.add_step(state.job.id, "system", payload)
-        state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}")
+        missing_commands = workflow_state.get("missing_commands") if workflow_state is not None else None
+        next_command = ""
+        if isinstance(missing_commands, list) and missing_commands:
+            next_command = f"\nNext required command: {missing_commands[0]}"
+        state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}{next_command}")
         state.iteration += 1
 
     def sync_llm_usage(self, state: AgentState) -> None:

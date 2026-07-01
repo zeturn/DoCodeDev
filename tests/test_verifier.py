@@ -76,7 +76,7 @@ class UntrackedArtifactVerifierTools(PassingVerifierTools):
     async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
         self.command = command
         _ = cwd
-        return ToolResult(tool="run_command", output="ok", exit_code=0)
+        return ToolResult(tool="run_command", output="JSON outputs: data/output.json\nmin_records=1", exit_code=0)
 
 
 class StatusOnlyChangeVerifierTools(PassingVerifierTools):
@@ -121,6 +121,21 @@ class NoDetectedPythonVerifierTools(PassingVerifierTools):
         self.commands.append(command)
         _ = cwd
         return ToolResult(tool="run_command", output="smoke output", exit_code=self.smoke_exit_code, metadata={"command": command})
+
+
+class CrawlerPolicyVerifierTools(NoDetectedPythonVerifierTools):
+    def __init__(self, diff: str, *, smoke_output: str = "JSON outputs: data/output.json\nmin_records=5") -> None:
+        super().__init__(smoke_exit_code=0)
+        self.diff = diff
+        self.smoke_output = smoke_output
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(tool="git_diff", output=self.diff)
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        self.commands.append(command)
+        _ = cwd
+        return ToolResult(tool="run_command", output=self.smoke_output, exit_code=0, metadata={"command": command})
 
 
 class BugfixWithoutTestVerifierTools(PassingVerifierTools):
@@ -393,7 +408,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)
 
         result = await CodingVerifier().verify(
-            CodingJob(id=new_id("job"), user_id="u1", instruction="生成一个可运行的 Python 爬虫脚本抓取每日数据"),
+            CodingJob(id=new_id("job"), user_id="u1", instruction="生成一个可运行的 Python script"),
             tools,
         )
 
@@ -447,6 +462,99 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIn("data/output.json", command)
         self.assertIn("min_records=5", command)
         self.assertNotIn("*.csv", command)
+
+    async def test_crawler_rejects_undeclared_third_party_dependencies(self) -> None:
+        diff = (
+            "diff --git a/crawler.py b/crawler.py\n"
+            "+import requests\n"
+            "+from bs4 import BeautifulSoup\n"
+            "+def main():\n"
+            "+    print('JSON outputs: data/output.json')\n"
+            "+if __name__ == '__main__':\n"
+            "+    main()\n"
+        )
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Build a crawler that writes data/output.json with at least 5 records."),
+            CrawlerPolicyVerifierTools(diff),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("third-party Python dependency used but not declared" in fix for fix in result.required_fixes))
+
+    async def test_crawler_allows_declared_third_party_dependencies(self) -> None:
+        diff = (
+            "diff --git a/crawler.py b/crawler.py\n"
+            "+import requests\n"
+            "+from bs4 import BeautifulSoup\n"
+            "+def main():\n"
+            "+    print('JSON outputs: data/output.json')\n"
+            "+if __name__ == '__main__':\n"
+            "+    main()\n"
+            "diff --git a/requirements.txt b/requirements.txt\n"
+            "+requests\n"
+            "+beautifulsoup4\n"
+        )
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Build a crawler that writes data/output.json with at least 5 records."),
+            CrawlerPolicyVerifierTools(diff),
+        )
+
+        self.assertTrue(result.passed)
+
+    async def test_crawler_prefers_dry_run_when_entrypoint_supports_it(self) -> None:
+        diff = (
+            "diff --git a/crawler.py b/crawler.py\n"
+            "+import argparse\n"
+            "+def main():\n"
+            "+    parser = argparse.ArgumentParser()\n"
+            "+    parser.add_argument('--dry-run', action='store_true')\n"
+            "+    print('JSON outputs: data/output.json')\n"
+            "+if __name__ == '__main__':\n"
+            "+    main()\n"
+        )
+        tools = CrawlerPolicyVerifierTools(diff)
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Build a crawler that writes data/output.json with at least 5 records."),
+            tools,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertTrue(any(command == "python3 crawler.py --dry-run" for command in tools.commands))
+
+    async def test_crawler_rejects_duplicate_implementation(self) -> None:
+        diff = (
+            "diff --git a/crawler.py b/crawler.py\n"
+            "+def main():\n"
+            "+    pass\n"
+            "+if __name__ == '__main__':\n"
+            "+    main()\n"
+            "+def main():\n"
+            "+    pass\n"
+            "+if __name__ == '__main__':\n"
+            "+    main()\n"
+        )
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Build a crawler that writes data/output.json with at least 5 records."),
+            CrawlerPolicyVerifierTools(diff),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("appears duplicated" in fix for fix in result.required_fixes))
+
+    async def test_crawler_requires_output_artifact_evidence(self) -> None:
+        diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('ok')\n"
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Build a crawler."),
+            CrawlerPolicyVerifierTools(diff, smoke_output="ok"),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("dry-run must write an output artifact" in fix for fix in result.required_fixes))
 
     def test_json_api_response_does_not_require_output_file(self) -> None:
         self.assertFalse(requires_json_output_check("Implement client.parse_items_response so it extracts item names from a JSON API response."))

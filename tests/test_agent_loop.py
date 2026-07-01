@@ -196,6 +196,7 @@ class RequiredTestGateLLM:
     def __init__(self) -> None:
         self.calls = 0
         self.observed_test_gate_feedback = False
+        self.observed_next_required_command = False
 
     async def decide(self, *, system, messages, tools, context):
         _ = system, tools, context
@@ -207,6 +208,10 @@ class RequiredTestGateLLM:
         if self.calls == 3:
             self.observed_test_gate_feedback = any(
                 message.get("kind") == "feedback" and "final_candidate_tests_missing" in str(message.get("content"))
+                for message in messages
+            )
+            self.observed_next_required_command = any(
+                message.get("kind") == "feedback" and "Next required command: echo checked" in str(message.get("content"))
                 for message in messages
             )
             return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo checked"})
@@ -603,10 +608,12 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
             self.assertEqual(result.result_summary, "Updated README after running required verification.")
             self.assertTrue(llm.observed_test_gate_feedback)
+            self.assertTrue(llm.observed_next_required_command)
             steps = await repo.list_steps(job.id)
             rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
             self.assertEqual(rejected[0].content["reason"], "final_candidate_tests_missing")
             self.assertEqual(rejected[0].content["workflow_state"]["phase"], "TEST_REQUIRED")
+            self.assertEqual(rejected[0].content["workflow_state"]["missing_commands"], ["echo checked"])
             workflow_steps = [step for step in steps if step.content.get("type") == "workflow_state"]
             self.assertTrue(any(step.content.get("phase") == "TEST_REQUIRED" for step in workflow_steps))
 
