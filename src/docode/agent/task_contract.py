@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from collections.abc import Iterable
+import re
 
 
 FILE_REF_RE = re.compile(r"\b[\w./-]+\.(?:py|js|ts|go|rs|md|json|toml|yaml|yml)\b")
@@ -37,17 +37,44 @@ def suggested_commands(files: list[str]) -> list[str]:
 
 def verification_commands_from_instruction(instruction: str) -> list[str]:
     commands: list[str] = []
+    in_verification_block = False
     for raw_line in (instruction or "").splitlines():
         line = raw_line.strip()
         lowered = line.lower()
+        heading = lowered.lstrip("- ").rstrip(":")
+        if heading in {"verification commands", "suggested verification commands"}:
+            in_verification_block = True
+            continue
+        if in_verification_block:
+            if line.startswith("- "):
+                command = line[2:].strip(" `")
+                if command and command_like(command):
+                    commands.append(command)
+                continue
+            if line and not line.endswith(":"):
+                in_verification_block = False
         if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
             continue
+        if lowered.startswith("semantic checks:") or lowered.startswith("- semantic checks:"):
+            continue
         _, value = line.split(":", 1)
-        for command in re.split(r"\s*;\s*", value.strip()):
-            command = command.strip(" -`")
-            if command:
-                commands.append(command)
+        command = value.strip(" -`")
+        if command and command_like(command):
+            commands.append(command)
     return commands[:5]
+
+
+def command_like(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    parts = text.split()
+    first = parts[0]
+    if first == "git":
+        if len(parts) >= 3 and parts[2] in {"is", "should", "must"}:
+            return False
+        return len(parts) >= 2 and parts[1] in {"status", "diff", "show", "log"}
+    return first in {"python", "python3", "pytest", "npm", "node", "go", "cargo", "git", "ruff", "mypy", "make", "bash", "sh", "echo", "grep"}
 
 
 def unique_preserving_order(values: Iterable[object]) -> list[str]:

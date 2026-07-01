@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from docode.agent.context import ContextManager, ContextPack
@@ -10,7 +11,7 @@ from docode.agent.stuck import REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_c
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.task_contract import TaskContract, task_contract_from_instruction
 from docode.agent.verifier import CodingVerifier, VerificationResult, changed_files_from_diff, verification_evidence_from_steps
-from docode.agent.workflow import final_candidate_gate, workflow_snapshot
+from docode.agent.workflow import WorkflowPhase, final_candidate_gate, workflow_snapshot
 from docode.artifacts.exporter import ArtifactExporter, terminal_artifact_id
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
@@ -33,6 +34,8 @@ class CodingAgentLoop:
         context_manager: ContextManager | None = None,
         usage_meter: LLMUsageMeter | None = None,
         stuck_detector: StuckDetector | None = None,
+        llm_max_attempts: int = 3,
+        llm_retry_delays: tuple[float, ...] = (2.0, 5.0),
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -44,6 +47,8 @@ class CodingAgentLoop:
         self.context_manager = context_manager or ContextManager()
         self.usage_meter = usage_meter
         self.stuck_detector = stuck_detector or StuckDetector()
+        self.llm_max_attempts = max(1, llm_max_attempts)
+        self.llm_retry_delays = llm_retry_delays
 
     async def run(self, job: CodingJob) -> CodingJob:
         job = await self.repository.update_job(job.id, status=JobStatus.RUNNING)
@@ -81,12 +86,7 @@ class CodingAgentLoop:
                     },
                 )
             try:
-                decision = await self.llm.decide(
-                    system=DOCODE_SYSTEM_PROMPT,
-                    messages=state.messages,
-                    tools=allowed_tool_definitions(self.tools.definitions(), state.repair_mode),
-                    context=observation,
-                )
+                decision = await self.decide_with_transient_retries(state, observation)
             except Exception as exc:
                 provider_failure = provider_failure_reason(exc)
                 if provider_failure == "llm_auth_failed":
@@ -115,6 +115,18 @@ class CodingAgentLoop:
                             f"{decision.tool_name} is blocked while repair_mode=must_edit. "
                             "Call read_file, edit_file, write_file, replace_in_file, apply_patch, git_status, or git_diff first."
                         ),
+                    )
+                    continue
+                current_workflow = workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else "")
+                if current_workflow.phase == WorkflowPhase.FINAL_READY and state.repair_mode != "must_edit":
+                    await self.record_rejected_decision(
+                        state,
+                        reason="final_ready_tool_forbidden",
+                        detail=(
+                            f"{decision.tool_name} is blocked because the workflow is already FINAL_READY. "
+                            "Submit final_candidate now so the verifier can review the completed diff."
+                        ),
+                        workflow_state=current_workflow.to_dict(),
                     )
                     continue
                 cancelled = await self.cancelled_job(job.id)
@@ -193,6 +205,8 @@ class CodingAgentLoop:
                         artifact_id=artifact_id,
                     )
                 if requires_non_empty_diff_repair(verification):
+                    state.repair_mode = "must_edit"
+                elif verification.required_fixes:
                     state.repair_mode = "must_edit"
                 state.add_feedback(verification_repair_feedback(verification, state.task_contract))
                 state.iteration += 1
@@ -327,6 +341,41 @@ class CodingAgentLoop:
         state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}")
         state.iteration += 1
 
+    async def decide_with_transient_retries(self, state: AgentState, observation: str):
+        tools = allowed_tool_definitions(self.tools.definitions(), state.repair_mode)
+        for attempt in range(1, self.llm_max_attempts + 1):
+            try:
+                return await self.llm.decide(
+                    system=DOCODE_SYSTEM_PROMPT,
+                    messages=state.messages,
+                    tools=tools,
+                    context=observation,
+                )
+            except Exception as exc:
+                reason = provider_failure_reason(exc)
+                if reason == "llm_auth_failed" or not retryable_provider_failure(reason, exc) or attempt >= self.llm_max_attempts:
+                    raise
+                delay = self.llm_retry_delays[min(attempt - 1, len(self.llm_retry_delays) - 1)] if self.llm_retry_delays else 0.0
+                await self.record_model_retry(state, reason or "llm_provider_unavailable", str(exc), attempt, delay)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        raise RuntimeError("LLM retry loop exhausted unexpectedly")
+
+    async def record_model_retry(self, state: AgentState, reason: str, detail: str, attempt: int, delay: float) -> None:
+        self.sync_llm_usage(state)
+        await self.repository.add_step(
+            state.job.id,
+            "llm",
+            {
+                "type": "llm_retry",
+                "reason": reason,
+                "attempt": attempt,
+                "next_delay_seconds": delay,
+                "detail": truncate_text(detail, 1200),
+                "usage": self.usage_meter.snapshot() if self.usage_meter is not None else None,
+            },
+        )
+
     async def record_rejected_decision(
         self,
         state: AgentState,
@@ -402,6 +451,9 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
             "require_entrypoint_run": result.verification_plan.require_entrypoint_run,
             "require_no_placeholder": result.verification_plan.require_no_placeholder,
             "require_external_source_verified": result.verification_plan.require_external_source_verified,
+            "artifact_export": result.verification_plan.artifact_export,
+            "docs_only": result.verification_plan.docs_only,
+            "external_source_repair": result.verification_plan.external_source_repair,
         }
         if result.verification_plan
         else None,
@@ -570,3 +622,13 @@ def provider_failure_reason(exc: Exception) -> str | None:
     if "connection refused" in text or "connection reset" in text or "server disconnected" in text or "timeout" in text:
         return "llm_provider_unavailable:provider_network_error"
     return None
+
+
+def retryable_provider_failure(reason: str | None, exc: Exception) -> bool:
+    if isinstance(exc, ProviderUnavailableError):
+        return bool(exc.retryable)
+    return reason in {
+        "llm_provider_unavailable:provider_upstream_unavailable",
+        "llm_provider_unavailable:provider_rate_limited",
+        "llm_provider_unavailable:provider_network_error",
+    }

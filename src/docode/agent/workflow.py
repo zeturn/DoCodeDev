@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 from docode.agent.state import AgentState
-from docode.agent.stuck import git_status_clean
 from docode.agent.task_contract import TaskContract
 
 
@@ -47,7 +46,7 @@ class FinalGate:
 
 
 def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnapshot:
-    diff_exists = not git_status_clean(git_status_output)
+    diff_exists = meaningful_diff_exists(git_status_output)
     tests_run = required_commands_satisfied(state)
     if state.inspection is None:
         return WorkflowSnapshot(
@@ -161,3 +160,38 @@ def command_was_run(state: AgentState, command: str) -> bool:
 
 def normalize_command(command: str) -> str:
     return " ".join(command.strip().split())
+
+
+def meaningful_diff_exists(git_status_output: str) -> bool:
+    return any(meaningful_change_path(path) for path in changed_paths_from_status(git_status_output))
+
+
+def changed_paths_from_status(status: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in status.splitlines():
+        line = strip_ansi(raw_line).rstrip()
+        if len(line) < 4:
+            continue
+        marker = line[:2]
+        path = line[3:].strip()
+        if path and (marker == "??" or marker.strip()):
+            paths.append(path)
+    return paths
+
+
+def meaningful_change_path(path: str) -> bool:
+    normalized = strip_ansi(path).strip().replace("\\", "/")
+    parts = normalized.split("/")
+    return not (
+        normalized in {".docode_probe", ".docode_probe_api"}
+        or normalized.startswith(".docode_probe")
+        or "__pycache__" in parts
+        or normalized.endswith((".pyc", ".pyo"))
+        or normalized.startswith(".git/")
+    )
+
+
+def strip_ansi(value: str) -> str:
+    import re
+
+    return re.sub(r"\x1b\[[0-9;]*m", "", value)

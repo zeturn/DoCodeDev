@@ -86,6 +86,12 @@ def main() -> None:
     eval_jobs.add_argument("--max-tool-calls", type=int)
     eval_jobs.add_argument("--max-llm-tokens", type=int)
     eval_jobs.add_argument("--max-llm-cost", type=float)
+    eval_jobs.add_argument(
+        "--retry-model-unavailable",
+        type=int,
+        default=0,
+        help="Retry each eval case this many additional times when the result is classified as model_unavailable.",
+    )
     eval_jobs.add_argument("--user-id", default="eval")
     eval_jobs.add_argument("--start-dobox", action="store_true", help="Temporarily start the local DoBox backend for eval jobs if needed.")
     eval_jobs.add_argument("--include-hints", action="store_true", help="Append eval-only target file and command hints to each job instruction.")
@@ -297,42 +303,93 @@ async def run_eval_jobs_with_config(args: argparse.Namespace, config) -> None:
     with managed_local_repo_server(manifest, enabled=serve_local_repos) as served_manifest:
         cases = served_manifest["cases"][: args.limit] if args.limit else served_manifest["cases"]
         for case in cases:
-            repo_url = case.get("repo_url") or case.get("repo_path")
-            instruction = eval_instruction_with_hints(case) if getattr(args, "include_hints", False) else str(case["instruction"])
-            job = await create_coding_job(
+            result = await run_eval_case_with_retries(
+                args=args,
+                case=case,
+                config=config,
                 repository=repository,
                 queue=queue,
-                config=config,
                 model_policy=model_policy,
-                user_id=args.user_id,
-                request=CreateJobInput(
-                    instruction=instruction,
-                    repo_url=str(repo_url) if repo_url else None,
-                    provider=args.provider,
-                    model=args.model,
-                    quality=args.quality,
-                    max_iterations=args.max_iterations,
-                    max_runtime_seconds=args.max_runtime_seconds,
-                    max_consecutive_failures=args.max_consecutive_failures,
-                    max_tool_calls=args.max_tool_calls,
-                    max_llm_tokens=args.max_llm_tokens,
-                    max_llm_cost=args.max_llm_cost,
-                    artifact_mode=str(case.get("artifact_mode") or "patch"),
-                    sandbox_network_mode=config.sandbox_network_mode,
-                ),
+                runner=runner,
             )
-            await runner.run_job(job.id)
-            completed = await repository.get_job(job.id)
-            steps = await repository.list_steps(job.id)
-            result = eval_case_result_from_job(case, completed or job, steps)
             write_eval_case_result(result, Path(args.results_dir))
             results.append(result)
     print({"results_dir": args.results_dir, "cases": len(results), "succeeded": sum(1 for result in results if result.get("success"))})
 
 
+async def run_eval_case_with_retries(
+    *,
+    args: argparse.Namespace,
+    case: dict[str, object],
+    config,
+    repository,
+    queue: AsyncJobQueue,
+    model_policy: DocodeModelPolicy,
+    runner,
+) -> dict[str, object]:
+    max_attempts = max(1, 1 + int(getattr(args, "retry_model_unavailable", 0) or 0))
+    attempts: list[dict[str, object]] = []
+    last_result: dict[str, object] | None = None
+    for attempt in range(1, max_attempts + 1):
+        repo_url = case.get("repo_url") or case.get("repo_path")
+        instruction = eval_instruction_with_hints(case) if getattr(args, "include_hints", False) else str(case["instruction"])
+        job = await create_coding_job(
+            repository=repository,
+            queue=queue,
+            config=config,
+            model_policy=model_policy,
+            user_id=args.user_id,
+            request=CreateJobInput(
+                instruction=instruction,
+                repo_url=str(repo_url) if repo_url else None,
+                provider=args.provider,
+                model=args.model,
+                quality=args.quality,
+                max_iterations=args.max_iterations,
+                max_runtime_seconds=args.max_runtime_seconds,
+                max_consecutive_failures=args.max_consecutive_failures,
+                max_tool_calls=args.max_tool_calls,
+                max_llm_tokens=args.max_llm_tokens,
+                max_llm_cost=args.max_llm_cost,
+                artifact_mode=str(case.get("artifact_mode") or "patch"),
+                sandbox_network_mode=config.sandbox_network_mode,
+            ),
+        )
+        await runner.run_job(job.id)
+        completed = await repository.get_job(job.id)
+        steps = await repository.list_steps(job.id)
+        result = eval_case_result_from_job(case, completed or job, steps)
+        attempts.append(eval_attempt_summary(attempt, result))
+        last_result = result
+        if result.get("failure_class") != "model_unavailable":
+            break
+    assert last_result is not None
+    last_result["attempts"] = len(attempts)
+    if len(attempts) > 1:
+        last_result["attempt_results"] = attempts
+    return last_result
+
+
+def eval_attempt_summary(attempt: int, result: dict[str, object]) -> dict[str, object]:
+    return {
+        "attempt": attempt,
+        "job_id": result.get("job_id"),
+        "success": result.get("success"),
+        "status": result.get("status"),
+        "failure_class": result.get("failure_class"),
+        "failure_category": result.get("failure_category"),
+        "failure_reason": result.get("failure_reason"),
+        "iterations": result.get("iterations"),
+        "tool_calls": result.get("tool_calls"),
+        "tokens": result.get("tokens"),
+    }
+
+
 def eval_instruction_with_hints(case: dict[str, object]) -> str:
     instruction = str(case["instruction"])
     hints: list[str] = []
+    verification_commands: list[str] = []
+    semantic_checks: list[str] = []
     configured_hints = case.get("hints") if isinstance(case.get("hints"), dict) else {}
     target_files = list_hint_values(configured_hints.get("target_files")) if configured_hints else []
     expected_behavior = str(configured_hints.get("expected_behavior") or "").strip() if configured_hints else ""
@@ -342,18 +399,77 @@ def eval_instruction_with_hints(case: dict[str, object]) -> str:
     if expected_behavior:
         hints.append("expected behavior: " + expected_behavior)
     if suggested_commands:
-        hints.append("verify with: " + "; ".join(suggested_commands[:5]))
+        for command in suggested_commands:
+            if eval_check_command_like(command):
+                verification_commands.append(command)
+            else:
+                semantic_checks.append(command)
     files = case.get("files")
     if not target_files and isinstance(files, dict):
         target_files = [str(path) for path in files if not str(path).startswith("tests/")]
         if target_files:
             hints.append("Likely target files: " + ", ".join(target_files[:5]))
     checks = case.get("expected_checks")
-    if not suggested_commands and isinstance(checks, list) and checks:
-        hints.append("Suggested verification commands: " + "; ".join(str(check) for check in checks[:5]))
+    if isinstance(checks, list) and checks:
+        commands, semantics = eval_check_hints(checks)
+        for command in commands:
+            if command not in verification_commands:
+                verification_commands.append(command)
+        for semantic in semantics:
+            if semantic not in semantic_checks:
+                semantic_checks.append(semantic)
+    if verification_commands:
+        hints.append("Verification commands:\n" + "\n".join(f"- {command}" for command in verification_commands[:8]))
+    if semantic_checks:
+        hints.append("Semantic checks:\n" + "\n".join(f"- {check}" for check in semantic_checks[:8]))
     if not hints:
         return instruction
     return instruction + "\n\nEvaluation hints:\n" + "\n".join(f"- {hint}" for hint in hints)
+
+
+def eval_check_hints(checks: list[object]) -> tuple[list[str], list[str]]:
+    commands: list[str] = []
+    semantics: list[str] = []
+    for check in checks:
+        if isinstance(check, dict):
+            check_type = str(check.get("type") or "").strip()
+            command = str(check.get("command") or "").strip()
+            path = str(check.get("path") or "").strip()
+            if check_type == "command" and command:
+                commands.append(command)
+            elif check_type == "file_contains":
+                contains = [str(item) for item in check.get("contains", []) if str(item)]
+                semantics.append(f"{path or 'file'} contains: {', '.join(contains)}")
+            elif check_type == "file_exists":
+                semantics.append(f"{path} exists")
+            elif check_type == "json_len_at_least":
+                semantics.append(f"{path} JSON length >= {check.get('min_len')}")
+            elif check_type == "evidence":
+                semantics.append("external source evidence required")
+            elif check_type == "artifact":
+                semantics.append(f"artifact required: {path or check.get('artifact') or 'patch/pr'}")
+            continue
+        text = str(check).strip()
+        if not text:
+            continue
+        if eval_check_command_like(text):
+            commands.append(text)
+        else:
+            semantics.append(text)
+    return commands, semantics
+
+
+def eval_check_command_like(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    parts = text.split()
+    first = parts[0]
+    if first == "git":
+        if len(parts) >= 3 and parts[2] in {"is", "should", "must"}:
+            return False
+        return len(parts) >= 2 and parts[1] in {"status", "diff", "show", "log"}
+    return first in {"python", "python3", "pytest", "npm", "node", "go", "cargo", "git", "ruff", "mypy", "make", "bash", "sh", "echo", "grep"}
 
 
 def list_hint_values(value: object) -> list[str]:

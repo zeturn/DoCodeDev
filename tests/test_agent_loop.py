@@ -117,8 +117,12 @@ class UnauthorizedLLM:
 
 
 class ProviderUnavailableLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def decide(self, *, system, messages, tools, context):
         _ = system, messages, tools, context
+        self.calls += 1
         raise ProviderUnavailableError(
             ProviderErrorInfo(
                 category="provider_upstream_unavailable",
@@ -129,6 +133,26 @@ class ProviderUnavailableLLM:
             attempts=3,
             cause=RuntimeError("503 Service Unavailable"),
         )
+
+
+class RecoveringProviderUnavailableLLM(ProviderUnavailableLLM):
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, tools, context
+        self.calls += 1
+        if self.calls == 1:
+            raise ProviderUnavailableError(
+                ProviderErrorInfo(
+                    category="provider_upstream_unavailable",
+                    retryable=True,
+                    status_code=502,
+                    detail="Server error '502 Bad Gateway' for url 'http://localhost:8103/v1/chat/completions'",
+                ),
+                attempts=3,
+                cause=RuntimeError("502 Bad Gateway"),
+            )
+        if self.calls == 2:
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "recovered\n"})
+        return AgentDecision(type="final_candidate", summary="Recovered after provider retry.")
 
 
 class PrematureFinalLLM:
@@ -187,6 +211,27 @@ class RequiredTestGateLLM:
             )
             return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo checked"})
         return AgentDecision(type="final_candidate", summary="Updated README after running required verification.")
+
+
+class FinalReadyToolLoopLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.observed_final_ready_feedback = False
+
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, tools, context
+        self.calls += 1
+        if self.calls == 1:
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "done\n"})
+        if self.calls == 2:
+            return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo checked"})
+        if self.calls == 3:
+            return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo extra"})
+        self.observed_final_ready_feedback = any(
+            message.get("kind") == "feedback" and "final_ready_tool_forbidden" in str(message.get("content"))
+            for message in messages
+        )
+        return AgentDecision(type="final_candidate", summary="Updated README after final-ready tool rejection.")
 
 
 class FakeTools:
@@ -327,7 +372,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             )
             checks_by_name = {check["name"]: check for check in result_payload["checks"]}
             self.assertIn("git_status", checks_by_name)
-            self.assertEqual(checks_by_name["test"]["command"], "go test ./...")
+            self.assertIsNone(checks_by_name["test"]["command"])
             self.assertIn("Detected commands: test=go test ./..., build=go build ./..., lint=not detected", llm.contexts[0])
 
             steps = await repo.list_steps(job.id)
@@ -565,6 +610,41 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             workflow_steps = [step for step in steps if step.content.get("type") == "workflow_state"]
             self.assertTrue(any(step.content.get("phase") == "TEST_REQUIRED" for step in workflow_steps))
 
+    async def test_agent_loop_rejects_tool_calls_after_final_ready(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="u1",
+                    instruction="Update README.md.\nverify with: echo checked",
+                )
+            )
+            tools = FakeTools()
+            llm = FinalReadyToolLoopLLM()
+
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(result.result_summary, "Updated README after final-ready tool rejection.")
+            self.assertTrue(llm.observed_final_ready_feedback)
+            self.assertEqual(tools.call_count, 2)
+            steps = await repo.list_steps(job.id)
+            rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
+            self.assertEqual(rejected[0].content["reason"], "final_ready_tool_forbidden")
+            self.assertEqual(rejected[0].content["workflow_state"]["phase"], "FINAL_READY")
+            tool_calls = [step for step in steps if step.content.get("type") == "tool_call"]
+            self.assertEqual([step.content["args"].get("command") for step in tool_calls if step.content["tool"] == "run_command"], ["echo checked"])
+
     async def test_agent_loop_recovers_from_transient_tool_error(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
@@ -654,30 +734,62 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(len(llm_errors), 1)
             self.assertEqual(llm_errors[0].content["reason"], "llm_auth_failed")
 
-    async def test_agent_loop_fails_fast_on_provider_unavailable(self) -> None:
+    async def test_agent_loop_retries_provider_unavailable_before_failing(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
             job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update readme"))
             tools = FakeTools()
+            llm = ProviderUnavailableLLM()
 
             loop = CodingAgentLoop(
-                llm=ProviderUnavailableLLM(),
+                llm=llm,
                 tools=tools,
                 verifier=CodingVerifier(),
                 repository=repo,
                 exporter=ArtifactExporter(Path(tmp), repo),
                 stop_policy=StopPolicy(max_iterations=10, max_runtime_seconds=60, max_consecutive_failures=5),
+                llm_retry_delays=(),
             )
 
             result = await loop.run(job)
 
             self.assertEqual(result.status, JobStatus.FAILED)
             self.assertEqual(result.failure_reason, "llm_provider_unavailable:provider_upstream_unavailable")
+            self.assertEqual(llm.calls, 3)
             self.assertEqual(tools.call_count, 0)
             steps = await repo.list_steps(job.id)
+            llm_retries = [step for step in steps if step.content.get("type") == "llm_retry"]
+            self.assertEqual(len(llm_retries), 2)
             llm_errors = [step for step in steps if step.content.get("type") == "llm_error"]
             self.assertEqual(len(llm_errors), 1)
             self.assertEqual(llm_errors[0].content["reason"], "llm_provider_unavailable:provider_upstream_unavailable")
+
+    async def test_agent_loop_recovers_from_retryable_provider_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update readme"))
+            tools = FakeTools()
+            llm = RecoveringProviderUnavailableLLM()
+
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=10, max_runtime_seconds=60, max_consecutive_failures=5),
+                llm_retry_delays=(),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(result.result_summary, "Recovered after provider retry.")
+            self.assertEqual(tools.files["README.md"], "recovered\n")
+            self.assertEqual(llm.calls, 3)
+            steps = await repo.list_steps(job.id)
+            llm_retries = [step for step in steps if step.content.get("type") == "llm_retry"]
+            self.assertEqual(len(llm_retries), 1)
 
     async def test_agent_loop_records_stuck_detector_step_after_clean_no_edit_loop(self) -> None:
         with TemporaryDirectory() as tmp:

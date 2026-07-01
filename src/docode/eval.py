@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
 
@@ -134,12 +134,33 @@ class EvalMatrixReport:
 
 
 @dataclass(frozen=True, slots=True)
+class EvalCheck:
+    type: Literal["command", "file_contains", "file_exists", "json_len_at_least", "evidence", "artifact"]
+    command: str | None = None
+    path: str | None = None
+    contains: list[str] = field(default_factory=list)
+    min_len: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"type": self.type}
+        if self.command:
+            data["command"] = self.command
+        if self.path:
+            data["path"] = self.path
+        if self.contains:
+            data["contains"] = self.contains
+        if self.min_len is not None:
+            data["min_len"] = self.min_len
+        return data
+
+
+@dataclass(frozen=True, slots=True)
 class EvalScenario:
     name: str
     category: str
     instruction: str
     files: dict[str, str]
-    expected_checks: list[str]
+    expected_checks: list[EvalCheck]
     hints: dict[str, Any] | None = None
     artifact_mode: str = "patch"
 
@@ -151,7 +172,7 @@ class EvalScenario:
             "repo_path": str(repo_dir),
             "repo_url": repo_dir.resolve().as_uri(),
             "artifact_mode": self.artifact_mode,
-            "expected_checks": self.expected_checks,
+            "expected_checks": [check.to_dict() for check in self.expected_checks],
             "git_initialized": git_initialized,
         }
         if self.hints:
@@ -598,7 +619,7 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "tests/test_calculator.py": "import unittest\nfrom calculator import retry_count\n\nclass CalculatorTests(unittest.TestCase):\n    def test_retry_count(self):\n        self.assertEqual(retry_count(3), 3)\n\nif __name__ == '__main__':\n    unittest.main()\n",
                 "README.md": "# Python Bugfix Fixture\n",
             },
-            expected_checks=["python3 -m unittest discover -s tests"],
+            expected_checks=[EvalCheck(type="command", command="python3 -m unittest discover -s tests")],
             hints={
                 "target_files": ["calculator.py"],
                 "expected_behavior": "retry_count(3) should return 3 by returning attempts unchanged.",
@@ -613,7 +634,7 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "cli.py": "import argparse\n\ndef main():\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--name', default='world')\n    args = parser.parse_args()\n    print('TODO')\n\nif __name__ == '__main__':\n    main()\n",
                 "README.md": "# Python CLI Fixture\nRun `python3 cli.py --name Ada`.\n",
             },
-            expected_checks=["python3 cli.py --name Ada"],
+            expected_checks=[EvalCheck(type="command", command="python3 cli.py --name Ada")],
             hints={
                 "target_files": ["cli.py"],
                 "expected_behavior": "python3 cli.py --name Ada should print a greeting that includes Ada.",
@@ -629,7 +650,10 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "fixtures/source.html": "<html><body><ul><li data-name='alpha'>Alpha</li><li data-name='beta'>Beta</li></ul></body></html>\n",
                 "README.md": "# Crawler Fixture\n",
             },
-            expected_checks=["python3 crawler.py", "python3 -c \"import json; assert len(json.load(open('data/output.json'))) >= 2\""],
+            expected_checks=[
+                EvalCheck(type="command", command="python3 crawler.py"),
+                EvalCheck(type="json_len_at_least", path="data/output.json", min_len=2),
+            ],
             hints={
                 "target_files": ["crawler.py"],
                 "expected_behavior": "data/output.json should contain at least two records parsed from fixtures/source.html.",
@@ -644,7 +668,7 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "client.py": "import json\n\ndef parse_items_response(text):\n    data = json.loads(text)\n    return []\n",
                 "tests/test_client.py": "import unittest\nfrom client import parse_items_response\n\nclass ClientTests(unittest.TestCase):\n    def test_parse_items(self):\n        payload = '{\"items\":[{\"name\":\"north\"},{\"name\":\"south\"}]}'\n        self.assertEqual(parse_items_response(payload), ['north', 'south'])\n\nif __name__ == '__main__':\n    unittest.main()\n",
             },
-            expected_checks=["python3 -m unittest discover -s tests"],
+            expected_checks=[EvalCheck(type="command", command="python3 -m unittest discover -s tests")],
             hints={
                 "target_files": ["client.py"],
                 "expected_behavior": "parse_items_response should return item names from the API response in order.",
@@ -659,7 +683,7 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "README.md": "# Tiny Tool\n\nTODO: document this project.\n",
                 "tool.py": "def run():\n    return 'ok'\n",
             },
-            expected_checks=["README contains installation and usage sections"],
+            expected_checks=[EvalCheck(type="file_contains", path="README.md", contains=["Installation", "Usage"])],
             hints={
                 "target_files": ["README.md"],
                 "expected_behavior": "README should include installation and usage sections.",
@@ -675,7 +699,7 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "sum.js": "function sum(values) { return values.length; }\nmodule.exports = { sum };\n",
                 "test.js": "const { sum } = require('./sum');\nif (sum([1,2,3]) !== 6) throw new Error('bad sum');\nconsole.log('ok');\n",
             },
-            expected_checks=["npm test"],
+            expected_checks=[EvalCheck(type="command", command="npm test")],
             hints={
                 "target_files": ["sum.js"],
                 "expected_behavior": "sum([1,2,3]) should return 6.",
@@ -690,7 +714,7 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "config_parser.py": "def parse_enabled(value):\n    return str(value).lower() in {'true', 'yes', 'onn'}\n",
                 "README.md": "# No Test Fixture\n",
             },
-            expected_checks=["python3 -m py_compile config_parser.py"],
+            expected_checks=[EvalCheck(type="command", command="python3 -m py_compile config_parser.py")],
             hints={
                 "target_files": ["config_parser.py"],
                 "expected_behavior": "parse_enabled should recognize 'on' as enabled, not the typo 'onn'.",
@@ -705,7 +729,10 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "source_config.py": "SOURCE_URL = 'https://api.example.invalid/missing'\n",
                 "README.md": "# Source Repair Fixture\n",
             },
-            expected_checks=["fetch_url evidence required", "python3 -m py_compile source_config.py"],
+            expected_checks=[
+                EvalCheck(type="evidence"),
+                EvalCheck(type="command", command="python3 -m py_compile source_config.py"),
+            ],
             hints={
                 "target_files": ["source_config.py"],
                 "expected_behavior": "SOURCE_URL should point to a documented working source and include verification evidence.",
@@ -721,7 +748,10 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "tests/test_noisy.py": "import unittest\nfrom noisy import status_line\n\nclass NoisyTests(unittest.TestCase):\n    def test_final_line(self):\n        self.assertEqual(status_line(999), 'done 999')\n\nif __name__ == '__main__':\n    unittest.main()\n",
                 "generate_output.py": "for i in range(5000):\n    print('line', i)\n",
             },
-            expected_checks=["python3 generate_output.py", "python3 -m unittest discover -s tests"],
+            expected_checks=[
+                EvalCheck(type="command", command="python3 generate_output.py"),
+                EvalCheck(type="command", command="python3 -m unittest discover -s tests"),
+            ],
             hints={
                 "target_files": ["noisy.py"],
                 "expected_behavior": "status_line(999) should return 'done 999'.",
@@ -736,7 +766,7 @@ def default_eval_scenarios() -> list[EvalScenario]:
                 "README.md": "# PR Export Fixture\n",
                 "module.py": "VALUE = 'old'\n",
             },
-            expected_checks=["git diff is non-empty", "artifact_mode=pr"],
+            expected_checks=[EvalCheck(type="artifact", path="pr")],
             hints={
                 "target_files": ["module.py"],
                 "expected_behavior": "Make a minimal code change suitable for PR artifact export.",
@@ -925,7 +955,7 @@ def provider_unavailable_category(reason: str, combined: str) -> str:
         return "provider_rate_limited"
     if "timeout" in text or "timed out" in text:
         return "provider_timeout"
-    if "connection refused" in text or "connection reset" in text or "server disconnected" in text:
+    if "connection refused" in text or "connection reset" in text or "server disconnected" in text or "all connection attempts failed" in text:
         return "provider_network_error"
     return "provider_call_failed"
 

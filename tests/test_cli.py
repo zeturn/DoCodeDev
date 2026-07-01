@@ -43,6 +43,25 @@ class CompletingFakeRunner(FakeRunner):
         await self.repository.update_job(job_id, status=JobStatus.SUCCEEDED, artifact_id="artifact-1")
 
 
+class ProviderFlakyThenCompletingRunner(FakeRunner):
+    async def run_job(self, job_id: str) -> None:
+        self.ran_job_ids.append(job_id)
+        if len(self.ran_job_ids) == 1:
+            await self.repository.add_step(
+                job_id,
+                "llm",
+                {
+                    "type": "llm_error",
+                    "reason": "llm_provider_unavailable:provider_upstream_unavailable",
+                    "detail": "503 Service Unavailable",
+                },
+            )
+            await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason="llm_provider_unavailable:provider_upstream_unavailable")
+            return
+        await self.repository.add_step(job_id, "llm", {"type": "llm_decision", "usage": {"total_tokens": 11, "cost": 0.01}})
+        await self.repository.update_job(job_id, status=JobStatus.SUCCEEDED, artifact_id="artifact-2")
+
+
 class CliTests(IsolatedAsyncioTestCase):
     def test_eval_instruction_with_hints_appends_targets_and_checks(self) -> None:
         instruction = eval_instruction_with_hints(
@@ -55,7 +74,8 @@ class CliTests(IsolatedAsyncioTestCase):
 
         self.assertIn("Fix the bug.", instruction)
         self.assertIn("Likely target files: calculator.py", instruction)
-        self.assertIn("Suggested verification commands: python3 -m unittest discover -s tests", instruction)
+        self.assertIn("Verification commands:", instruction)
+        self.assertIn("- python3 -m unittest discover -s tests", instruction)
 
     def test_eval_instruction_with_hints_prefers_manifest_hints(self) -> None:
         instruction = eval_instruction_with_hints(
@@ -74,8 +94,22 @@ class CliTests(IsolatedAsyncioTestCase):
         self.assertIn("Evaluation hints:", instruction)
         self.assertIn("target file: calculator.py", instruction)
         self.assertIn("expected behavior: retry_count(3) should return 3", instruction)
-        self.assertIn("verify with: python3 -m unittest discover -s tests", instruction)
-        self.assertNotIn("legacy check", instruction)
+        self.assertIn("Verification commands:", instruction)
+        self.assertIn("- python3 -m unittest discover -s tests", instruction)
+        self.assertIn("Semantic checks:", instruction)
+        self.assertIn("- legacy check", instruction)
+
+    def test_eval_instruction_treats_git_diff_sentence_as_semantic_check(self) -> None:
+        instruction = eval_instruction_with_hints(
+            {
+                "instruction": "Prepare PR artifact.",
+                "hints": {"suggested_commands": ["git diff is non-empty", "artifact_mode=pr"]},
+            }
+        )
+
+        self.assertNotIn("Verification commands:", instruction)
+        self.assertIn("Semantic checks:", instruction)
+        self.assertIn("- git diff is non-empty", instruction)
 
     async def asyncSetUp(self) -> None:
         FakeRunner.ran_job_ids = []
@@ -202,6 +236,65 @@ class CliTests(IsolatedAsyncioTestCase):
             self.assertTrue(result["success"])
             self.assertEqual(result["tokens"], 25)
             self.assertEqual(result["tool_calls"], 1)
+
+    async def test_eval_jobs_retries_model_unavailable_case(self) -> None:
+        repo = InMemoryJobRepository()
+        ProviderFlakyThenCompletingRunner.ran_job_ids = []
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.json"
+            results_dir = root / "results"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {
+                                "name": "python-bugfix",
+                                "instruction": "fix",
+                                "repo_url": "file:///tmp/python-bugfix",
+                                "artifact_mode": "patch",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                manifest=str(manifest),
+                results_dir=str(results_dir),
+                provider="dev",
+                model=None,
+                quality=None,
+                limit=None,
+                max_iterations=20,
+                max_runtime_seconds=900,
+                max_consecutive_failures=6,
+                max_tool_calls=80,
+                max_llm_tokens=200_000,
+                max_llm_cost=None,
+                retry_model_unavailable=2,
+                user_id="eval",
+                start_dobox=False,
+                no_serve_local_repos=True,
+                sandbox_retention="delete_always",
+            )
+
+            with (
+                patch("docode.cli.load_config", return_value=DocodeConfig()),
+                patch("docode.cli.build_repository", return_value=repo),
+                patch("docode.cli.JobRunnerService", ProviderFlakyThenCompletingRunner),
+                patch("builtins.print"),
+            ):
+                await run_eval_jobs_command(args)
+
+            jobs = await repo.list_jobs()
+            self.assertEqual(len(jobs), 2)
+            self.assertEqual(len(ProviderFlakyThenCompletingRunner.ran_job_ids), 2)
+            result = json.loads((results_dir / "python-bugfix.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(result["attempts"], 2)
+            self.assertEqual(result["attempt_results"][0]["failure_class"], "model_unavailable")
+            self.assertEqual(result["attempt_results"][1]["success"], True)
 
     async def test_eval_jobs_start_dobox_writes_preflight_and_uses_token(self) -> None:
         repo = InMemoryJobRepository()

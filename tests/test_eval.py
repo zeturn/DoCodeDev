@@ -408,6 +408,21 @@ class EvalTests(TestCase):
         self.assertEqual(result["failure_class"], "model_unavailable")
         self.assertEqual(result["failure_category"], "provider_rate_limited")
 
+    def test_eval_case_result_classifies_llm_connection_attempt_failures_as_model_unavailable(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="max_consecutive_failures_exceeded",
+        )
+        steps = [{"type": "llm_error", "reason": "llm_decision_failed", "detail": "All connection attempts failed"}]
+
+        result = eval_case_result_from_job({"name": "python-cli", "instruction": "fix"}, job, steps)
+
+        self.assertEqual(result["failure_class"], "model_unavailable")
+        self.assertEqual(result["failure_category"], "provider_network_error")
+
     def test_eval_case_result_ignores_artifact_export_network_error_for_model_availability(self) -> None:
         job = CodingJob(
             id=new_id("job"),

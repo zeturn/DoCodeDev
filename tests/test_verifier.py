@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
+from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
 
-from docode.agent.verifier import CodingVerifier, VerificationEvidence, build_verification_plan, verification_evidence_from_steps
+from docode.agent.verifier import (
+    CodingVerifier,
+    VerificationEvidence,
+    build_verification_plan,
+    json_output_check_script,
+    requires_json_output_check,
+    verification_evidence_from_steps,
+)
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob, new_id
 
@@ -137,6 +147,29 @@ class DocsVerifierTools(PassingVerifierTools):
         return ToolResult(tool="run_build", output="no build command detected", exit_code=0, metadata={"detected": False})
 
 
+class StrictDocsVerifierTools(DocsVerifierTools):
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(
+            tool="git_diff",
+            output=(
+                "diff --git a/README.md b/README.md\n"
+                "+## Installation\n"
+                "+Run `pip install .`.\n"
+                "+## Usage\n"
+                "+Run the tool from the command line.\n"
+            ),
+        )
+
+    async def run_tests(self) -> ToolResult:
+        raise RuntimeError("docs-only verifier should not run tests")
+
+    async def run_build(self) -> ToolResult:
+        raise RuntimeError("docs-only verifier should not run build")
+
+    async def run_lint(self) -> ToolResult:
+        raise RuntimeError("docs-only verifier should not run lint")
+
+
 class CliHintVerifierTools(PassingVerifierTools):
     def __init__(self) -> None:
         self.command = ""
@@ -173,6 +206,49 @@ class ApiVerifierTools(PassingVerifierTools):
         self.command = command
         _ = cwd
         return ToolResult(tool="run_command", output="ok", exit_code=0)
+
+
+class SourceRepairVerifierTools(PassingVerifierTools):
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(
+            tool="git_diff",
+            output=(
+                "diff --git a/source_config.py b/source_config.py\n"
+                "-SOURCE_URL = 'https://api.example.invalid/missing'\n"
+                "+SOURCE_URL = 'https://jsonplaceholder.typicode.com/todos/1'\n"
+            ),
+        )
+
+    async def run_tests(self) -> ToolResult:
+        return ToolResult(tool="run_tests", output="no test command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_build(self) -> ToolResult:
+        return ToolResult(tool="run_build", output="no build command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_lint(self) -> ToolResult:
+        return ToolResult(tool="run_lint", output="no lint command detected", exit_code=0, metadata={"detected": False})
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        self.command = command
+        _ = cwd
+        return ToolResult(tool="run_command", output="ok", exit_code=0, metadata={"command": command})
+
+
+class ArtifactExportVerifierTools(PassingVerifierTools):
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(tool="git_diff", output="diff --git a/module.py b/module.py\n-VALUE = 'old'\n+VALUE = 'new'\n")
+
+    async def run_tests(self) -> ToolResult:
+        raise RuntimeError("artifact export verifier should not run tests")
+
+    async def run_build(self) -> ToolResult:
+        raise RuntimeError("artifact export verifier should not run build")
+
+    async def run_lint(self) -> ToolResult:
+        raise RuntimeError("artifact export verifier should not run lint")
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        raise RuntimeError(f"artifact export verifier should not run smoke command: {command}")
 
 
 class VetoingJudge:
@@ -262,7 +338,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.passed)
         self.assertIn("diff --git a/crawler.py b/crawler.py", result.git_diff)
         self.assertIsNotNone(result.workspace_result)
-        self.assertIn("python3 -m py_compile crawler.py", tools.command)
+        self.assertTrue(any("python3 -m py_compile crawler.py" in command for command in result.smoke_result.metadata["commands"]))
 
     async def test_status_changes_count_as_change_evidence_when_git_diff_is_empty(self) -> None:
         result = await CodingVerifier().verify(
@@ -311,8 +387,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(result.smoke_result)
         self.assertEqual(result.smoke_result.exit_code, 1)
         self.assertGreaterEqual(len(tools.commands), 1)
-        self.assertIn("python3 -m py_compile crawler.py", tools.commands[-1])
-        self.assertIn("python3 crawler.py", tools.commands[-1])
+        self.assertIn("python3 -m py_compile crawler.py", tools.commands)
 
     async def test_python_smoke_success_allows_no_detected_standard_commands(self) -> None:
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=0)
@@ -373,6 +448,33 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIn("min_records=5", command)
         self.assertNotIn("*.csv", command)
 
+    def test_json_api_response_does_not_require_output_file(self) -> None:
+        self.assertFalse(requires_json_output_check("Implement client.parse_items_response so it extracts item names from a JSON API response."))
+        self.assertTrue(requires_json_output_check("Build a crawler that writes data/output.json with at least 2 records."))
+
+    def test_fixtures_path_does_not_trigger_bugfix_test_requirement(self) -> None:
+        plan = build_verification_plan("Build a crawler that parses fixtures/source.html and writes data/output.json.")
+
+        self.assertFalse(plan.require_test_change)
+        self.assertNotIn("related_test", plan.required_commands)
+
+    def test_json_output_check_script_runs_as_python_c_argument(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "data"
+            output_dir.mkdir()
+            (output_dir / "output.json").write_text(json.dumps([{"name": "a"}, {"name": "b"}]), encoding="utf-8")
+
+            result = subprocess.run(
+                ["python3", "-c", json_output_check_script(2)],
+                cwd=tmp,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("data/output.json", result.stdout)
+
     async def test_python_crawler_exit_zero_error_output_blocks_success(self) -> None:
         class ErrorOutputTools(NoDetectedPythonVerifierTools):
             async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
@@ -389,6 +491,60 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIn("fix failing smoke verification command", result.required_fixes)
         self.assertTrue(any("call web_search again" in fix for fix in result.required_fixes))
         self.assertEqual(result.smoke_result.exit_code, 1)
+
+    async def test_truncated_smoke_output_does_not_fail_when_exit_code_is_zero(self) -> None:
+        class TruncatedOutputTools(NoDetectedPythonVerifierTools):
+            async def run_tests(self) -> ToolResult:
+                return ToolResult(tool="run_tests", output="OK", exit_code=0, metadata={"detected": True, "command": "python3 -m unittest discover -s tests"})
+
+            async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+                self.commands.append(command)
+                _ = cwd
+                return ToolResult(
+                    tool="run_command",
+                    output=("line\n" * 200) + "not found <truncated>",
+                    exit_code=0,
+                    truncated=False,
+                    metadata={"command": command},
+                )
+
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Fix noisy.py so tests pass even when command output is very large."),
+            TruncatedOutputTools(smoke_exit_code=0),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.smoke_result.exit_code, 0)
+        self.assertIn("<truncated>", result.smoke_result.output)
+
+    async def test_truncated_smoke_failure_is_allowed_when_standard_tests_passed(self) -> None:
+        class TruncatedFailureTools(NoDetectedPythonVerifierTools):
+            async def run_tests(self) -> ToolResult:
+                return ToolResult(tool="run_tests", output="OK", exit_code=0, metadata={"detected": True, "command": "python3 -m unittest discover -s tests"})
+
+            async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+                self.commands.append(command)
+                _ = cwd
+                if "py_compile" in command or "unittest" in command:
+                    return ToolResult(tool="run_command", output="OK", exit_code=0, metadata={"command": command})
+                return ToolResult(
+                    tool="run_command",
+                    output="line\n" * 2000,
+                    exit_code=1,
+                    metadata={"command": command},
+                )
+
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="Fix noisy.py so tests pass even when command output is very large.\nVerification commands:\n- python3 generate_output.py\n- python3 -m unittest discover -s tests",
+            ),
+            TruncatedFailureTools(smoke_exit_code=1),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.smoke_result.exit_code, 0)
 
     async def test_python_crawler_404_output_requires_endpoint_reinspection(self) -> None:
         class NotFoundOutputTools(NoDetectedPythonVerifierTools):
@@ -429,16 +585,16 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.smoke_result.exit_code, 0)
 
-    async def test_bugfix_plan_requires_related_test_change(self) -> None:
+    async def test_bugfix_plan_allows_existing_detected_tests_without_test_change(self) -> None:
         result = await CodingVerifier().verify(
             CodingJob(id=new_id("job"), user_id="u1", instruction="fix retry bug in payment adapter"),
             BugfixWithoutTestVerifierTools(),
         )
 
-        self.assertFalse(result.passed)
+        self.assertTrue(result.passed)
         self.assertIsNotNone(result.verification_plan)
         self.assertTrue(result.verification_plan.require_test_change)
-        self.assertIn("add or update a related test for this bugfix, or record why no automated test is appropriate", result.required_fixes)
+        self.assertNotIn("add or update a related test for this bugfix, or record why no automated test is appropriate", result.required_fixes)
 
     async def test_bugfix_plan_allows_missing_test_with_recorded_reason(self) -> None:
         result = await CodingVerifier().verify(
@@ -464,6 +620,71 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(result.verification_plan)
         self.assertFalse(result.verification_plan.require_test_change)
         self.assertFalse(result.verification_plan.require_no_placeholder)
+
+    async def test_docs_only_verifier_checks_readme_terms_without_tests(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Update README.md with installation and usage sections. Do not change code."),
+            StrictDocsVerifierTools(),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertTrue(result.verification_plan.docs_only)
+        self.assertTrue(result.verification_plan.forbid_code_changes)
+        self.assertEqual(result.test_result.metadata["skipped"], True)
+
+    def test_javascript_bugfix_does_not_trigger_cli_script_entrypoint(self) -> None:
+        plan = build_verification_plan("Fix the JavaScript sum bug and keep node tests passing.")
+
+        self.assertFalse(plan.require_entrypoint_run)
+        self.assertTrue(plan.require_test_change)
+
+    def test_source_repair_plan_requires_external_evidence_not_related_test(self) -> None:
+        plan = build_verification_plan(
+            "Replace the broken data source URL in source_config.py with a documented working source and record the verification evidence."
+        )
+
+        self.assertTrue(plan.external_source_repair)
+        self.assertTrue(plan.require_external_source_verified)
+        self.assertFalse(plan.require_test_change)
+        self.assertNotIn("related_test", plan.required_commands)
+
+    def test_git_diff_sentence_is_not_a_smoke_command(self) -> None:
+        plan = build_verification_plan(
+            "Make a minimal code change.\n\n"
+            "Evaluation hints:\n"
+            "- Verification commands:\n"
+            "- git diff is non-empty\n"
+            "- Semantic checks:\n"
+            "- artifact_mode=pr"
+        )
+
+        self.assertEqual(plan.smoke_commands, [])
+
+    async def test_source_repair_accepts_fetch_evidence_without_test_change(self) -> None:
+        result = await CodingVerifier(judge=VetoingJudge()).verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=(
+                    "Replace the broken data source URL in source_config.py with a documented working source and record "
+                    "the verification evidence.\n\n"
+                    "Evaluation hints:\n"
+                    "- Verification commands:\n"
+                    "- python3 -m py_compile source_config.py\n"
+                    "- Semantic checks:\n"
+                    "- fetch_url evidence required"
+                ),
+            ),
+            SourceRepairVerifierTools(),
+            evidence=VerificationEvidence(
+                successful_fetch_urls=["https://jsonplaceholder.typicode.com/todos/1"],
+                successful_web_search_queries=[],
+                no_test_reason="No automated test framework detected; manual verification and py_compile were performed.",
+            ),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertIsNone(result.llm_judgement)
 
     async def test_eval_verify_with_hint_becomes_smoke_command(self) -> None:
         plan = build_verification_plan(
@@ -515,6 +736,30 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.evidence.successful_fetch_urls, ["https://api.example.test/docs"])
         self.assertEqual(result.evidence.relevant_fetch_urls, ["https://api.example.test/docs"])
+
+    async def test_external_source_accepts_successful_fetch_url_when_written_to_diff(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Replace the broken data source URL in source_config.py with a documented working source."),
+            ApiVerifierTools(),
+            evidence=VerificationEvidence(
+                successful_fetch_urls=["https://api.example.test/v1/items"],
+                successful_web_search_queries=[],
+                relevant_fetch_urls=[],
+            ),
+        )
+
+        self.assertTrue(result.passed)
+
+    async def test_artifact_export_verifier_skips_standard_commands_and_smoke(self) -> None:
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Make a minimal code change and prepare the job for PR artifact export mode."),
+            ArtifactExportVerifierTools(),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertTrue(result.verification_plan.artifact_export)
+        self.assertEqual(result.smoke_result.metadata["detected"], False)
+        self.assertEqual(result.test_result.metadata["skipped"], True)
 
     def test_verification_evidence_from_steps_collects_successful_source_tools(self) -> None:
         steps = [

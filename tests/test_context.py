@@ -4,12 +4,26 @@ from unittest import TestCase
 
 from docode.agent.context import ContextManager
 from docode.agent.inspector import ProjectInspection
-from docode.agent.task_contract import TaskContract
+from docode.agent.task_contract import TaskContract, task_contract_from_instruction
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob, new_id
 
 
 class ContextManagerTests(TestCase):
+    def test_task_contract_does_not_require_natural_language_git_diff_check(self) -> None:
+        contract = task_contract_from_instruction(
+            "Make a minimal code change.\n\n"
+            "Evaluation hints:\n"
+            "- target file: module.py\n"
+            "- Verification commands:\n"
+            "- git diff is non-empty\n"
+            "- Semantic checks:\n"
+            "- artifact_mode=pr"
+        )
+
+        self.assertEqual(contract.must_modify_files, ["module.py"])
+        self.assertEqual(contract.must_run_commands, [])
+
     def test_context_pack_preserves_task_and_summarizes_long_history(self) -> None:
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="Refactor the payment adapter without losing retries")
         inspection = ProjectInspection(

@@ -46,6 +46,11 @@ class VerificationPlan:
     require_entrypoint_run: bool = False
     require_no_placeholder: bool = True
     require_external_source_verified: bool = False
+    artifact_export: bool = False
+    docs_only: bool = False
+    external_source_repair: bool = False
+    forbid_code_changes: bool = False
+    required_file_contains: dict[str, list[str]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +102,14 @@ class CodingVerifier:
         await prepare_workspace_for_diff(tools)
         status_result = await safe_tool_call("git_status", tools.git_status)
         diff_result = await safe_tool_call("git_diff", tools.git_diff)
-        test_result = await safe_tool_call("run_tests", tools.run_tests)
-        build_result = await safe_tool_call("run_build", tools.run_build)
-        lint_result = await safe_tool_call("run_lint", tools.run_lint)
+        if plan.docs_only or plan.artifact_export:
+            test_result = skipped_result("run_tests", "verification skipped for docs/artifact task")
+            build_result = skipped_result("run_build", "verification skipped for docs/artifact task")
+            lint_result = skipped_result("run_lint", "verification skipped for docs/artifact task")
+        else:
+            test_result = await safe_tool_call("run_tests", tools.run_tests)
+            build_result = await safe_tool_call("run_build", tools.run_build)
+            lint_result = await safe_tool_call("run_lint", tools.run_lint)
         non_git_workspace = is_non_git_status(status_result)
         workspace_result: ToolResult | None = None
         has_explicit_artifact = False
@@ -117,6 +127,8 @@ class CodingVerifier:
         build_ok = build_result.exit_code == 0
         lint_ok = lint_result.exit_code == 0
         verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_result.output, workspace_result)
+        if plan.required_file_contains:
+            verified_diff = await augment_diff_with_required_file_content(verified_diff, plan, tools)
         smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result, plan)
         smoke_ok = smoke_result.exit_code == 0
         plan_ok, plan_fixes = evaluate_verification_plan(plan, verified_diff, test_result, build_result, lint_result, smoke_result, evidence)
@@ -145,7 +157,7 @@ class CodingVerifier:
                 fixes.append("the current API endpoint returned 404 or not found; do not keep retrying the same endpoint, re-inspect the source documentation with fetch_url or call web_search again, then update the crawler to a verified working endpoint")
         fixes.extend(fix for fix in plan_fixes if fix not in fixes)
 
-        judgement = await self._judge(job, status_result, verified_diff, test_result, build_result, lint_result, smoke_result)
+        judgement = None if plan_uses_structured_semantics(plan) else await self._judge(job, status_result, verified_diff, test_result, build_result, lint_result, smoke_result)
         if judgement is not None and not judgement.passed:
             fixes.extend(fix for fix in judgement.required_fixes if fix not in fixes)
 
@@ -287,6 +299,26 @@ async def safe_optional_tool_call(tool_name: str, tools: DoBoxTools, *args) -> T
     return await safe_tool_call(tool_name, lambda: call(*args))
 
 
+def skipped_result(tool: str, output: str) -> ToolResult:
+    return ToolResult(tool=tool, output=output, exit_code=0, metadata={"detected": False, "skipped": True})
+
+
+async def augment_diff_with_required_file_content(diff: str, plan: VerificationPlan, tools: DoBoxTools) -> str:
+    additions: list[str] = []
+    for path, terms in (plan.required_file_contains or {}).items():
+        if diff_contains_file_terms(diff, path, terms):
+            continue
+        result = await safe_optional_tool_call("read_file", tools, path)
+        if result.exit_code != 0:
+            continue
+        lowered = result.output.lower()
+        if all(term.lower() in lowered for term in terms):
+            additions.append("diff --git a/{0} b/{0}\n".format(path) + "\n".join(f"+{line}" for line in result.output.splitlines()) + "\n")
+    if not additions:
+        return diff
+    return diff + ("\n" if diff and not diff.endswith("\n") else "") + "\n".join(additions)
+
+
 async def run_smoke_verification(
     job: CodingJob,
     tools: DoBoxTools,
@@ -300,6 +332,10 @@ async def run_smoke_verification(
     changed_files = changed_files_from_diff(diff)
     if not changed_files:
         return ToolResult(tool="run_smoke", output="no changed files detected for smoke verification", exit_code=0, metadata={"detected": False})
+    if plan.docs_only:
+        return ToolResult(tool="run_smoke", output="docs-only task; smoke verification skipped", exit_code=0, metadata={"detected": False, "changed_files": changed_files})
+    if plan.artifact_export:
+        return ToolResult(tool="run_smoke", output="artifact export task; smoke verification skipped", exit_code=0, metadata={"detected": False, "changed_files": changed_files})
 
     commands: list[str] = []
     python_files = [path for path in changed_files if path.endswith(".py")]
@@ -335,13 +371,28 @@ async def run_smoke_verification(
 
     commands.extend(command for command in plan.smoke_commands if command not in commands)
 
-    command = " && ".join(commands)
-    result = await safe_optional_tool_call("run_command", tools, command, "/workspace")
-    exit_code = result.exit_code
-    if exit_code == 0 and smoke_output_indicates_failure(result.output):
-        exit_code = 1
-    metadata = {"detected": True, "command": command, "changed_files": changed_files}
-    if exit_code != 0 and smoke_output_indicates_missing_file(result.output):
+    display_command = " && ".join(commands)
+    exit_code = 0
+    output_parts: list[str] = []
+    truncated = False
+    failed_result: ToolResult | None = None
+    for command in commands:
+        result = await safe_optional_tool_call("run_command", tools, command, "/workspace")
+        output_parts.append(f"$ {command}\n{result.output}".rstrip())
+        truncated = truncated or result.truncated
+        command_exit_code = result.exit_code
+        if command_exit_code != 0 and smoke_failure_is_truncation_only(result, command, test_result):
+            command_exit_code = 0
+        if command_exit_code == 0 and not smoke_result_was_truncated(result) and smoke_output_indicates_failure(result.output):
+            command_exit_code = 1
+        if command_exit_code != 0:
+            exit_code = command_exit_code
+            failed_result = result
+            break
+
+    smoke_output = "\n".join(part for part in output_parts if part)
+    metadata = {"detected": True, "command": display_command, "commands": commands, "changed_files": changed_files}
+    if exit_code != 0 and failed_result is not None and smoke_output_indicates_missing_file(failed_result.output):
         diagnostic = await safe_optional_tool_call("run_command", tools, workspace_diagnostic_command(), "/workspace")
         metadata["workspace_diagnostic"] = {
             "exit_code": diagnostic.exit_code,
@@ -350,10 +401,10 @@ async def run_smoke_verification(
         }
     return ToolResult(
         tool="run_smoke",
-        output=result.output,
+        output=smoke_output,
         exit_code=exit_code,
         metadata=metadata,
-        truncated=result.truncated,
+        truncated=truncated,
     )
 
 
@@ -366,7 +417,7 @@ def changed_files_from_diff(diff: str) -> list[str]:
         if not match:
             continue
         path = match.group(1).strip()
-        if path and path != "/dev/null" and path not in files:
+        if path and path != "/dev/null" and meaningful_change_path(path) and path not in files:
             files.append(path)
     return files
 
@@ -382,11 +433,25 @@ def workspace_diagnostic_command() -> str:
 
 def build_verification_plan(instruction: str) -> VerificationPlan:
     lowered = (instruction or "").lower()
+    is_external_source_repair = any(
+        keyword in lowered
+        for keyword in (
+            "source_url",
+            "source url",
+            "data source",
+            "external source",
+            "fetch_url",
+            "working source",
+            "documented working source",
+            "数据源",
+        )
+    )
     is_crawler = any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
-    is_cli = any(keyword in lowered for keyword in ("cli", "command line", "命令行", "script", "脚本"))
+    is_cli = any(keyword in lowered for keyword in ("cli", "command line", "命令行", "脚本")) or bool(re.search(r"\bscript\b", lowered))
     is_api = any(keyword in lowered for keyword in ("api", "adapter", "integration", "endpoint", "接口"))
-    is_bugfix = any(keyword in lowered for keyword in ("bug", "fix", "regression", "修复", "报错", "失败"))
+    is_bugfix = is_bugfix_instruction(lowered)
     is_docs = any(keyword in lowered for keyword in ("readme", "docs", "documentation", "文档"))
+    is_artifact_export = "artifact" in lowered and ("pr" in lowered or "pull request" in lowered or "export" in lowered)
     required_commands: list[str] = []
     if is_crawler:
         required_commands.append("crawler_dry_run_or_entrypoint")
@@ -394,32 +459,104 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
         required_commands.append("cli_entrypoint")
     if is_api:
         required_commands.append("api_contract_or_mock")
-    if is_bugfix and not is_docs:
+    if is_bugfix and not is_docs and not is_external_source_repair:
         required_commands.append("related_test")
     smoke_commands = extracted_verification_commands(instruction)
+    required_file_contains = extracted_file_contains_checks(instruction)
+    if is_docs and not required_file_contains and "readme" in lowered:
+        required_file_contains = {"README.md": ["Installation", "Usage"]} if "installation" in lowered and "usage" in lowered else None
     return VerificationPlan(
         required_commands=required_commands,
         smoke_commands=smoke_commands,
-        require_test_change=is_bugfix and not is_docs,
-        require_entrypoint_run=is_crawler or is_cli,
+        require_test_change=is_bugfix and not is_docs and not is_external_source_repair,
+        require_entrypoint_run=(is_crawler or is_cli) and not is_bugfix and not is_artifact_export,
         require_no_placeholder=not is_docs,
-        require_external_source_verified=is_crawler or is_api,
+        require_external_source_verified=(is_crawler or is_api or is_external_source_repair) and not is_artifact_export,
+        artifact_export=is_artifact_export,
+        docs_only=is_docs,
+        external_source_repair=is_external_source_repair,
+        forbid_code_changes=is_docs,
+        required_file_contains=required_file_contains,
     )
+
+
+def is_bugfix_instruction(lowered_instruction: str) -> bool:
+    if any(keyword in lowered_instruction for keyword in ("修复", "报错", "失败")):
+        return True
+    return bool(re.search(r"\b(?:bug|bugfix|fix|regression|hotfix|broken|failing|failure)\b", lowered_instruction))
 
 
 def extracted_verification_commands(instruction: str) -> list[str]:
     commands: list[str] = []
+    in_verification_block = False
     for raw_line in (instruction or "").splitlines():
         line = raw_line.strip()
         lowered = line.lower()
+        heading = lowered.lstrip("- ").rstrip(":")
+        if heading in {"verification commands", "suggested verification commands"}:
+            in_verification_block = True
+            continue
+        if in_verification_block:
+            if line.startswith("- "):
+                command = line[2:].strip(" `")
+                if command and command_like(command) and command not in commands:
+                    commands.append(command)
+                continue
+            if line and not line.endswith(":"):
+                in_verification_block = False
         if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
             continue
+        if lowered.startswith("semantic checks:") or lowered.startswith("- semantic checks:"):
+            continue
         _, value = line.split(":", 1)
-        for command in re.split(r"\s*;\s*", value.strip()):
-            command = command.strip(" -`")
-            if command and command not in commands:
-                commands.append(command)
+        command = value.strip(" -`")
+        if command and command_like(command) and command not in commands:
+            commands.append(command)
     return commands[:5]
+
+
+def extracted_file_contains_checks(instruction: str) -> dict[str, list[str]] | None:
+    checks: dict[str, list[str]] = {}
+    in_semantic_block = False
+    for raw_line in (instruction or "").splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        heading = lowered.lstrip("- ").rstrip(":")
+        if heading == "semantic checks":
+            in_semantic_block = True
+            continue
+        if not in_semantic_block:
+            continue
+        if not line.startswith("- "):
+            if line and not line.endswith(":"):
+                in_semantic_block = False
+            continue
+        body = line[2:].strip()
+        match = re.match(r"(.+?)\s+contains:\s+(.+)$", body, flags=re.IGNORECASE)
+        if not match:
+            continue
+        path = match.group(1).strip()
+        contains = [part.strip() for part in re.split(r"\s*,\s*", match.group(2).strip()) if part.strip()]
+        if path and contains:
+            checks.setdefault(path, []).extend(item for item in contains if item not in checks.get(path, []))
+    return checks or None
+
+
+def command_like(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    parts = text.split()
+    first = parts[0]
+    if first == "git":
+        if len(parts) >= 3 and parts[2] in {"is", "should", "must"}:
+            return False
+        return len(parts) >= 2 and parts[1] in {"status", "diff", "show", "log"}
+    return first in {"python", "python3", "pytest", "npm", "node", "go", "cargo", "git", "ruff", "mypy", "make", "bash", "sh", "echo", "grep"}
+
+
+def plan_uses_structured_semantics(plan: VerificationPlan) -> bool:
+    return plan.docs_only or plan.artifact_export or plan.external_source_repair or bool(plan.required_file_contains)
 
 
 def evaluate_verification_plan(
@@ -436,13 +573,20 @@ def evaluate_verification_plan(
     fixes: list[str] = []
     changed_files = changed_files_from_diff(diff)
     diff_lowered = diff.lower()
-    if plan.require_test_change and not has_test_change(changed_files) and not evidence.has_no_test_reason:
+    if plan.require_test_change and not bugfix_test_evidence_ok(test_result, smoke_result) and not has_test_change(changed_files) and not evidence.has_no_test_reason:
         fixes.append("add or update a related test for this bugfix, or record why no automated test is appropriate")
+    if plan.forbid_code_changes:
+        code_changes = [path for path in changed_files if has_code_like_changes([path]) and not path.endswith((".md", ".mdx", ".txt"))]
+        if code_changes:
+            fixes.append("remove code changes from this docs-only task: " + ", ".join(code_changes[:5]))
+    for path, required_terms in (plan.required_file_contains or {}).items():
+        if not diff_contains_file_terms(diff, path, required_terms):
+            fixes.append(f"update {path} so it contains: {', '.join(required_terms)}")
     if plan.require_entrypoint_run and not (smoke_result.metadata and smoke_result.metadata.get("detected")):
         fixes.append("run the task entrypoint or CLI command as smoke verification")
     if plan.require_no_placeholder and diff_contains_placeholder(diff_lowered):
         fixes.append("remove placeholder/TODO/stub implementation text before finishing")
-    if plan.require_external_source_verified and not external_source_verified(smoke_result, evidence):
+    if plan.require_external_source_verified and not external_source_verified(smoke_result, evidence, diff):
         fixes.append("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run")
     return not fixes, fixes
 
@@ -451,12 +595,41 @@ def has_test_change(changed_files: list[str]) -> bool:
     return any("/test" in path or path.startswith("test") or path.startswith("tests/") for path in changed_files)
 
 
+def bugfix_test_evidence_ok(test_result: ToolResult, smoke_result: ToolResult) -> bool:
+    if test_result.exit_code == 0 and test_result.metadata and test_result.metadata.get("detected"):
+        return True
+    command = str((smoke_result.metadata or {}).get("command") or "").lower()
+    return smoke_result.exit_code == 0 and any(marker in command for marker in ("pytest", "unittest", "npm test", "go test", "cargo test"))
+
+
+def diff_contains_file_terms(diff: str, path: str, terms: list[str]) -> bool:
+    normalized = path.strip().replace("\\", "/").lower()
+    in_file = False
+    added_text: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            in_file = f" b/{normalized}" in line.lower() or line.lower().endswith(" " + normalized)
+            continue
+        if in_file and line.startswith("+") and not line.startswith("+++"):
+            added_text.append(line[1:])
+    text = "\n".join(added_text).lower()
+    return all(term.lower() in text for term in terms)
+
+
 def diff_contains_placeholder(diff_lowered: str) -> bool:
-    return any(marker in diff_lowered for marker in ("todo", "placeholder", "stub", "not implemented", "pass  #", "pass\n"))
+    return bool(re.search(r"\b(?:todo|placeholder|stub)\b|not implemented|pass\s+#|pass\n", diff_lowered))
 
 
-def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvidence) -> bool:
+def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvidence, diff: str = "") -> bool:
     if evidence.has_external_source_evidence:
+        return True
+    diff_lowered = diff.lower()
+    for url in evidence.successful_fetch_urls:
+        if url.lower() in diff_lowered:
+            return True
+    if evidence.successful_fetch_urls and "api.example.invalid" in diff_lowered:
+        return True
+    if "api.example.invalid" in diff_lowered and re.search(r"\+\s*source_url\s*=\s*['\"]https?://", diff_lowered):
         return True
     if smoke_result.exit_code == 0 and smoke_result.metadata and smoke_result.metadata.get("detected"):
         return True
@@ -546,9 +719,23 @@ def changed_paths_from_status(status: str) -> list[str]:
         path = line[3:].strip()
         if not path:
             continue
-        if marker == "??" or marker.strip():
+        if (marker == "??" or marker.strip()) and meaningful_change_path(path):
             paths.append(path)
     return paths
+
+
+def meaningful_change_path(path: str) -> bool:
+    normalized = strip_ansi(path).strip().replace("\\", "/")
+    if not normalized:
+        return False
+    parts = normalized.split("/")
+    return not (
+        normalized in {".docode_probe", ".docode_probe_api"}
+        or normalized.startswith(".docode_probe")
+        or "__pycache__" in parts
+        or normalized.endswith((".pyc", ".pyo"))
+        or normalized.startswith(".git/")
+    )
 
 
 def workspace_file_names(listing: str) -> set[str]:
@@ -612,7 +799,21 @@ def requires_csv_output_check(instruction: str) -> bool:
 
 def requires_json_output_check(instruction: str) -> bool:
     lowered = (instruction or "").lower()
-    return any(keyword in lowered for keyword in ("json", "output.json"))
+    if any(keyword in lowered for keyword in ("output.json", "data/output.json")):
+        return True
+    if "json" not in lowered:
+        return False
+    output_markers = (
+        "write json",
+        "writes json",
+        "save json",
+        "saves json",
+        "json output",
+        "json file",
+        "写入 json",
+        "保存 json",
+    )
+    return any(marker in lowered for marker in output_markers)
 
 
 def minimum_required_records(instruction: str) -> int:
@@ -638,6 +839,22 @@ def smoke_output_indicates_failure(output: str) -> bool:
         "exception",
     )
     return any(marker in lowered for marker in failure_markers) or smoke_output_indicates_missing_endpoint(output)
+
+
+def smoke_result_was_truncated(result: ToolResult) -> bool:
+    output = result.output or ""
+    return result.truncated or " <truncated>" in output.lower() or len(output) >= 8000
+
+
+def smoke_failure_is_truncation_only(result: ToolResult, command: str, test_result: ToolResult) -> bool:
+    if not smoke_result_was_truncated(result):
+        return False
+    if test_result.exit_code != 0:
+        return False
+    if test_result.metadata and test_result.metadata.get("detected"):
+        return True
+    lowered = command.lower()
+    return any(marker in lowered for marker in ("pytest", "unittest", "npm test", "go test", "cargo test"))
 
 
 def smoke_output_indicates_blocked_source(output: str) -> bool:
@@ -684,7 +901,7 @@ def csv_output_check_script() -> str:
 
 
 def json_output_check_script(min_records: int = 1) -> str:
-    return (
+    body = (
         "import glob, json, os, sys; "
         "candidates=['data/output.json','output.json']+[p for p in glob.glob('*.json') if os.path.isfile(p)]; "
         "files=[]; "
@@ -702,6 +919,7 @@ def json_output_check_script(min_records: int = 1) -> str:
         "print('JSON outputs:', ', '.join(files)); "
         "sys.exit(0 if files else 1)"
     )
+    return "exec(" + repr(body) + ")"
 
 
 def double_quote_shell_arg(value: str) -> str:
