@@ -14,7 +14,7 @@ older callers, but are intentionally omitted from __all__.
 """
 
 from .decision import AgentDecision, DecisionLLM, DoCodeDecisionAdapter, WeavDecisionLLM, parse_decision, parse_json_object
-from .dev_llms import GitHubTrendingCrawlerDecisionLLM, ScriptedDecisionLLM, is_github_trending_araneae_instruction, objective_id_from_instruction
+from .dev_llms import ScriptedDecisionLLM
 from .provider_compat import (
     LocalLLMRouter,
     OpenAICompatibleChatClient,
@@ -66,7 +66,6 @@ __all__ = [
 ]
 
 LEGACY_RUNTIME_EXPORTS = [
-    "GitHubTrendingCrawlerDecisionLLM",
     "LocalLLMRouter",
     "OpenAICompatibleChatClient",
     "ProviderCallResult",
@@ -91,9 +90,7 @@ LEGACY_RUNTIME_EXPORTS = [
     "get_field",
     "import_llm_router",
     "int_or_none",
-    "is_github_trending_araneae_instruction",
     "normalize_provider_response",
-    "objective_id_from_instruction",
     "parse_decision",
     "parse_json_object",
     "parse_verifier_judgement",

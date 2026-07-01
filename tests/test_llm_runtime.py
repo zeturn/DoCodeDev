@@ -17,7 +17,6 @@ from docode.llm.runtime import (
     OpenAICompatibleChatClient,
     ProviderCallResult,
     ProviderUnavailableError,
-    GitHubTrendingCrawlerDecisionLLM,
     ScriptedDecisionLLM,
     WeavDecisionLLM,
     WeavVerifierJudge,
@@ -122,13 +121,6 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertIsInstance(runtime.llm, ScriptedDecisionLLM)
         self.assertIsInstance(llm, ScriptedDecisionLLM)
         self.assertEqual(resolver.resolve_calls, 0)
-
-    async def test_github_trending_template_uses_objective_id_from_instruction(self) -> None:
-        llm = GitHubTrendingCrawlerDecisionLLM(
-            "Build crawler\nObjective id: obj_github_trending_abc123\nTarget: GitHub Trending"
-        )
-
-        self.assertIn('OBJECTIVE_ID = "obj_github_trending_abc123"', llm.files["crawler.py"])
 
     async def test_weav_verifier_judge_parses_structured_judgement(self) -> None:
         class Provider:

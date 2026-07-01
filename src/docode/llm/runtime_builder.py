@@ -8,7 +8,7 @@ from docode.storage.models import CodingJob
 
 from .credentials import APICredCredentialResolver
 from .decision import DecisionLLM, DoCodeDecisionAdapter
-from .dev_llms import GitHubTrendingCrawlerDecisionLLM, ScriptedDecisionLLM, is_github_trending_araneae_instruction
+from .dev_llms import ScriptedDecisionLLM
 from .provider_compat import LocalLLMRouter, build_provider_client, register_provider
 from .usage import LLMUsageMeter
 from .weav_apicred_store import APICredCredentialStore, APICredUsageSink, normalize_openai_compatible_provider
@@ -45,17 +45,6 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
             usage_sink=usage_sink,
             usage_meter=usage_meter,
         )
-    if is_github_trending_araneae_instruction(job.instruction):
-        return DocodeRuntime(
-            provider=job.provider,
-            model=job.model,
-            llm=GitHubTrendingCrawlerDecisionLLM(job.instruction),
-            router=LocalLLMRouter(),
-            tools=tool_registry,
-            usage_sink=usage_sink,
-            usage_meter=usage_meter,
-        )
-
     try:
         runtime_context, ai_runtime = build_weav_runtime(job, resolver, usage_sink)
     except RuntimeError as exc:
