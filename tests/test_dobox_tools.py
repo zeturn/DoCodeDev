@@ -202,6 +202,16 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertIn("+hello there", result.output)
         self.assertEqual(client.files["README.md"], "hello there\nworld\n")
 
+    async def test_edit_file_rejects_noop_replacement(self) -> None:
+        client = FakeDoBoxClient()
+        tools = DoBoxTools(client, "project-123")
+
+        result = await tools.edit_file("README.md", "hello\n", "hello\n")
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("would not change", result.output)
+        self.assertEqual(client.files["README.md"], "hello\nworld\n")
+
     async def test_replace_in_file_alias_uses_find_replace_arguments(self) -> None:
         client = FakeDoBoxClient()
         tools = DoBoxTools(client, "project-123")

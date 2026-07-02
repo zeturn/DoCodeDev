@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import shlex
 import json
@@ -95,8 +96,9 @@ class VerifierJudge(Protocol):
 
 
 class CodingVerifier:
-    def __init__(self, judge: VerifierJudge | None = None) -> None:
+    def __init__(self, judge: VerifierJudge | None = None, *, judge_timeout_seconds: float = 45.0) -> None:
         self.judge = judge
+        self.judge_timeout_seconds = judge_timeout_seconds
 
     async def verify(self, job: CodingJob, tools: DoBoxTools, evidence: VerificationEvidence | None = None) -> VerificationResult:
         evidence = evidence or empty_verification_evidence()
@@ -227,34 +229,45 @@ class CodingVerifier:
             return None
         try:
             try:
-                return await self.judge.judge(
-                    instruction=job.instruction,
-                    status=status_result,
-                    diff=diff,
-                    tests=test_result,
-                    build=build_result,
-                    lint=lint_result,
-                    smoke=smoke_result,
-                )
-            except TypeError as exc:
-                if "smoke" in str(exc):
-                    return await self.judge.judge(
+                return await asyncio.wait_for(
+                    self.judge.judge(
                         instruction=job.instruction,
                         status=status_result,
                         diff=diff,
                         tests=test_result,
                         build=build_result,
                         lint=lint_result,
+                        smoke=smoke_result,
+                    ),
+                    timeout=self.judge_timeout_seconds,
+                )
+            except TypeError as exc:
+                if "smoke" in str(exc):
+                    return await asyncio.wait_for(
+                        self.judge.judge(
+                            instruction=job.instruction,
+                            status=status_result,
+                            diff=diff,
+                            tests=test_result,
+                            build=build_result,
+                            lint=lint_result,
+                        ),
+                        timeout=self.judge_timeout_seconds,
                     )
                 if "status" not in str(exc):
                     raise
-                return await self.judge.judge(
-                    instruction=job.instruction,
-                    diff=diff,
-                    tests=test_result,
-                    build=build_result,
-                    lint=lint_result,
+                return await asyncio.wait_for(
+                    self.judge.judge(
+                        instruction=job.instruction,
+                        diff=diff,
+                        tests=test_result,
+                        build=build_result,
+                        lint=lint_result,
+                    ),
+                    timeout=self.judge_timeout_seconds,
                 )
+        except TimeoutError:
+            return None
         except Exception as exc:
             return VerifierJudgement(
                 passed=False,

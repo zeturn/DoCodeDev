@@ -50,8 +50,16 @@ class ContextManager:
         llm_cost_used: float,
         task_contract: TaskContract | None = None,
         repair_mode: str | None = None,
+        active_repair_action: dict[str, Any] | None = None,
+        targeted_repair_phase: str | None = None,
     ) -> ContextPack:
-        task_contract_text = self.task_contract(job, task_contract=task_contract, repair_mode=repair_mode)
+        task_contract_text = self.task_contract(
+            job,
+            task_contract=task_contract,
+            repair_mode=repair_mode,
+            active_repair_action=active_repair_action,
+            targeted_repair_phase=targeted_repair_phase,
+        )
         repo_map = self.repo_map(inspection)
         working_memory = self.working_memory(
             inspection=inspection,
@@ -62,7 +70,13 @@ class ContextManager:
             llm_cost_used=llm_cost_used,
         )
         file_memory = self.file_memory(inspection, messages)
-        latest_evidence = self.latest_evidence(git_status, messages, repair_mode=repair_mode)
+        latest_evidence = self.latest_evidence(
+            git_status,
+            messages,
+            repair_mode=repair_mode,
+            active_repair_action=active_repair_action,
+            targeted_repair_phase=targeted_repair_phase,
+        )
         recent_messages = [compact_message(message) for message in messages[-self.recent_message_limit :]]
         return ContextPack(
             task_contract=clip_text(task_contract_text, self.section_bytes),
@@ -73,7 +87,15 @@ class ContextManager:
             recent_messages=recent_messages,
         )
 
-    def task_contract(self, job: CodingJob, *, task_contract: TaskContract | None = None, repair_mode: str | None = None) -> str:
+    def task_contract(
+        self,
+        job: CodingJob,
+        *,
+        task_contract: TaskContract | None = None,
+        repair_mode: str | None = None,
+        active_repair_action: dict[str, Any] | None = None,
+        targeted_repair_phase: str | None = None,
+    ) -> str:
         parts = [
             f"Instruction:\n{job.instruction}\n\n"
             "Constraints:\n"
@@ -98,6 +120,17 @@ class ContextManager:
                 "Repair Mode:\n"
                 "- The next action must be read_file, edit_file, write_file, replace_in_file, apply_patch, git_status, or git_diff.\n"
                 "- final_candidate and run_command are blocked until git_status shows a modified file."
+            )
+        if active_repair_action:
+            phase = targeted_repair_phase or "inspect_allowed"
+            targets = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "the target file"
+            next_action = f"modify {targets} now" if phase == "edit_forced" else f"inspect {targets} briefly, then modify it"
+            parts.append(
+                "Active Targeted Repair:\n"
+                + json.dumps(active_repair_action, ensure_ascii=False, indent=2)
+                + "\n\n"
+                + f"Targeted repair phase: {phase}\n"
+                + f"Next required action: {next_action}"
             )
         return "\n\n".join(parts)
 
@@ -141,13 +174,34 @@ class ContextManager:
             parts.append("Touched or inspected paths:\n" + "\n".join(f"- {path}" for path in touched))
         return "\n\n".join(parts) if parts else "No file memory yet."
 
-    def latest_evidence(self, git_status: ToolResult, messages: list[dict[str, Any]], *, repair_mode: str | None = None) -> str:
+    def latest_evidence(
+        self,
+        git_status: ToolResult,
+        messages: list[dict[str, Any]],
+        *,
+        repair_mode: str | None = None,
+        active_repair_action: dict[str, Any] | None = None,
+        targeted_repair_phase: str | None = None,
+    ) -> str:
         latest_tools = [message for message in messages if message.get("role") == "tool"][-5:]
         tool_summaries = "\n".join(tool_evidence(message) for message in latest_tools)
         clean = git_status_clean(git_status.output)
         changed = changed_files_from_status(git_status.output)
         final_allowed = "no" if clean or repair_mode == "must_edit" else "yes"
         required_next = next_missing_command(messages)
+        active = ""
+        if active_repair_action:
+            target_files = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "<none>"
+            rerun = ", ".join(str(command) for command in active_repair_action.get("rerun_commands") or []) or "<none>"
+            active = (
+                "\n\nActive Targeted Repair:\n"
+                f"- category: {active_repair_action.get('category')}\n"
+                f"- reason: {active_repair_action.get('reason')}\n"
+                f"- phase: {targeted_repair_phase or 'inspect_allowed'}\n"
+                f"- target_files: {target_files}\n"
+                f"- rerun: {rerun}\n"
+                f"- next_required_action: {'modify ' + target_files + ' now' if targeted_repair_phase == 'edit_forced' else 'inspect briefly, then modify target file'}"
+            )
         return (
             f"Git status:\n{git_status.output or '<clean>'}\n\n"
             "Current Git Diff State:\n"
@@ -156,6 +210,7 @@ class ContextManager:
             f"- final_candidate_allowed: {final_allowed}{final_candidate_reason(clean, repair_mode)}\n"
             f"- required_next_command: {required_next or '<none>'}\n\n"
             f"Latest tool evidence:\n{tool_summaries or '- No tool calls yet.'}"
+            f"{active}"
         )
 
 

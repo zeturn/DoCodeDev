@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from docode.agent.loop import CodingAgentLoop
+from docode.agent.reviewer import IndependentReviewer
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.tools import CompositeAgentTools
 from docode.agent.verifier import CodingVerifier
@@ -173,12 +174,16 @@ class JobRunnerService:
             verifier_judge = (
                 WeavVerifierJudge(runtime.provider_client, runtime.model, runtime.usage_meter) if runtime.provider_client is not None else None
             )
+            reviewer = (
+                IndependentReviewer(runtime.provider_client, runtime.model, runtime.usage_meter) if runtime.provider_client is not None else None
+            )
             max_llm_tokens = runtime_budget(job.max_llm_tokens, authorization.budget_tokens)
             max_llm_cost = runtime_budget(job.max_llm_cost, authorization.budget_cost)
             loop = CodingAgentLoop(
                 llm=llm,
                 tools=agent_tools,
                 verifier=CodingVerifier(judge=verifier_judge),
+                reviewer=reviewer,
                 repository=self.repository,
                 exporter=ArtifactExporter(
                     self.config.artifact_dir,

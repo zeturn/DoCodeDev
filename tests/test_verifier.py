@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import subprocess
@@ -285,6 +286,12 @@ class BrokenJudge:
         raise ValueError("not json")
 
 
+class HangingJudge:
+    async def judge(self, *, instruction, status=None, diff, tests, build, lint, smoke=None):
+        _ = instruction, status, diff, tests, build, lint, smoke
+        await asyncio.sleep(3600)
+
+
 class VerifierTests(IsolatedAsyncioTestCase):
     async def test_failing_build_blocks_success(self) -> None:
         result = await CodingVerifier().verify(
@@ -388,6 +395,16 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertEqual(result.confidence, 0.0)
         self.assertIsNotNone(result.llm_judgement)
         self.assertTrue(result.llm_judgement.reason.startswith("verifier_model_failed:"))
+
+    async def test_verifier_judge_timeout_falls_back_to_deterministic_checks(self) -> None:
+        result = await CodingVerifier(judge=HangingJudge(), judge_timeout_seconds=0.01).verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="ship it"),
+            PassingVerifierTools(),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertIsNone(result.llm_judgement)
+        self.assertGreater(result.confidence, 0.8)
 
     async def test_python_crawler_smoke_failure_blocks_success(self) -> None:
         tools = NoDetectedPythonVerifierTools(smoke_exit_code=1)

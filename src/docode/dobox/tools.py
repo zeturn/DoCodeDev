@@ -165,6 +165,8 @@ class DoBoxTools:
             return rejected_tool_result("edit_file", path_error, {"path": path})
         if not isinstance(old_text, str) or old_text == "":
             return ToolResult(tool="edit_file", output="old_text must be a non-empty string", exit_code=2, metadata={"path": path})
+        if old_text == new_text:
+            return ToolResult(tool="edit_file", output="edit_file would not change the file; old_text and new_text are identical", exit_code=2, metadata={"path": path})
         expected = int_or_default(expected_occurrences, 1)
         if expected < 1:
             return ToolResult(tool="edit_file", output="expected_occurrences must be at least 1", exit_code=2, metadata={"path": path})

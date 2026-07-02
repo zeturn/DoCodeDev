@@ -26,6 +26,17 @@ class AgentState:
     latest_git_status: ToolResult | None = None
     repair_mode: str | None = None
     stuck_count: int = 0
+    quality_gate_passed: bool = False
+    quality_gate_attempts: int = 0
+    last_quality_gate: dict[str, Any] | None = None
+    active_repair_action: dict[str, Any] | None = None
+    active_repair_started_at: int = 0
+    targeted_repair_phase: str | None = None
+    targeted_repair_inspections: int = 0
+    targeted_repair_edits: int = 0
+    repair_action_attempts: int = 0
+    failure_signatures: dict[str, int] = field(default_factory=dict)
+    last_failed_command: str | None = None
 
     def add_observation(self, content: str) -> None:
         self.messages.append({"role": "system", "kind": "observation", "content": content})
@@ -48,6 +59,8 @@ class AgentState:
                 "metadata": metadata,
             }
         )
+        if result.tool in {"edit_file", "write_file", "replace_in_file", "apply_patch"} and result.ok:
+            self.quality_gate_passed = False
         self.consecutive_failures = self.consecutive_failures + 1 if not result.ok else 0
 
     def add_feedback(self, content: str) -> None:
