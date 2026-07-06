@@ -65,4 +65,34 @@ class AgentState:
 
     def add_feedback(self, content: str) -> None:
         self.messages.append({"role": "system", "kind": "feedback", "content": content})
-        self.consecutive_failures += 1
+        if feedback_counts_as_consecutive_failure(content):
+            self.consecutive_failures += 1
+
+
+def feedback_counts_as_consecutive_failure(content: str) -> bool:
+    """Return whether feedback should consume the hard consecutive-failure budget.
+
+    A rejected targeted-repair action is usually control-flow guidance rather than a
+    new runtime failure. Counting every such hint as a hard failure makes the loop
+    stop before the constrained repair policy can steer the model back to editing
+    the target file. Tool failures still count through add_tool_result, and broader
+    stop policies continue to cap iterations, tool calls, runtime, and token usage.
+    """
+
+    text = (content or "").lower()
+    targeted_repair_markers = (
+        "active repair:",
+        "active targeted repair",
+        "repair_mode=targeted_repair",
+        "targeted_repair_wrong_action",
+        "targeted_repair_exploration_limit",
+        "targeted_repair_tool_forbidden",
+        "requires modifying",
+        "do not run tests again until",
+        "rerun after patch",
+    )
+    if any(marker in text for marker in targeted_repair_markers) and (
+        "targeted" in text or "active repair" in text or "before running commands" in text
+    ):
+        return False
+    return True
