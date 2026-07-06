@@ -87,12 +87,7 @@ def targeted_repair_allowed_tools_for_phase(state: Any) -> set[str]:
 
 
 def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> list[Any]:
-    """Hide non-command tools while an exact TEST_REQUIRED command is pending.
-
-    The loop already rejects wrong tools in TEST_REQUIRED, but repeated rejections
-    can burn the consecutive-failure budget. Restricting the tool schema makes the
-    next action much more likely to be the required run_command instead of read_file.
-    """
+    """Hide non-command tools while an exact TEST_REQUIRED command is pending."""
 
     from docode.agent import loop as loop_module
 
@@ -100,20 +95,14 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> li
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     workflow = loop_module.workflow_snapshot(state, status_output)
     if workflow.phase == loop_module.WorkflowPhase.TEST_REQUIRED and not loop_module.missing_must_modify_targets(state):
-        allowed = {"run_command", "git_status", "git_diff"}
+        allowed = {"run_command"}
         return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     original = getattr(loop_module, "_docode_original_allowed_tool_definitions_for_state")
     return original(definitions, state)
 
 
 def required_test_tool_block(state: Any, workflow: Any, tool_name: str, args: dict[str, object]) -> str:
-    """Keep TEST_REQUIRED strict, but do not make repeated read attempts fatal.
-
-    The main loop still records a rejection, but these feedback strings include a
-    stable marker that AgentState can be taught to treat as control feedback. This
-    function also emits a very short imperative message that is easier for the
-    model to follow on the next turn.
-    """
+    """Keep TEST_REQUIRED strict, but make repeated wrong choices non-fatal control feedback."""
 
     from docode.agent import loop as loop_module
 
