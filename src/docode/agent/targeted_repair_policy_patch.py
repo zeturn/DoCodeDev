@@ -4,31 +4,28 @@ from typing import Any
 
 
 def apply() -> None:
-    """Install targeted-repair policy overrides into docode.agent.loop.
-
-    This module intentionally patches only policy helper functions. The loop calls
-    these helpers by module-global name at runtime, so replacing them is enough to
-    harden the repair path without rewriting the large agent loop module.
-    """
+    """Install repair and workflow policy overrides into docode.agent.loop."""
 
     from docode.agent import loop as loop_module
+
+    if not hasattr(loop_module, "_docode_original_allowed_tool_definitions_for_state"):
+        loop_module._docode_original_allowed_tool_definitions_for_state = loop_module.allowed_tool_definitions_for_state
+    if not hasattr(loop_module, "_docode_original_required_test_tool_block"):
+        loop_module._docode_original_required_test_tool_block = loop_module.required_test_tool_block
 
     loop_module.targeted_repair_forced_tool = targeted_repair_forced_tool
     loop_module.targeted_repair_allowed_tools_for_phase = targeted_repair_allowed_tools_for_phase
     loop_module.review_repair_target_files = review_repair_target_files
     loop_module.repair_action_from_quality_gate = repair_action_from_quality_gate
+    loop_module.allowed_tool_definitions_for_state = allowed_tool_definitions_for_state
+    loop_module.required_test_tool_block = required_test_tool_block
 
 
 def targeted_repair_forced_tool(
     state: Any,
     tool_name: str,
 ) -> tuple[str, dict[str, object], str] | None:
-    """Force the next valid targeted-repair action.
-
-    Before the target file changes, wrong exploration/actions are retargeted to an
-    inspection or target rewrite. After the target file changes, any next action
-    is retargeted to the exact rerun command recorded by the repair action.
-    """
+    """Force the next valid targeted-repair action."""
 
     from docode.agent import loop as loop_module
 
@@ -89,16 +86,54 @@ def targeted_repair_allowed_tools_for_phase(state: Any) -> set[str]:
     return {"read_file", "edit_file", "write_file", "replace_in_file", "apply_patch"}
 
 
-def repair_action_from_quality_gate(result: Any):
-    """Turn quality-gate blockers into targeted repairs when paths are known.
+def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> list[Any]:
+    """Hide non-command tools while an exact TEST_REQUIRED command is pending.
 
-    The previous fallback used repair_mode=quality_repair for markdown blockers
-    such as `README.md Usage is empty`. That mode still allowed run_command and
-    also prevented FINAL_READY auto-finalization, so the loop could dry-run until
-    max_iterations. A path-specific targeted repair forces a real edit to the
-    blocker path and then clears itself after that edit because no rerun command
-    is required for documentation-only quality fixes.
+    The loop already rejects wrong tools in TEST_REQUIRED, but repeated rejections
+    can burn the consecutive-failure budget. Restricting the tool schema makes the
+    next action much more likely to be the required run_command instead of read_file.
     """
+
+    from docode.agent import loop as loop_module
+
+    loop_module.refresh_targeted_repair_phase(state)
+    status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
+    workflow = loop_module.workflow_snapshot(state, status_output)
+    if workflow.phase == loop_module.WorkflowPhase.TEST_REQUIRED and not loop_module.missing_must_modify_targets(state):
+        allowed = {"run_command", "git_status", "git_diff"}
+        return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
+    original = getattr(loop_module, "_docode_original_allowed_tool_definitions_for_state")
+    return original(definitions, state)
+
+
+def required_test_tool_block(state: Any, workflow: Any, tool_name: str, args: dict[str, object]) -> str:
+    """Keep TEST_REQUIRED strict, but do not make repeated read attempts fatal.
+
+    The main loop still records a rejection, but these feedback strings include a
+    stable marker that AgentState can be taught to treat as control feedback. This
+    function also emits a very short imperative message that is easier for the
+    model to follow on the next turn.
+    """
+
+    from docode.agent import loop as loop_module
+
+    original = getattr(loop_module, "_docode_original_required_test_tool_block")
+    detail = original(state, workflow, tool_name, args)
+    if not detail:
+        return ""
+    if workflow.phase != loop_module.WorkflowPhase.TEST_REQUIRED:
+        return detail
+    command = ""
+    missing = getattr(workflow, "missing_commands", None) or []
+    if missing:
+        command = str(missing[0])
+    if command:
+        return f"test_required_exact_command_control: run_command now with exactly: {command}"
+    return "test_required_exact_command_control: run the exact required TEST_REQUIRED command now"
+
+
+def repair_action_from_quality_gate(result: Any):
+    """Turn quality-gate blockers into targeted repairs when paths are known."""
 
     blockers = list(result.blockers())
     if not blockers:
