@@ -68,7 +68,13 @@ def targeted_repair_forced_tool(
     state: Any,
     tool_name: str,
 ) -> tuple[str, dict[str, object], str] | None:
-    """Force the next valid targeted-repair action."""
+    """Force only deterministic targeted-repair actions.
+
+    This intentionally does not auto-write default crawler artifact templates during
+    repair. Template writes are useful while creating missing required files, but
+    during repair they can overwrite the model's current implementation and cause a
+    loop: failing test -> read_file -> forced default write -> same failing test.
+    """
 
     from docode.agent import loop as loop_module
 
@@ -98,14 +104,6 @@ def targeted_repair_forced_tool(
             {"path": target},
             "active_repair_requires_inspection_or_patch",
         )
-    if read_count > 0 and tool_name in {"run_command", "read_file", "search", "list_files"}:
-        content = loop_module.default_crawler_artifact_file_content(target, state)
-        if content is not None:
-            return (
-                "write_file",
-                {"path": target, "content": content},
-                "active_repair_requires_target_patch",
-            )
     return None
 
 
