@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from docode.agent.loop import CodingAgentLoop
+from docode.agent import targeted_repair_policy_patch
 from docode.agent.reviewer import IndependentReviewer
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.tools import CompositeAgentTools
@@ -22,6 +23,9 @@ from docode.llm.weav_apicred_store import usage_record_from_snapshot
 from docode.storage.models import JobStatus
 from docode.storage.repository import JobRepository, terminal_status
 from docode.web.tools import WebTools, WebToolsConfig
+
+
+targeted_repair_policy_patch.apply()
 
 
 DoBoxClientFactory = Callable[[], DoBoxClient]
@@ -618,7 +622,7 @@ def main() -> None:
     records = parse_records(html)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+    output_path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if args.dry_run:
         print(f"dry-run wrote {output_path}")
     else:
