@@ -72,11 +72,10 @@ class AgentState:
 def feedback_counts_as_consecutive_failure(content: str) -> bool:
     """Return whether feedback should consume the hard consecutive-failure budget.
 
-    A rejected targeted-repair action is usually control-flow guidance rather than a
-    new runtime failure. Counting every such hint as a hard failure makes the loop
-    stop before the constrained repair policy can steer the model back to editing
-    the target file. Tool failures still count through add_tool_result, and broader
-    stop policies continue to cap iterations, tool calls, runtime, and token usage.
+    Rejections that are deterministic workflow control-flow guidance should not be
+    counted as hard failures. Tool execution failures still count through
+    add_tool_result, and broader stop policies continue to cap iterations, tool
+    calls, runtime, and token usage.
     """
 
     text = (content or "").lower()
@@ -95,4 +94,14 @@ def feedback_counts_as_consecutive_failure(content: str) -> bool:
         "targeted" in text or "active repair" in text or "before running commands" in text
     ):
         return False
+
+    required_command_markers = (
+        "test_required_exact_command_control",
+        "test_required_tool_forbidden",
+        "run this exact verification command before final_candidate",
+        "run_command now with exactly",
+    )
+    if any(marker in text for marker in required_command_markers):
+        return False
+
     return True
