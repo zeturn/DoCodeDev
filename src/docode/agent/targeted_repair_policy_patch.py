@@ -16,6 +16,7 @@ def apply() -> None:
     loop_module.targeted_repair_forced_tool = targeted_repair_forced_tool
     loop_module.targeted_repair_allowed_tools_for_phase = targeted_repair_allowed_tools_for_phase
     loop_module.review_repair_target_files = review_repair_target_files
+    loop_module.repair_action_from_quality_gate = repair_action_from_quality_gate
 
 
 def targeted_repair_forced_tool(
@@ -25,13 +26,8 @@ def targeted_repair_forced_tool(
     """Force the next valid targeted-repair action.
 
     Before the target file changes, wrong exploration/actions are retargeted to an
-    inspection or target rewrite. After the target file changes, *any* wrong next
-    action is retargeted to the exact rerun command recorded by the repair action.
-    This prevents traces from getting stuck in reject loops such as:
-
-      read_file -> rejected -> dry-run -> rejected -> cat file -> rejected
-
-    after the repair target was already patched.
+    inspection or target rewrite. After the target file changes, any next action
+    is retargeted to the exact rerun command recorded by the repair action.
     """
 
     from docode.agent import loop as loop_module
@@ -48,15 +44,9 @@ def targeted_repair_forced_tool(
         commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
         if not commands:
             return None
-        expected = commands[0]
-        if tool_name == "run_command":
-            args = getattr(state, "_current_tool_args", {}) or {}
-            observed = " ".join(str(args.get("command") or "").strip().split())
-            if any(loop_module.commands_equivalent(observed, command) for command in commands):
-                return None
         return (
             "run_command",
-            {"command": expected},
+            {"command": commands[0]},
             "active_repair_requires_exact_rerun",
         )
 
@@ -97,6 +87,65 @@ def targeted_repair_allowed_tools_for_phase(state: Any) -> set[str]:
     if state.targeted_repair_phase == "edit_forced":
         return {"edit_file", "write_file", "replace_in_file", "apply_patch"}
     return {"read_file", "edit_file", "write_file", "replace_in_file", "apply_patch"}
+
+
+def repair_action_from_quality_gate(result: Any):
+    """Turn quality-gate blockers into targeted repairs when paths are known.
+
+    The previous fallback used repair_mode=quality_repair for markdown blockers
+    such as `README.md Usage is empty`. That mode still allowed run_command and
+    also prevented FINAL_READY auto-finalization, so the loop could dry-run until
+    max_iterations. A path-specific targeted repair forces a real edit to the
+    blocker path and then clears itself after that edit because no rerun command
+    is required for documentation-only quality fixes.
+    """
+
+    blockers = list(result.blockers())
+    if not blockers:
+        return None
+
+    target_files: list[str] = []
+    lines = ["Quality gate blocked finalization. Modify the listed target file(s) before running commands again."]
+    for issue in blockers:
+        path = str(getattr(issue, "path", "") or "").strip()
+        if path and path not in target_files:
+            target_files.append(path)
+        code = str(getattr(issue, "code", "") or "quality_blocker")
+        message = str(getattr(issue, "message", "") or "Quality gate blocker")
+        hint = str(getattr(issue, "repair_hint", "") or "").strip()
+        where = f" ({path})" if path else ""
+        lines.append(f"- [{code}] {message}{where}")
+        if hint:
+            lines.append(f"  Repair hint: {hint}")
+
+    if not target_files:
+        from docode.agent import loop as loop_module
+
+        issue_text = "\n".join(f"{getattr(issue, 'code', '')}: {getattr(issue, 'message', '')}" for issue in blockers)
+        return loop_module.plan_repair_from_tool_result(
+            tool="run_command",
+            output=issue_text,
+            metadata={"command": "python3 crawler.py --dry-run"},
+        )
+
+    from docode.agent.repair_planner import RepairAction
+
+    signature_source = "|".join(
+        f"{getattr(issue, 'code', '')}:{getattr(issue, 'message', '')}:{getattr(issue, 'path', '')}"
+        for issue in blockers
+    )
+    return RepairAction(
+        category="quality_gate_repair",
+        signature="quality:" + str(abs(hash(signature_source)))[:12],
+        reason="quality_gate_blocked",
+        target_files=target_files,
+        allowed_tools=["read_file", "edit_file", "write_file", "replace_in_file", "apply_patch", "git_status", "git_diff"],
+        forbidden_tools=["run_command", "web_search", "fetch_url", "preview", "logs"],
+        instruction="\n".join(lines),
+        rerun_commands=[],
+        exploration_forbidden=True,
+        initial_inspection_budget=1,
+    )
 
 
 def review_repair_target_files(task_contract: Any | None, issue_text: str = "") -> list[str]:
