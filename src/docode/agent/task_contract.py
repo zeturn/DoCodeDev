@@ -5,7 +5,7 @@ from collections.abc import Iterable
 import re
 
 
-FILE_REF_RE = re.compile(r"\b[\w./-]+\.(?:py|js|ts|go|rs|md|json|toml|yaml|yml)\b")
+FILE_REF_RE = re.compile(r"\b[\w./-]+\.(?:py|js|ts|go|rs|md|json|toml|yaml|yml|txt|csv|html)\b")
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,13 +16,44 @@ class TaskContract:
 
 
 def task_contract_from_instruction(instruction: str) -> TaskContract:
-    files = unique_preserving_order(match.group(0).strip("./") for match in FILE_REF_RE.finditer(instruction or ""))
-    commands = unique_preserving_order([*suggested_commands(files), *verification_commands_from_instruction(instruction)])
+    files = unique_preserving_order(
+        path
+        for match in FILE_REF_RE.finditer(instruction or "")
+        if (path := normalize_contract_file(match.group(0))) and contract_file_allowed(path)
+    )
+    if is_crawler_instruction(instruction):
+        files = unique_preserving_order(["crawler.py", *files])
+    explicit_commands = verification_commands_from_instruction(instruction)
+    commands = unique_preserving_order([*suggested_commands(files), *explicit_commands])
+    if is_crawler_instruction(instruction):
+        crawler_defaults = [
+            "python3 -m unittest discover -s tests",
+            "python3 crawler.py --preflight",
+            "python3 crawler.py --dry-run",
+        ]
+        commands = unique_preserving_order([*commands, *crawler_defaults])
     forbidden = [
         "Do not call final_candidate until git_status shows at least one modified file.",
         "Do not finish with a clean git status; produce a non-empty git diff first.",
     ]
     return TaskContract(must_modify_files=files, must_run_commands=commands, forbidden_finish_conditions=forbidden)
+
+
+def normalize_contract_file(value: str) -> str:
+    return value.strip().strip("`'\"").strip("./")
+
+
+def contract_file_allowed(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("/")
+    if not normalized:
+        return False
+    if normalized.startswith((".araneae/", "araneae/")):
+        return False
+    if normalized.endswith(".jsonl"):
+        return False
+    if normalized.startswith(("http:/", "https:/")):
+        return False
+    return True
 
 
 def suggested_commands(files: list[str]) -> list[str]:
@@ -86,3 +117,8 @@ def unique_preserving_order(values: Iterable[object]) -> list[str]:
             seen.add(text)
             result.append(text)
     return result
+
+
+def is_crawler_instruction(instruction: str) -> bool:
+    lowered = (instruction or "").lower()
+    return any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "trending"))

@@ -14,6 +14,7 @@ class WorkflowPhase(str, Enum):
     INSPECT = "INSPECT"
     PLAN = "PLAN"
     EDIT_REQUIRED = "EDIT_REQUIRED"
+    REPAIR_REQUIRED = "REPAIR_REQUIRED"
     TEST_REQUIRED = "TEST_REQUIRED"
     VERIFY_READY = "VERIFY_READY"
     FINAL_READY = "FINAL_READY"
@@ -28,18 +29,38 @@ class WorkflowSnapshot:
     reason: str
     required_action: str
     missing_commands: list[str] | None = None
+    required_tests_attempted: bool = False
+    required_tests_passed: bool = False
+    active_repair_required: bool = False
+    latest_test_failure_signature: str | None = None
+    allowed_next_tools: list[str] | None = None
+    rerun_after_patch: str | None = None
+    target_file: str | None = None
+    target_file_modified_after_repair: bool = False
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
             "phase": self.phase.value,
             "diff_exists": self.diff_exists,
             "tests_run": self.tests_run,
+            "required_tests_attempted": self.required_tests_attempted,
+            "required_tests_passed": self.required_tests_passed,
             "final_allowed": self.final_allowed,
             "reason": self.reason,
             "required_action": self.required_action,
+            "active_repair_required": self.active_repair_required,
+            "target_file_modified_after_repair": self.target_file_modified_after_repair,
         }
         if self.missing_commands:
             payload["missing_commands"] = self.missing_commands
+        if self.latest_test_failure_signature:
+            payload["latest_test_failure_signature"] = self.latest_test_failure_signature
+        if self.allowed_next_tools:
+            payload["allowed_next_tools"] = self.allowed_next_tools
+        if self.rerun_after_patch:
+            payload["rerun_after_patch"] = self.rerun_after_patch
+        if self.target_file:
+            payload["target_file"] = self.target_file
         return payload
 
 
@@ -56,11 +77,42 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
     diff_exists = meaningful_diff_exists(git_status_output) and successful_edit_tool_called(state)
     missing_commands = missing_required_commands(state)
     tests_run = not missing_commands
+    required_tests_attempted = required_commands_attempted(state)
+    latest_failure_signature = latest_failed_required_command_signature(state)
+    if state.repair_mode == "targeted_repair" and state.active_repair_action:
+        action = state.active_repair_action
+        target_files = [str(path) for path in action.get("target_files") or [] if str(path)]
+        rerun_commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
+        target_file = target_files[0] if target_files else None
+        modified = target_file_modified_after_repair_start(state)
+        return WorkflowSnapshot(
+            phase=WorkflowPhase.REPAIR_REQUIRED,
+            diff_exists=diff_exists,
+            tests_run=tests_run,
+            required_tests_attempted=required_tests_attempted,
+            required_tests_passed=tests_run,
+            final_allowed=False,
+            reason="active_targeted_repair",
+            required_action=(
+                f"modify {target_file or 'the target file'} before rerunning tests"
+                if not modified
+                else f"rerun after patch: {rerun_commands[0] if rerun_commands else 'the failing command'}"
+            ),
+            missing_commands=missing_commands,
+            active_repair_required=True,
+            latest_test_failure_signature=latest_failure_signature,
+            allowed_next_tools=["read_file", "edit_file", "apply_patch", "write_file"] if not modified else ["run_command"],
+            rerun_after_patch=rerun_commands[0] if rerun_commands else None,
+            target_file=target_file,
+            target_file_modified_after_repair=modified,
+        )
     if state.inspection is None:
         return WorkflowSnapshot(
             phase=WorkflowPhase.INSPECT,
             diff_exists=diff_exists,
             tests_run=tests_run,
+            required_tests_attempted=required_tests_attempted,
+            required_tests_passed=tests_run,
             final_allowed=False,
             reason="inspection_missing",
             required_action="inspect the repository before planning or editing",
@@ -70,6 +122,8 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             phase=WorkflowPhase.EDIT_REQUIRED,
             diff_exists=False,
             tests_run=tests_run,
+            required_tests_attempted=required_tests_attempted,
+            required_tests_passed=tests_run,
             final_allowed=False,
             reason="no_diff",
             required_action="modify a target file and confirm git_status shows a change",
@@ -79,6 +133,8 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             phase=WorkflowPhase.EDIT_REQUIRED,
             diff_exists=True,
             tests_run=tests_run,
+            required_tests_attempted=required_tests_attempted,
+            required_tests_passed=tests_run,
             final_allowed=False,
             reason="repair_mode_requires_edit",
             required_action="make or confirm an edit with an allowed repair tool before final_candidate",
@@ -88,15 +144,20 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             phase=WorkflowPhase.TEST_REQUIRED,
             diff_exists=True,
             tests_run=False,
+            required_tests_attempted=required_tests_attempted,
+            required_tests_passed=False,
             final_allowed=False,
             reason="required_tests_missing",
             required_action=f"run this exact verification command before final_candidate: {missing_commands[0]}",
             missing_commands=missing_commands,
+            latest_test_failure_signature=latest_failure_signature,
         )
     return WorkflowSnapshot(
         phase=WorkflowPhase.FINAL_READY,
         diff_exists=True,
         tests_run=tests_run,
+        required_tests_attempted=required_tests_attempted,
+        required_tests_passed=tests_run,
         final_allowed=True,
         reason="ready",
         required_action="submit final_candidate for verifier review",
@@ -160,12 +221,45 @@ def command_was_run(state: AgentState, command: str) -> bool:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         observed = normalize_command(str(metadata.get("command") or ""))
-        if observed and (observed == expected or expected in observed):
+        if observed and commands_equivalent(observed, expected):
             return True
         tool = str(message.get("tool") or "")
         if tool == "run_tests" and ("test" in expected or "pytest" in expected or "unittest" in expected):
             return True
     return False
+
+
+def required_commands_attempted(state: AgentState) -> bool:
+    commands = required_commands(state.task_contract)
+    if not commands:
+        return False
+    expected = [normalize_command(command) for command in commands]
+    for message in state.messages:
+        if message.get("role") != "tool":
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        observed = normalize_command(str(metadata.get("command") or ""))
+        if observed and any(commands_equivalent(observed, command) for command in expected):
+            return True
+    return False
+
+
+def latest_failed_required_command_signature(state: AgentState) -> str | None:
+    commands = [normalize_command(command) for command in required_commands(state.task_contract)]
+    for message in reversed(state.messages):
+        if message.get("role") != "tool" or int(message.get("exit_code") or 0) == 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        observed = normalize_command(str(metadata.get("command") or ""))
+        if not observed or not any(commands_equivalent(observed, command) for command in commands):
+            continue
+        output = str(message.get("output") or "")
+        for line in output.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("AssertionError:", "AttributeError:", "KeyError:", "FAIL:", "ERROR:")):
+                return stripped[:160]
+        return observed
+    return None
 
 
 def successful_edit_tool_called(state: AgentState) -> bool:
@@ -178,7 +272,53 @@ def successful_edit_tool_called(state: AgentState) -> bool:
 
 
 def normalize_command(command: str) -> str:
-    return " ".join(command.strip().split())
+    cleaned = " ".join(command.strip().split())
+    for suffix in (" 2>&1", " 1>&2"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+    return cleaned
+
+
+def commands_equivalent(observed: str, expected: str) -> bool:
+    observed = normalize_command(observed)
+    expected = normalize_command(expected)
+    if observed == expected or expected in observed:
+        return True
+    if observed.endswith(" -v") and observed[: -3] == expected:
+        return True
+    if expected.endswith(" -v") and expected[: -3] == observed:
+        return True
+    unittest = "python3 -m unittest discover -s tests"
+    if observed.startswith(unittest) and expected == unittest:
+        extra = observed[len(unittest) :].strip()
+        return extra in {"", "-v"}
+    if expected == "python3 crawler.py --dry-run" and observed.startswith("python3 crawler.py "):
+        return "--dry-run" in observed.split()
+    if observed == "python3 crawler.py --dry-run" and expected.startswith("python3 crawler.py "):
+        return "--dry-run" in expected.split()
+    if expected == "python3 crawler.py --preflight" and observed.startswith("python3 crawler.py "):
+        return "--dry-run" in observed.split()
+    return False
+
+
+def target_file_modified_after_repair_start(state: AgentState) -> bool:
+    action = state.active_repair_action or {}
+    targets = {str(path).replace("\\", "/").strip().removeprefix("/workspace/") for path in action.get("target_files") or [] if str(path)}
+    if not targets:
+        return successful_edit_tool_called(state)
+    for message in reversed(state.messages[state.active_repair_started_at :]):
+        if message.get("role") != "tool":
+            continue
+        tool = str(message.get("tool") or "")
+        if tool not in EDIT_TOOLS or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = str(metadata.get("path") or "").replace("\\", "/").strip()
+        if path.startswith("/workspace/"):
+            path = path[len("/workspace/") :]
+        if tool == "apply_patch" or path in targets:
+            return True
+    return False
 
 
 def meaningful_diff_exists(git_status_output: str) -> bool:
@@ -188,14 +328,32 @@ def meaningful_diff_exists(git_status_output: str) -> bool:
 def changed_paths_from_status(status: str) -> list[str]:
     paths: list[str] = []
     for raw_line in status.splitlines():
-        line = strip_ansi(raw_line).rstrip()
-        if len(line) < 4:
-            continue
-        marker = line[:2]
-        path = line[3:].strip()
+        marker, path = parse_status_line(raw_line)
         if path and (marker == "??" or marker.strip()):
             paths.append(path)
     return paths
+
+
+def parse_status_line(raw_line: str) -> tuple[str, str]:
+    line = strip_ansi(raw_line).rstrip()
+    if not line:
+        return "", ""
+    if line.startswith("?? "):
+        return "??", line[3:].strip()
+    if len(line) >= 4 and line[2] == " ":
+        marker = line[:2]
+        path = line[3:].strip()
+    elif len(line) >= 3 and line[1] == " ":
+        marker = line[:1]
+        path = line[2:].strip()
+    else:
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            return "", ""
+        marker, path = parts[0], parts[1].strip()
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[-1].strip()
+    return marker, path
 
 
 def meaningful_change_path(path: str) -> bool:

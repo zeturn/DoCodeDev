@@ -7,8 +7,11 @@ from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
 
 from docode.agent.loop import (
+    INITIAL_NO_DIFF_EXPLORATION_BUDGET,
     CodingAgentLoop,
+    allowed_tools_for_repair_mode_name,
     allowed_tool_definitions_for_state,
+    compact_llm_message,
     edit_required_tool_block,
     latest_failed_required_command,
     required_test_tool_block,
@@ -22,6 +25,8 @@ from docode.agent.state import AgentState
 from docode.agent.task_contract import TaskContract
 from docode.agent.verifier import CodingVerifier, VerificationResult
 from docode.agent.workflow import WorkflowPhase
+from docode.agent.context import instruction_source_urls
+from docode.agent.inspector import should_skip_important_file_reads
 from docode.artifacts.exporter import ArtifactExporter
 from docode.dobox.types import ToolResult
 from docode.llm.runtime import AgentDecision, LLMUsageMeter
@@ -77,6 +82,18 @@ class FlakyLLM:
         if self.calls == 2:
             return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "recovered\n"})
         return AgentDecision(type="final_candidate", summary="Recovered from a model error and updated README.")
+
+
+class FlakyThenWritesAtBudgetLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, tools, context
+        self.calls += 1
+        if self.calls in {1, 2}:
+            raise ValueError("unsupported decision type: ")
+        return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "done\n"})
 
 
 class MissingSummaryLLM:
@@ -234,22 +251,25 @@ class RequiredTestGateLLM:
 class FinalReadyToolLoopLLM:
     def __init__(self) -> None:
         self.calls = 0
-        self.observed_final_ready_feedback = False
 
     async def decide(self, *, system, messages, tools, context):
-        _ = system, tools, context
+        _ = system, messages, tools, context
         self.calls += 1
         if self.calls == 1:
             return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "done\n"})
         if self.calls == 2:
             return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo checked"})
-        if self.calls == 3:
-            return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo extra"})
-        self.observed_final_ready_feedback = any(
-            message.get("kind") == "feedback" and "final_ready_tool_forbidden" in str(message.get("content"))
-            for message in messages
-        )
-        return AgentDecision(type="final_candidate", summary="Updated README after final-ready tool rejection.")
+        return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo extra"})
+
+
+class FinalReadyMalformedLLM(FinalReadyToolLoopLLM):
+    async def decide(self, *, system, messages, tools, context):
+        self.calls += 1
+        if self.calls == 1:
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "done\n"})
+        if self.calls == 2:
+            return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo checked"})
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
 
 class ReviewerRepairLLM:
@@ -278,6 +298,7 @@ class TargetedRepairLLM:
         self.calls = 0
         self.observed_targeted_feedback = False
         self.observed_rerun_feedback = False
+        self.observed_dry_run_feedback = False
 
     async def decide(self, *, system, messages, tools, context):
         _ = system, tools
@@ -306,6 +327,16 @@ class TargetedRepairLLM:
                 for message in messages
             )
             return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "python3 -m unittest discover -s tests"})
+        if self.calls == 7:
+            self.observed_dry_run_feedback = any(
+                message.get("kind") == "feedback" and "python3 crawler.py --source fixtures/sample_source.html --output data/output.json --dry-run" in str(message.get("content"))
+                for message in messages
+            )
+            return AgentDecision(
+                type="tool_call",
+                tool_name="run_command",
+                args={"command": "python3 crawler.py --source fixtures/sample_source.html --output data/output.json --dry-run"},
+            )
         return AgentDecision(type="final_candidate", summary="Fixed crawler export after targeted repair.")
 
 
@@ -478,6 +509,32 @@ class FakeTools:
 
 
 class AgentLoopTests(IsolatedAsyncioTestCase):
+    def test_compact_llm_message_truncates_large_fields(self) -> None:
+        message = {
+            "role": "tool",
+            "tool": "run_command",
+            "exit_code": 1,
+            "output": "x" * 5000,
+            "metadata": {
+                "command": "python3 crawler.py --dry-run",
+                "path": "/workspace/crawler.py",
+                "ignored": "y" * 2000,
+            },
+        }
+
+        compact = compact_llm_message(message)
+
+        self.assertEqual(compact["role"], "tool")
+        self.assertEqual(compact["tool"], "run_command")
+        self.assertLess(len(str(compact["output"])), 700)
+        self.assertEqual(
+            compact["metadata"],
+            {
+                "command": "python3 crawler.py --dry-run",
+                "path": "/workspace/crawler.py",
+            },
+        )
+
     def test_verification_feedback_includes_smoke_command_and_output(self) -> None:
         feedback = verification_repair_feedback(
             VerificationResult(
@@ -681,6 +738,29 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(llm_error.content["reason"], "llm_decision_failed")
             self.assertIn("invalid json", llm_error.content["detail"])
 
+    async def test_agent_loop_auto_finalizes_when_final_ready_at_iteration_budget(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update readme"))
+            tools = FakeTools()
+
+            loop = CodingAgentLoop(
+                llm=FlakyThenWritesAtBudgetLLM(),
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=3, max_runtime_seconds=60),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(result.result_summary, "Completed the requested changes in README.md.")
+            steps = await repo.list_steps(job.id)
+            auto = [step for step in steps if step.content.get("type") == "auto_final_candidate"]
+            self.assertEqual(auto[0].content["reason"], "final_ready_stop_policy_auto_finalized")
+
     async def test_agent_loop_requires_final_candidate_summary_before_success(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
@@ -839,10 +919,61 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         )
         self.assertEqual(required_test_tool_block(missing_test_state, workflow, "write_file", {"path": "/workspace/tests/test_parser.py"}), "")
 
+    async def test_agent_loop_sets_must_edit_when_tests_blocked_by_missing_target_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="u1",
+                    instruction="Build crawler.\nmodify files: crawler.py, tests/test_parser.py\nverify with: python3 crawler.py --dry-run",
+                )
+            )
+            tools = FakeTools()
+
+            class MissingTargetUnderTestLLM:
+                def __init__(self) -> None:
+                    self.calls = 0
+                    self.saw_must_edit_feedback = False
+
+                async def decide(self, *, system, messages, tools, context):
+                    _ = system, tools, context
+                    self.calls += 1
+                    if self.calls == 1:
+                        return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "crawler.py", "content": "print('ok')\n"})
+                    if self.calls == 2:
+                        return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "python3 crawler.py --dry-run"})
+                    self.saw_must_edit_feedback = any(
+                        message.get("kind") == "feedback" and "required target files are still missing" in str(message.get("content"))
+                        for message in messages
+                    )
+                    return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "tests/test_parser.py", "content": "print('test')\n"})
+
+            llm = MissingTargetUnderTestLLM()
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=PassingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=4, max_runtime_seconds=60),
+                quality_gate=PassingQualityGate(),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.FAILED)
+            self.assertEqual(result.failure_reason, "max_iterations_exceeded")
+            self.assertTrue(llm.saw_must_edit_feedback)
+            steps = await repo.list_steps(job.id)
+            rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
+            self.assertTrue(any(step.content["reason"] == "test_required_tool_forbidden" for step in rejected))
+            self.assertTrue(any(step.content.get("repair_mode") == "must_edit" for step in rejected))
+
     def test_edit_required_blocks_repeated_run_commands_without_diff(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.task_contract = TaskContract(must_modify_files=["crawler.py"])
-        for _ in range(8):
+        for _ in range(INITIAL_NO_DIFF_EXPLORATION_BUDGET):
             state.messages.append({"role": "tool", "tool": "run_command", "exit_code": 0, "metadata": {"command": "cat crawler.py"}})
         workflow = SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED)
 
@@ -852,6 +983,147 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIn("crawler.py", block)
         self.assertEqual(state.repair_mode, "must_edit")
         self.assertEqual(edit_required_tool_block(state, workflow, "write_file", {"path": "crawler.py"}), "")
+
+    def test_edit_required_rejects_non_target_file_edits(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
+        state.task_contract = TaskContract(must_modify_files=["crawler.py", "manifest.json"])
+        workflow = SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED)
+
+        block = edit_required_tool_block(state, workflow, "write_file", {"path": "/workspace/.docode_probe"})
+
+        self.assertIn("required target files", block)
+        self.assertIn("crawler.py", block)
+        self.assertIn("manifest.json", block)
+
+    def test_must_edit_mode_allows_only_edit_tools_and_git_checks(self) -> None:
+        allowed = allowed_tools_for_repair_mode_name("must_edit")
+
+        self.assertEqual(allowed, {"edit_file", "write_file", "replace_in_file", "apply_patch", "git_status", "git_diff"})
+
+    def test_edit_required_after_exploration_only_exposes_edit_and_git_tools(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["crawler.py"])
+        state.latest_git_status = ToolResult(tool="git_status", output="", exit_code=0)
+        for idx in range(INITIAL_NO_DIFF_EXPLORATION_BUDGET):
+            state.messages.append({"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": f"README_{idx}.md"}})
+        definitions = [
+            NamedTool("read_file"),
+            NamedTool("web_search"),
+            NamedTool("fetch_url"),
+            NamedTool("run_command"),
+            NamedTool("write_file"),
+            NamedTool("edit_file"),
+            NamedTool("replace_in_file"),
+            NamedTool("apply_patch"),
+            NamedTool("git_status"),
+            NamedTool("git_diff"),
+        ]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+
+        self.assertEqual(
+            set(names),
+            {"write_file", "edit_file", "replace_in_file", "apply_patch", "git_status", "git_diff"},
+        )
+        self.assertNotIn("read_file", names)
+        self.assertNotIn("web_search", names)
+        self.assertNotIn("fetch_url", names)
+        self.assertNotIn("run_command", names)
+
+    def test_edit_required_before_exploration_budget_keeps_search_tools_available(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="crawl github trends from https://github.com/trending"))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["crawler.py"])
+        state.latest_git_status = ToolResult(tool="git_status", output="", exit_code=0)
+        state.messages.append({"role": "tool", "tool": "list_files", "exit_code": 0, "metadata": {"path": "/workspace"}})
+        definitions = [
+            NamedTool("list_files"),
+            NamedTool("read_file"),
+            NamedTool("web_search"),
+            NamedTool("fetch_url"),
+            NamedTool("write_file"),
+            NamedTool("git_status"),
+            NamedTool("git_diff"),
+        ]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+
+        self.assertIn("fetch_url", names)
+        self.assertIn("write_file", names)
+        self.assertNotIn("web_search", names)
+        self.assertNotIn("read_file", names)
+        self.assertNotIn("list_files", names)
+        self.assertNotIn("git_status", names)
+        self.assertNotIn("git_diff", names)
+
+    def test_edit_required_after_explicit_fetch_allows_web_search_for_crawler(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="crawl github trends from https://github.com/trending"))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["crawler.py"])
+        state.latest_git_status = ToolResult(tool="git_status", output="", exit_code=0)
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool": "fetch_url",
+                "exit_code": 1,
+                "metadata": {"url": "https://github.com/trending"},
+            }
+        )
+        definitions = [NamedTool("fetch_url"), NamedTool("web_search"), NamedTool("write_file")]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+
+        self.assertIn("fetch_url", names)
+        self.assertIn("web_search", names)
+        self.assertIn("write_file", names)
+
+    def test_crawler_instruction_with_public_url_skips_important_file_reads(self) -> None:
+        self.assertTrue(should_skip_important_file_reads("crawl https://github.com/trending every two hours"))
+        self.assertFalse(should_skip_important_file_reads("update README.md"))
+
+    def test_instruction_source_urls_extracts_literal_urls(self) -> None:
+        urls = instruction_source_urls("check https://github.com/trending and https://example.com/feed.xml, then crawl")
+        self.assertEqual(urls, ["https://github.com/trending", "https://example.com/feed.xml"])
+
+    def test_test_required_missing_targets_only_exposes_edit_and_git_tools(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(
+            must_modify_files=["crawler.py", "tests/test_parser.py"],
+            must_run_commands=["python3 crawler.py --dry-run"],
+        )
+        state.latest_git_status = ToolResult(tool="git_status", output=" M crawler.py\n", exit_code=0)
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool": "write_file",
+                "exit_code": 0,
+                "metadata": {"path": "crawler.py"},
+            }
+        )
+        definitions = [
+            NamedTool("read_file"),
+            NamedTool("list_files"),
+            NamedTool("run_command"),
+            NamedTool("write_file"),
+            NamedTool("edit_file"),
+            NamedTool("replace_in_file"),
+            NamedTool("apply_patch"),
+            NamedTool("git_status"),
+            NamedTool("git_diff"),
+        ]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+
+        self.assertEqual(
+            set(names),
+            {"write_file", "apply_patch", "git_status", "git_diff"},
+        )
+        self.assertNotIn("run_command", names)
+        self.assertNotIn("read_file", names)
+        self.assertNotIn("edit_file", names)
+        self.assertNotIn("replace_in_file", names)
 
     def test_targeted_repair_tool_list_drops_read_after_exploration_limit(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -875,7 +1147,8 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertEqual(state.targeted_repair_phase, "edit_forced")
         self.assertNotIn("read_file", names)
         self.assertIn("write_file", names)
-        self.assertIn("run_command", names)
+        self.assertNotIn("run_command", names)
+        self.assertNotIn("git_status", names)
 
     def test_targeted_repair_inspect_phase_exposes_read_file(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -891,8 +1164,10 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(state.targeted_repair_phase, "inspect_allowed")
         self.assertIn("read_file", names)
-        self.assertIn("search", names)
+        self.assertNotIn("search", names)
         self.assertNotIn("web_search", names)
+        self.assertIn("write_file", names)
+        self.assertNotIn("run_command", names)
 
     def test_targeted_repair_wrong_target_edit_is_rejected(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -958,7 +1233,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
 
         self.assertEqual(state.targeted_repair_phase, "edit_forced")
-        self.assertEqual(set(names), {"write_file", "apply_patch", "run_command", "git_status", "git_diff"})
+        self.assertEqual(set(names), {"write_file", "apply_patch"})
 
     def test_latest_failed_required_command_finds_classifiable_failure(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -1012,7 +1287,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertIsNone(latest_failed_required_command(state))
 
-    async def test_agent_loop_rejects_tool_calls_after_final_ready(self) -> None:
+    async def test_agent_loop_auto_finalizes_tool_calls_after_final_ready(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
             job = await repo.create_job(
@@ -1037,15 +1312,47 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             result = await loop.run(job)
 
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
-            self.assertEqual(result.result_summary, "Updated README after final-ready tool rejection.")
-            self.assertTrue(llm.observed_final_ready_feedback)
+            self.assertEqual(result.result_summary, "Completed the requested changes in README.md.")
             self.assertEqual(tools.call_count, 2)
             steps = await repo.list_steps(job.id)
             rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
-            self.assertEqual(rejected[0].content["reason"], "final_ready_tool_forbidden")
-            self.assertEqual(rejected[0].content["workflow_state"]["phase"], "FINAL_READY")
+            self.assertEqual(rejected, [])
+            auto = [step for step in steps if step.content.get("type") == "auto_final_candidate"]
+            self.assertEqual(auto[0].content["reason"], "final_ready_tool_auto_finalized")
+            self.assertEqual(auto[0].content["workflow_state"]["phase"], "FINAL_READY")
             tool_calls = [step for step in steps if step.content.get("type") == "tool_call"]
             self.assertEqual([step.content["args"].get("command") for step in tool_calls if step.content["tool"] == "run_command"], ["echo checked"])
+
+    async def test_agent_loop_auto_finalizes_bad_llm_json_after_final_ready(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="u1",
+                    instruction="Update README.md.\nverify with: echo checked",
+                )
+            )
+            tools = FakeTools()
+
+            loop = CodingAgentLoop(
+                llm=FinalReadyMalformedLLM(),
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(result.result_summary, "Completed the requested changes in README.md.")
+            self.assertEqual(tools.call_count, 2)
+            steps = await repo.list_steps(job.id)
+            auto = [step for step in steps if step.content.get("type") == "auto_final_candidate"]
+            self.assertEqual(auto[0].content["reason"], "final_ready_llm_decision_failed")
+            self.assertIn("Expecting value", auto[0].content["detail"])
 
     async def test_agent_loop_repairs_after_independent_reviewer_blocks(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1077,7 +1384,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             review_steps = [step for step in steps if step.content.get("type") == "independent_review"]
             self.assertEqual([step.content["passed"] for step in review_steps], [False, True])
             verifier_steps = [step for step in steps if step.kind == "verifier"]
-            self.assertEqual(len(verifier_steps), 1)
+            self.assertEqual(len(verifier_steps), 2)
 
     async def test_agent_loop_targeted_repair_blocks_search_and_requires_rerun(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1108,7 +1415,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(result.result_summary, "Fixed crawler export after targeted repair.")
             self.assertTrue(llm.observed_targeted_feedback)
             self.assertTrue(llm.observed_rerun_feedback)
-            self.assertEqual(tools.call_count, 4)
+            self.assertEqual(tools.call_count, 5)
             steps = await repo.list_steps(job.id)
             repair_steps = [step for step in steps if step.content.get("type") == "repair_action"]
             self.assertEqual(repair_steps[0].content["repair_action"]["category"], "import_error_missing_symbol")

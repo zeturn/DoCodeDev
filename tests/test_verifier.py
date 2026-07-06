@@ -577,6 +577,18 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertFalse(requires_json_output_check("Implement client.parse_items_response so it extracts item names from a JSON API response."))
         self.assertTrue(requires_json_output_check("Build a crawler that writes data/output.json with at least 2 records."))
 
+    def test_apicred_literal_text_does_not_require_external_source_verification(self) -> None:
+        plan = build_verification_plan("Create DOCODE_DEEPSEEK_RESULT.md containing exactly: DeepSeek via APICred works.")
+
+        self.assertFalse(plan.require_external_source_verified)
+        self.assertNotIn("api_contract_or_mock", plan.required_commands)
+
+    def test_api_adapter_still_requires_external_source_verification(self) -> None:
+        plan = build_verification_plan("add API adapter for external endpoint")
+
+        self.assertTrue(plan.require_external_source_verified)
+        self.assertIn("api_contract_or_mock", plan.required_commands)
+
     def test_fixtures_path_does_not_trigger_bugfix_test_requirement(self) -> None:
         plan = build_verification_plan("Build a crawler that parses fixtures/source.html and writes data/output.json.")
 

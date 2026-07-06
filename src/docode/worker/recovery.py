@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from docode.storage.models import JobStatus
+from datetime import timedelta
+
+from docode.storage.models import JobStatus, utcnow
 from docode.storage.repository import JobRepository
 
 
@@ -30,6 +32,33 @@ async def recover_interrupted_jobs(repository: JobRepository) -> list[str]:
             job.id,
             "system",
             {"type": "worker_recovered_stopped_finalization", "previous_status": job.status.value},
+        )
+        recovered.append(job.id)
+    return recovered
+
+
+async def recover_stale_active_jobs(repository: JobRepository, stale_after_seconds: int) -> list[str]:
+    if stale_after_seconds <= 0:
+        return []
+    recovered: list[str] = []
+    active_jobs = await repository.list_jobs(INTERRUPTED_STATUSES)
+    if not active_jobs:
+        return recovered
+    now = utcnow()
+    threshold = timedelta(seconds=stale_after_seconds)
+    for job in active_jobs:
+        if now - job.updated_at < threshold:
+            continue
+        await repository.update_job(job.id, status=JobStatus.QUEUED)
+        await repository.add_step(
+            job.id,
+            "system",
+            {
+                "type": "worker_recovered_stale_job",
+                "previous_status": job.status.value,
+                "stale_after_seconds": stale_after_seconds,
+                "last_updated_at": job.updated_at.isoformat(),
+            },
         )
         recovered.append(job.id)
     return recovered

@@ -97,6 +97,9 @@ class InMemoryJobRepository(JobRepository):
                 content=dict(content),
             )
             self._steps[job_id].append(step)
+            job = self._jobs.get(job_id)
+            if job is not None:
+                self._jobs[job_id] = replace(job, updated_at=utcnow())
             return step
 
     async def list_steps(self, job_id: str) -> list[DocodeStep]:
@@ -117,6 +120,9 @@ class InMemoryJobRepository(JobRepository):
                 size_bytes=size_bytes,
             )
             self._artifacts.setdefault(job_id, []).append(artifact)
+            job = self._jobs.get(job_id)
+            if job is not None:
+                self._jobs[job_id] = replace(job, updated_at=utcnow())
             return artifact
 
     async def get_artifact(self, artifact_id: str) -> DocodeArtifact | None:

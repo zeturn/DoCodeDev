@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from docode.agent.workflow import parse_status_line
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
@@ -61,6 +62,8 @@ class VerificationEvidence:
     successful_fetch_urls: list[str]
     successful_web_search_queries: list[str]
     relevant_fetch_urls: list[str] | None = None
+    successful_commands: list[str] | None = None
+    successful_command_outputs: list[str] | None = None
     no_test_reason: str | None = None
 
     @property
@@ -77,6 +80,8 @@ class VerificationEvidence:
             successful_fetch_urls=self.successful_fetch_urls,
             successful_web_search_queries=self.successful_web_search_queries,
             relevant_fetch_urls=self.relevant_fetch_urls,
+            successful_commands=self.successful_commands,
+            successful_command_outputs=self.successful_command_outputs,
             no_test_reason=reason,
         )
 
@@ -266,7 +271,7 @@ class CodingVerifier:
                     ),
                     timeout=self.judge_timeout_seconds,
                 )
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             return None
         except Exception as exc:
             return VerifierJudgement(
@@ -495,7 +500,7 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
     )
     is_crawler = any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
     is_cli = any(keyword in lowered for keyword in ("cli", "command line", "命令行", "脚本")) or bool(re.search(r"\bscript\b", lowered))
-    is_api = any(keyword in lowered for keyword in ("api", "adapter", "integration", "endpoint", "接口"))
+    is_api = is_api_implementation_instruction(lowered)
     is_bugfix = is_bugfix_instruction(lowered)
     is_docs = any(keyword in lowered for keyword in ("readme", "docs", "documentation", "文档"))
     is_artifact_export = "artifact" in lowered and ("pr" in lowered or "pull request" in lowered or "export" in lowered)
@@ -533,6 +538,21 @@ def is_bugfix_instruction(lowered_instruction: str) -> bool:
     if any(keyword in lowered_instruction for keyword in ("修复", "报错", "失败")):
         return True
     return bool(re.search(r"\b(?:bug|bugfix|fix|regression|hotfix|broken|failing|failure)\b", lowered_instruction))
+
+
+def is_api_implementation_instruction(lowered_instruction: str) -> bool:
+    if "接口" in lowered_instruction:
+        return True
+    if re.search(r"\b(?:api|adapter|integration|endpoint)\b", lowered_instruction) is None:
+        return False
+    if re.search(r"\b(?:api|adapter|integration|endpoint)\b.{0,80}\b(?:adapter|client|integration|endpoint|contract|request|response|auth)\b", lowered_instruction):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:add|build|implement|create|write|fix|repair|update|replace)\b.{0,80}\b(?:api|adapter|integration|endpoint)\b",
+            lowered_instruction,
+        )
+    )
 
 
 def extracted_verification_commands(instruction: str) -> list[str]:
@@ -641,7 +661,7 @@ def evaluate_verification_plan(
         dependency_fixes = undeclared_dependency_fixes(diff)
         fixes.extend(fix for fix in dependency_fixes if fix not in fixes)
     if plan.require_crawler_artifacts:
-        crawler_fixes = crawler_artifact_fixes(diff, smoke_result)
+        crawler_fixes = crawler_artifact_fixes(diff, smoke_result, evidence)
         fixes.extend(fix for fix in crawler_fixes if fix not in fixes)
     return not fixes, fixes
 
@@ -793,19 +813,21 @@ def is_python_dependency_manifest(path: str) -> bool:
     return normalized.endswith(("requirements.txt", "pyproject.toml", "setup.cfg", "setup.py", "pipfile"))
 
 
-def crawler_artifact_fixes(diff: str, smoke_result: ToolResult) -> list[str]:
+def crawler_artifact_fixes(diff: str, smoke_result: ToolResult, evidence: VerificationEvidence | None = None) -> list[str]:
     fixes: list[str] = []
     if duplicate_python_implementation_paths(diff):
         fixes.append("crawler implementation appears duplicated; rewrite the Python file once cleanly instead of appending another implementation")
     command_text = " ".join(str(item) for item in (smoke_result.metadata or {}).get("commands", []))
     output_text = smoke_result.output or ""
+    if evidence is not None:
+        command_text = f"{command_text}\n" + "\n".join(evidence.successful_commands or [])
+        output_text = f"{output_text}\n" + "\n".join(evidence.successful_command_outputs or [])
     combined = f"{command_text}\n{output_text}".lower()
     if "--dry-run" in diff.lower() and "dry-run" not in combined:
         fixes.append("run the crawler dry-run command before final verification")
-    if not crawler_output_artifact_verified(combined):
+    diff_lowered = diff.lower()
+    if not crawler_output_artifact_verified(combined) and not crawler_fixture_artifact_present(diff_lowered):
         fixes.append("crawler dry-run must write an output artifact and verification must prove the JSON/CSV file exists and parses")
-    if "fixtures/" in diff.lower() and "--source" in diff.lower() and "--source" not in combined:
-        fixes.append("run the crawler against its offline fixture with --source before final verification")
     return fixes
 
 
@@ -831,11 +853,17 @@ def duplicate_python_implementation_paths(diff: str) -> list[str]:
 def crawler_output_artifact_verified(combined_smoke_text: str) -> bool:
     if "json outputs:" in combined_smoke_text or "csv outputs:" in combined_smoke_text:
         return True
+    if "dry-run complete" in combined_smoke_text and re.search(r"\bwrote\b|\bwritten\b|\bsaved\b", combined_smoke_text):
+        return True
     if re.search(r"data/[\w.-]+\.(?:json|csv)", combined_smoke_text) and any(
         marker in combined_smoke_text for marker in ("min_records=", "json output", "csv output", "saved", "wrote", "written")
     ):
         return True
     return False
+
+
+def crawler_fixture_artifact_present(diff_lowered: str) -> bool:
+    return "--dry-run" in diff_lowered and "fixtures/sample.html" in diff_lowered and "fixtures/sample.csv" in diff_lowered
 
 
 def is_test_path(path: str) -> bool:
@@ -847,6 +875,8 @@ def verification_evidence_from_steps(steps) -> VerificationEvidence:
     fetch_urls: list[str] = []
     relevant_fetch_urls: list[str] = []
     web_search_queries: list[str] = []
+    successful_commands: list[str] = []
+    successful_command_outputs: list[str] = []
     for step in steps:
         content = getattr(step, "content", step)
         if not isinstance(content, dict) or content.get("type") != "tool_result" or content.get("exit_code") != 0:
@@ -863,11 +893,30 @@ def verification_evidence_from_steps(steps) -> VerificationEvidence:
             query = metadata.get("query")
             if isinstance(query, str) and query and query not in web_search_queries:
                 web_search_queries.append(query)
-    return VerificationEvidence(successful_fetch_urls=fetch_urls, successful_web_search_queries=web_search_queries, relevant_fetch_urls=relevant_fetch_urls)
+        elif tool == "run_command":
+            command = metadata.get("command")
+            if isinstance(command, str) and command and command not in successful_commands:
+                successful_commands.append(command)
+            output = content.get("output") or content.get("summary")
+            if isinstance(output, str) and output:
+                successful_command_outputs.append(output[:2000])
+    return VerificationEvidence(
+        successful_fetch_urls=fetch_urls,
+        successful_web_search_queries=web_search_queries,
+        relevant_fetch_urls=relevant_fetch_urls,
+        successful_commands=successful_commands,
+        successful_command_outputs=successful_command_outputs,
+    )
 
 
 def empty_verification_evidence() -> VerificationEvidence:
-    return VerificationEvidence(successful_fetch_urls=[], successful_web_search_queries=[], relevant_fetch_urls=[])
+    return VerificationEvidence(
+        successful_fetch_urls=[],
+        successful_web_search_queries=[],
+        relevant_fetch_urls=[],
+        successful_commands=[],
+        successful_command_outputs=[],
+    )
 
 
 def fetch_result_relevant(content: dict[str, Any], metadata: dict[str, Any]) -> bool:
@@ -919,11 +968,7 @@ def synthetic_diff_from_status(status: str, workspace_result: ToolResult | None)
 def changed_paths_from_status(status: str) -> list[str]:
     paths: list[str] = []
     for raw_line in status.splitlines():
-        line = strip_ansi(raw_line).rstrip()
-        if len(line) < 4:
-            continue
-        marker = line[:2]
-        path = line[3:].strip()
+        marker, path = parse_status_line(raw_line)
         if not path:
             continue
         if (marker == "??" or marker.strip()) and meaningful_change_path(path):

@@ -15,9 +15,12 @@ class SQLiteJobRepository(JobRepository):
         self.db_path = str(db_path)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._lock = asyncio.Lock()
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA busy_timeout=30000;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._migrate()
 
     def _migrate(self) -> None:
@@ -194,6 +197,10 @@ class SQLiteJobRepository(JobRepository):
                 "INSERT INTO docode_steps (id, job_id, step_index, kind, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 step_to_row(step),
             )
+            self._conn.execute(
+                "UPDATE docode_jobs SET updated_at = ? WHERE id = ?",
+                (iso(utcnow()), job_id),
+            )
             self._conn.commit()
             return step
 
@@ -219,6 +226,10 @@ class SQLiteJobRepository(JobRepository):
             self._conn.execute(
                 "INSERT INTO docode_artifacts (id, job_id, kind, path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 artifact_to_row(artifact),
+            )
+            self._conn.execute(
+                "UPDATE docode_jobs SET updated_at = ? WHERE id = ?",
+                (iso(utcnow()), job_id),
             )
             self._conn.commit()
             return artifact

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 from docode.agent.inspector import ProjectInspection
 from docode.agent.stuck import git_status_clean
 from docode.agent.task_contract import TaskContract
+from docode.agent.workflow import parse_status_line
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
 
@@ -27,13 +30,12 @@ class ContextPack:
             ("Working Memory", self.working_memory),
             ("File Memory", self.file_memory),
             ("Latest Evidence", self.latest_evidence),
-            ("Recent Messages", json.dumps(self.recent_messages, ensure_ascii=False, indent=2)),
         ]
         return "\n\n".join(f"## {title}\n{body}".rstrip() for title, body in sections if body)
 
 
 class ContextManager:
-    def __init__(self, *, recent_message_limit: int = 8, section_bytes: int = 12_000) -> None:
+    def __init__(self, *, recent_message_limit: int = 3, section_bytes: int = 2_000) -> None:
         self.recent_message_limit = recent_message_limit
         self.section_bytes = section_bytes
 
@@ -52,7 +54,11 @@ class ContextManager:
         repair_mode: str | None = None,
         active_repair_action: dict[str, Any] | None = None,
         targeted_repair_phase: str | None = None,
+        workflow_phase: str | None = None,
     ) -> ContextPack:
+        compact_mode = workflow_phase in {"EDIT_REQUIRED", "TEST_REQUIRED", "FINAL_READY"}
+        section_bytes = 1_200 if compact_mode else self.section_bytes
+        recent_message_limit = 2 if compact_mode else self.recent_message_limit
         task_contract_text = self.task_contract(
             job,
             task_contract=task_contract,
@@ -77,13 +83,16 @@ class ContextManager:
             active_repair_action=active_repair_action,
             targeted_repair_phase=targeted_repair_phase,
         )
-        recent_messages = [compact_message(message) for message in messages[-self.recent_message_limit :]]
+        recent_messages = [
+            compact_message(message, content_limit=500 if compact_mode else 1200)
+            for message in messages[-recent_message_limit:]
+        ]
         return ContextPack(
-            task_contract=clip_text(task_contract_text, self.section_bytes),
-            repo_map=clip_text(repo_map, self.section_bytes),
-            working_memory=clip_text(working_memory, self.section_bytes),
-            file_memory=clip_text(file_memory, self.section_bytes),
-            latest_evidence=clip_text(latest_evidence, self.section_bytes),
+            task_contract=clip_text(task_contract_text, 1_600 if compact_mode else section_bytes),
+            repo_map=clip_text(repo_map, 700 if compact_mode else section_bytes),
+            working_memory=clip_text(working_memory, 900 if compact_mode else section_bytes),
+            file_memory=clip_text(file_memory, 700 if compact_mode else section_bytes),
+            latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else section_bytes),
             recent_messages=recent_messages,
         )
 
@@ -115,6 +124,16 @@ class ContextManager:
             if is_crawler_instruction(job.instruction):
                 mandatory.extend(crawler_contract_requirements())
             parts.append("Mandatory:\n" + "\n".join(f"- {item}" for item in mandatory))
+        source_urls = instruction_source_urls(job.instruction)
+        if source_urls:
+            domains = [urlparse(url).netloc for url in source_urls if urlparse(url).netloc]
+            parts.append(
+                "Source Guidance:\n"
+                + "\n".join(f"- preferred_source_url: {url}" for url in source_urls[:5])
+                + ("\n" + "\n".join(f"- preferred_source_domain: {domain}" for domain in domains[:5]) if domains else "")
+                + "\n- First inspect these sources with fetch_url before broadening to web_search."
+                + "\n- If web_search becomes necessary, keep queries anchored to these URLs/domains and the requested target."
+            )
         if repair_mode:
             parts.append(
                 "Repair Mode:\n"
@@ -238,19 +257,28 @@ def summarize_feedback(messages: list[dict[str, Any]]) -> str:
     return "\n".join(feedback[-8:])
 
 
-def compact_message(message: dict[str, Any]) -> dict[str, Any]:
+def compact_message(message: dict[str, Any], *, content_limit: int = 1200) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for key in ("role", "kind", "tool", "exit_code", "truncated"):
         if key in message:
             compact[key] = message[key]
     if "content" in message:
-        compact["content"] = clip_text(str(message["content"]), 1200)
+        compact["content"] = clip_text(str(message["content"]), content_limit)
     if "output" in message:
-        compact["output"] = clip_text(str(message["output"]), 1200)
+        compact["output"] = clip_text(str(message["output"]), content_limit)
     metadata = message.get("metadata")
     if isinstance(metadata, dict):
         compact["metadata"] = compact_metadata(metadata)
     return compact
+
+
+def instruction_source_urls(instruction: str) -> list[str]:
+    urls: list[str] = []
+    for match in re.findall(r"https?://[^\s'\"`)>]+", instruction or "", flags=re.IGNORECASE):
+        cleaned = match.rstrip(".,;:")
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+    return urls
 
 
 def tool_evidence(message: dict[str, Any], *, output_limit: int = 900) -> str:
@@ -316,11 +344,14 @@ def touched_paths(messages: list[dict[str, Any]]) -> set[str]:
 def changed_files_from_status(output: str) -> list[str]:
     files: list[str] = []
     for line in output.splitlines():
-        if not line.strip():
+        _, path = parse_status_line(line)
+        if not path:
             continue
-        path = line[3:].strip() if len(line) > 3 else line.strip()
         if " -> " in path:
             path = path.rsplit(" -> ", 1)[-1].strip()
+        normalized = path.replace("\\", "/")
+        if normalized in {".docode_probe", ".docode_probe_api"} or normalized.startswith(".docode_probe") or normalized.startswith(".git/"):
+            continue
         if path and path not in files:
             files.append(path)
     return files
@@ -354,3 +385,7 @@ def clip_text(text: str, limit: int) -> str:
     if len(encoded) <= limit:
         return text
     return encoded[:limit].decode("utf-8", errors="replace") + "\n<truncated>"
+
+
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", value)

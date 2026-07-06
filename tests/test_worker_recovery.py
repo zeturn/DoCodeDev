@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest import IsolatedAsyncioTestCase
 
-from docode.storage.models import CodingJob, JobStatus, new_id
+from docode.storage.models import CodingJob, JobStatus, new_id, utcnow
 from docode.storage.repository import InMemoryJobRepository
-from docode.worker.recovery import recover_interrupted_jobs
+from docode.worker.recovery import recover_interrupted_jobs, recover_stale_active_jobs
 
 
 class WorkerRecoveryTests(IsolatedAsyncioTestCase):
@@ -71,3 +72,32 @@ class WorkerRecoveryTests(IsolatedAsyncioTestCase):
         stopped_steps = await repo.list_steps(stopped_pending.id)
         self.assertEqual(stopped_steps[0].content["type"], "worker_recovered_stopped_finalization")
         self.assertEqual(stopped_steps[0].content["previous_status"], "stopped")
+
+    async def test_requeues_stale_active_jobs_without_process_restart(self) -> None:
+        repo = InMemoryJobRepository()
+        stale = await repo.create_job(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="stale running",
+                status=JobStatus.RUNNING,
+                updated_at=utcnow() - timedelta(seconds=180),
+            )
+        )
+        fresh = await repo.create_job(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="fresh running",
+                status=JobStatus.RUNNING,
+            )
+        )
+
+        recovered = await recover_stale_active_jobs(repo, 90)
+
+        self.assertEqual(recovered, [stale.id])
+        self.assertEqual((await repo.get_job(stale.id)).status, JobStatus.QUEUED)
+        self.assertEqual((await repo.get_job(fresh.id)).status, JobStatus.RUNNING)
+        stale_steps = await repo.list_steps(stale.id)
+        self.assertEqual(stale_steps[0].content["type"], "worker_recovered_stale_job")
+        self.assertEqual(stale_steps[0].content["previous_status"], "running")

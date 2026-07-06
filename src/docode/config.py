@@ -33,6 +33,8 @@ class DocodeConfig:
     max_tool_calls: int = 100
     max_llm_tokens: int = 100_000
     max_llm_cost: float | None = None
+    llm_decision_timeout_seconds: float = 45.0
+    stale_job_requeue_seconds: int = 90
     command_timeout_seconds: int = 120
     output_limit_bytes: int = 1_000_000
     sandbox_retention: str = "keep"
@@ -41,6 +43,7 @@ class DocodeConfig:
     github_base_branch: str = "main"
     github_work_dir: Path = Path(".docode/github")
     web_tools_enabled: bool = True
+    direct_openai_enabled: bool = False
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_search_model: str = "gpt-4o-mini"
@@ -76,6 +79,8 @@ def load_config() -> DocodeConfig:
         max_tool_calls=int(os.getenv("DOCODE_MAX_TOOL_CALLS", "100")),
         max_llm_tokens=int(os.getenv("DOCODE_MAX_LLM_TOKENS", "100000")),
         max_llm_cost=float(os.environ["DOCODE_MAX_LLM_COST"]) if os.getenv("DOCODE_MAX_LLM_COST") else None,
+        llm_decision_timeout_seconds=float(os.getenv("DOCODE_LLM_DECISION_TIMEOUT_SECONDS", "45")),
+        stale_job_requeue_seconds=int(os.getenv("DOCODE_STALE_JOB_REQUEUE_SECONDS", "90")),
         command_timeout_seconds=int(os.getenv("DOCODE_COMMAND_TIMEOUT_SECONDS", "120")),
         output_limit_bytes=int(os.getenv("DOCODE_OUTPUT_LIMIT_BYTES", "1000000")),
         sandbox_retention=os.getenv("DOCODE_SANDBOX_RETENTION", "keep"),
@@ -84,6 +89,7 @@ def load_config() -> DocodeConfig:
         github_base_branch=os.getenv("DOCODE_GITHUB_BASE_BRANCH", "main"),
         github_work_dir=Path(os.getenv("DOCODE_GITHUB_WORK_DIR", ".docode/github")),
         web_tools_enabled=os.getenv("DOCODE_WEB_TOOLS_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        direct_openai_enabled=os.getenv("DOCODE_DIRECT_OPENAI_ENABLED", "").lower() in {"1", "true", "yes", "on"},
         openai_api_key=os.getenv("DOCODE_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")),
         openai_base_url=os.getenv("DOCODE_OPENAI_BASE_URL", "https://api.openai.com/v1"),
         openai_search_model=os.getenv("DOCODE_OPENAI_SEARCH_MODEL", "gpt-4o-mini"),

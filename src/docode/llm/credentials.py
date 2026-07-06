@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import random
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,12 +26,24 @@ class RuntimeAuthorization:
 class APICredCredentialResolver:
     """Resolve provider credentials through APICred without persisting keys."""
 
-    def __init__(self, base_url: str, access_token: str = "", mode: str = "auto") -> None:
+    def __init__(
+        self,
+        base_url: str,
+        access_token: str = "",
+        mode: str = "auto",
+        local_credentials: dict[str, ProviderCredential] | None = None,
+        *,
+        retry_attempts: int = 5,
+        retry_delays: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0),
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.access_token = access_token
         self.mode = normalize_apicred_mode(mode)
         self.proxy_active = self.mode == "proxy"
         self.calls: list[dict[str, Any]] = []
+        self.local_credentials = dict(local_credentials or {})
+        self.retry_attempts = max(1, retry_attempts)
+        self.retry_delays = retry_delays
 
     def use_access_token(self, access_token: str | None) -> None:
         if access_token:
@@ -50,6 +64,9 @@ class APICredCredentialResolver:
         sandbox_network_mode: str | None = None,
         artifact_mode: str | None = None,
     ) -> RuntimeAuthorization:
+        local = self._local_credential(provider)
+        if local is not None:
+            return RuntimeAuthorization(allowed=True, reason=f"local_direct_credential:{provider}", raw={"provider": provider, "model": model})
         payload: dict[str, object] = {
             "user_id": user_id,
             "provider": provider,
@@ -90,6 +107,9 @@ class APICredCredentialResolver:
         )
 
     async def resolve(self, *, user_id: str, provider: str, model: str) -> ProviderCredential:
+        local = self._local_credential(provider, model=model)
+        if local is not None:
+            return local
         if self.proxy_active:
             return self._proxy_credential(provider=provider, model=model)
 
@@ -112,6 +132,13 @@ class APICredCredentialResolver:
             api_key=data.get("api_key") or data.get("token") or None,
             base_url=data.get("base_url"),
         )
+
+    def _local_credential(self, provider: str, model: str | None = None) -> ProviderCredential | None:
+        credential = self.local_credentials.get(provider)
+        if credential is None:
+            return None
+        resolved_model = model or credential.model
+        return ProviderCredential(provider=credential.provider, model=resolved_model, api_key=credential.api_key, base_url=credential.base_url)
 
     async def list_providers(self, *, user_id: str | None = None) -> dict[str, list[str]]:
         if self.proxy_active:
@@ -159,11 +186,7 @@ class APICredCredentialResolver:
         headers = {"Accept": "application/json"}
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(f"{self.base_url}{path}", json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return data if isinstance(data, dict) else {"data": data}
+        return await self._request_json("POST", path, json=payload, headers=headers)
 
     def _proxy_authorization(self, raw: dict[str, Any] | None = None) -> RuntimeAuthorization:
         return RuntimeAuthorization(allowed=True, reason="apicred_proxy_chat_completions", raw=raw)
@@ -179,11 +202,42 @@ class APICredCredentialResolver:
         headers = {"Accept": "application/json"}
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(f"{self.base_url}{path}", params=clean_params, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return data if isinstance(data, dict) else {"data": data}
+        return await self._request_json("GET", path, params=clean_params, headers=headers)
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, object] | None = None,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        import httpx
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    response = await client.request(
+                        method,
+                        f"{self.base_url}{path}",
+                        json=json,
+                        params=params,
+                        headers=headers,
+                    )
+                response.raise_for_status()
+                data = response.json()
+                return data if isinstance(data, dict) else {"data": data}
+            except Exception as exc:
+                last_exc = exc
+                if not is_retryable_apicred_exception(exc) or attempt >= self.retry_attempts:
+                    raise
+                delay = retry_delay_with_jitter(self.retry_delays, attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
 
 def parse_provider_catalog(data: dict[str, object]) -> dict[str, list[str]]:
@@ -243,3 +297,33 @@ def normalize_apicred_mode(value: str | None) -> str:
 def is_missing_runtime_endpoint(exc: Exception) -> bool:
     status_code = getattr(getattr(exc, "response", None), "status_code", None)
     return status_code in {404, 405}
+
+
+def is_retryable_apicred_exception(exc: Exception) -> bool:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).lower()
+    return any(
+        fragment in text
+        for fragment in (
+            "timeout",
+            "timed out",
+            "connection refused",
+            "connection reset",
+            "server disconnected",
+            "temporary failure",
+            "bad gateway",
+            "service unavailable",
+            "too many requests",
+        )
+    )
+
+
+def retry_delay_with_jitter(retry_delays: tuple[float, ...], attempt: int) -> float:
+    if not retry_delays:
+        return 0.0
+    base = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+    if base <= 0:
+        return 0.0
+    return base + random.uniform(0.0, min(1.0, base * 0.2))

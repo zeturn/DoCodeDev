@@ -214,7 +214,7 @@ class DoBoxTools:
             f"git apply --check {patch_path} && "
             f"git apply {patch_path} && "
             f"rm -f {patch_path} && "
-            "git diff --stat && git diff -- "
+            "git --no-pager diff --stat && git --no-pager diff -- "
         )
         result = await self.run_command(command, "/workspace")
         if result.exit_code != 0:

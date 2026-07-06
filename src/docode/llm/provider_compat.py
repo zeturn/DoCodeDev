@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -74,6 +75,8 @@ class OpenAICompatibleChatClient:
 
 
 def build_provider_client(provider: str, api_key: str | None, base_url: str | None) -> Any:
+    if base_url and provider.lower() in {"openai", "openai-compatible", "apicred", "deepseek", "qwen", "zhipu"}:
+        return OpenAICompatibleChatClient(api_key=api_key, base_url=base_url)
     kwargs: dict[str, str] = {}
     if api_key:
         kwargs["api_key"] = api_key
@@ -94,8 +97,8 @@ async def call_provider(
     prompt: str,
     model: str,
     *,
-    max_attempts: int = 3,
-    retry_delays: tuple[float, ...] = (1.0, 2.0),
+    max_attempts: int = 5,
+    retry_delays: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0),
 ) -> ProviderCallResult:
     attempts = max(1, max_attempts)
     last_info: ProviderErrorInfo | None = None
@@ -112,6 +115,8 @@ async def call_provider(
             if not info.retryable or attempt >= attempts:
                 raise ProviderUnavailableError(info, attempts=attempt, cause=exc) from exc
             delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)] if retry_delays else 0.0
+            if delay > 0:
+                delay += retry_jitter(delay)
             if delay > 0:
                 await asyncio.sleep(delay)
     assert last_info is not None and last_exc is not None
@@ -401,3 +406,9 @@ def float_or_none(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def retry_jitter(delay: float) -> float:
+    if delay <= 0:
+        return 0.0
+    return random.uniform(0.0, min(1.0, delay * 0.2))

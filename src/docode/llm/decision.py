@@ -61,7 +61,7 @@ WeavDecisionLLM = DoCodeDecisionAdapter
 
 def parse_decision(raw: str) -> AgentDecision:
     data = parse_json_object(raw)
-    decision_type = str(data.get("type", ""))
+    decision_type = str(data.get("type") or data.get("action") or "").strip()
     if decision_type == "tool_call":
         return AgentDecision(type="tool_call", tool_name=str(data["tool_name"]), args=dict(data.get("args") or {}))
     if decision_type == "final_candidate":
@@ -76,8 +76,22 @@ def parse_decision(raw: str) -> AgentDecision:
             no_test_reason=str(no_test_reason) if no_test_reason else None,
             remaining_risks=[str(risk) for risk in risks if str(risk)],
         )
+    if decision_type == "tool":
+        tool = data.get("tool")
+        if isinstance(tool, dict):
+            tool_name = str(tool.get("tool_name") or tool.get("name") or "")
+            if tool_name:
+                return AgentDecision(type="tool_call", tool_name=tool_name, args=dict(tool.get("input") or tool.get("args") or {}))
+        tool_name = str(data.get("tool_name") or data.get("name") or "")
+        if tool_name:
+            return AgentDecision(type="tool_call", tool_name=tool_name, args=dict(data.get("input") or data.get("args") or {}))
     if decision_type and isinstance(data.get("args"), dict):
         return AgentDecision(type="tool_call", tool_name=decision_type, args=dict(data.get("args") or {}))
+    if isinstance(data.get("tool"), dict):
+        tool = data["tool"]
+        tool_name = str(tool.get("tool_name") or tool.get("name") or "")
+        if tool_name:
+            return AgentDecision(type="tool_call", tool_name=tool_name, args=dict(tool.get("input") or tool.get("args") or {}))
     raise ValueError(f"unsupported decision type: {decision_type}")
 
 

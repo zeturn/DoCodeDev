@@ -101,6 +101,53 @@ class APICredSessionVerifier:
             return data if isinstance(data, dict) else {"data": data}
 
 
+class BasaltPassSessionVerifier:
+    def __init__(self, base_url: str, client_id: str, client_secret: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.calls: list[dict[str, Any]] = []
+
+    async def verify(
+        self,
+        *,
+        authorization: str | None,
+        forwarded_user_id: str | None,
+        forwarded_tenant: str | None,
+    ) -> AuthVerification:
+        token = bearer_token(authorization)
+        if not token:
+            return AuthVerification(allowed=False, reason="token_missing")
+        data = await self._introspect(token)
+        allowed = bool(data.get("active"))
+        client_id = str(data.get("client_id") or "")
+        audience = str(data.get("aud") or "")
+        if allowed and self.client_id and self.client_id not in {client_id, audience}:
+            return AuthVerification(allowed=False, reason="token_invalid")
+        return AuthVerification(
+            allowed=allowed,
+            user_id=str(data.get("sub") or forwarded_user_id or "") or None,
+            tenant=str(data.get("tenant_id") or data.get("tenant") or forwarded_tenant or "") or None,
+            reason="" if allowed else "token_invalid",
+            raw=data,
+        )
+
+    async def _introspect(self, token: str) -> dict[str, Any]:
+        import httpx
+
+        self.calls.append({"method": "POST", "path": "/api/v1/oauth/introspect", "token": redact_authorization(token)})
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"{self.base_url}/api/v1/oauth/introspect",
+                data={"token": token},
+                auth=(self.client_id, self.client_secret),
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, dict) else {"data": data}
+
+
 class UserContextDependency:
     def __init__(self, *, auth_required: bool, verifier: SessionVerifier | None = None) -> None:
         self.auth_required = auth_required
@@ -170,6 +217,8 @@ async def get_user_context(
 
 
 def make_user_context_dependency(config: DocodeConfig, verifier: SessionVerifier | None = None):
+    if verifier is None and config.basaltpass_enabled:
+        verifier = BasaltPassSessionVerifier(config.basaltpass_base_url, config.basaltpass_client_id, config.basaltpass_client_secret)
     dependency = UserContextDependency(
         auth_required=config.auth_required,
         verifier=verifier or APICredSessionVerifier(config.apicred_base_url, config.apicred_token),

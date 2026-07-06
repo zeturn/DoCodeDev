@@ -200,17 +200,22 @@ def detect_duplicate_python_implementations(diff: str) -> list[QualityIssue]:
 
 
 def detect_placeholder_code(diff: str) -> list[QualityIssue]:
-    lowered = diff.lower()
-    for marker in ("todo", "placeholder", "not implemented", "stub", "pass  #", "raise notimplementederror"):
-        if marker in lowered:
-            return [
-                QualityIssue(
-                    severity="blocker",
-                    code="placeholder_left_in_diff",
-                    message=f"Diff still contains placeholder marker: {marker}",
-                    repair_hint="Replace placeholder/stub code with a real implementation before verification.",
-                )
-            ]
+    code_suffixes = (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".cs")
+    for path, file_diff in split_diff_by_file(diff).items():
+        if not path.endswith(code_suffixes):
+            continue
+        lowered = file_diff.lower()
+        for marker in ("todo", "placeholder", "not implemented", "stub", "pass  #", "raise notimplementederror"):
+            if marker in lowered:
+                return [
+                    QualityIssue(
+                        severity="blocker",
+                        code="placeholder_left_in_diff",
+                        path=path,
+                        message=f"Diff still contains placeholder marker: {marker}",
+                        repair_hint="Replace placeholder/stub code with a real implementation before verification.",
+                    )
+                ]
     return []
 
 
@@ -287,16 +292,20 @@ async def inspect_common_artifacts(
 
 def inferred_json_artifact_paths(instruction: str, task_contract: TaskContract | None, status: str) -> list[str]:
     candidates: list[str] = []
+    config_json = {"manifest.json", "sources.json", "schemas/output.schema.json"}
     for path in task_contract.must_modify_files if task_contract is not None else []:
-        if path.endswith(".json"):
+        normalized = path.strip("./").replace("\\", "/")
+        if normalized.endswith(".json") and normalized not in config_json and not normalized.startswith(("schemas/", "fixtures/")):
             candidates.append(path)
     for path in changed_paths_from_status(status):
         normalized = path.strip().replace("\\", "/")
-        if normalized.endswith(".json"):
+        if normalized.endswith(".json") and normalized.strip("./") not in config_json and not normalized.startswith(("schemas/", "fixtures/")):
             candidates.append(normalized)
     lowered = instruction.lower()
     for path in re.findall(r"\b[\w./-]+\.json\b", instruction):
-        candidates.append(path.strip("./"))
+        normalized = path.strip("./").replace("\\", "/")
+        if normalized not in config_json and not normalized.startswith(("schemas/", "fixtures/")):
+            candidates.append(normalized)
     if ("json" in lowered or "crawler" in lowered or "scraper" in lowered or "爬虫" in lowered) and not candidates:
         candidates.extend(["data/output.json", "output.json"])
     return unique_paths(candidates)
@@ -367,29 +376,31 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
             )
             continue
         for field in required_fields:
-            value = row.get(field)
+            value = github_repository_value(row) if field == "__github_repository__" else row.get(field)
             if value is None or value == "":
+                label = "repository_name/repository/name" if field == "__github_repository__" else field
                 issues.append(
                     QualityIssue(
                         severity="blocker",
                         code="json_required_field_empty",
                         path=path,
-                        message=f"JSON row {index} has empty required field: {field}",
-                        repair_hint=f"Populate {field} with a meaningful non-empty value for every record.",
+                        message=f"JSON row {index} has empty required field: {label}",
+                        repair_hint=f"Populate {label} with a meaningful non-empty value for every record.",
                     )
                 )
             elif isinstance(value, str) and dirty_required_value(value):
+                label = "repository_name/repository/name" if field == "__github_repository__" else field
                 issues.append(
                     QualityIssue(
                         severity="blocker",
                         code="json_required_field_dirty",
                         path=path,
-                        message=f"JSON row {index} has dirty required field {field}: {preview(value)}",
-                        repair_hint=f"Normalize {field}; derive stable identifiers from URLs or structured attributes instead of raw text.",
+                        message=f"JSON row {index} has dirty required field {label}: {preview(value)}",
+                        repair_hint=f"Normalize {label}; derive stable identifiers from URLs or structured attributes instead of raw text.",
                     )
                 )
         url = row.get("url")
-        repository = row.get("repository")
+        repository = github_repository_value(row)
         if "github" in instruction.lower():
             if isinstance(url, str) and not url.startswith("https://github.com/"):
                 issues.append(
@@ -430,10 +441,22 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
 def inferred_required_json_fields(instruction: str) -> list[str]:
     lowered = instruction.lower()
     if "github" in lowered and ("trending" in lowered or "repository" in lowered or "repo" in lowered):
-        return ["repository", "url"]
+        return ["__github_repository__", "url"]
     if "crawler" in lowered or "scraper" in lowered or "爬虫" in lowered:
         return ["url"]
     return []
+
+
+def github_repository_value(row: dict[str, Any]) -> Any:
+    for key in ("repository_name", "repository", "name"):
+        value = row.get(key)
+        if value not in {None, ""}:
+            return value
+    owner = row.get("owner")
+    name = row.get("repo") or row.get("project")
+    if owner and name:
+        return f"{owner}/{name}"
+    return None
 
 
 def dirty_required_value(value: str) -> bool:

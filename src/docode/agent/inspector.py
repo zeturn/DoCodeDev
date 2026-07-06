@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 
 from docode.dobox.tools import DoBoxTools
+from docode.agent.task_contract import is_crawler_instruction
 
 
 IMPORTANT_FILES = (
@@ -41,14 +42,15 @@ class ProjectInspector:
         listing_result = await tools.list_files(".")
         listing = listing_result.output
         important_files: dict[str, str] = {}
-        for path in IMPORTANT_FILES:
-            if _listing_contains(listing, path):
-                try:
-                    result = await tools.read_file(path)
-                except Exception as exc:
-                    important_files[path] = f"<read failed: {exc}>"
-                    continue
-                important_files[path] = _clip(result.output, 8000)
+        if not should_skip_important_file_reads(instruction):
+            for path in IMPORTANT_FILES:
+                if _listing_contains(listing, path):
+                    try:
+                        result = await tools.read_file(path)
+                    except Exception as exc:
+                        important_files[path] = f"<read failed: {exc}>"
+                        continue
+                    important_files[path] = _clip(result.output, 8000)
 
         detected_commands = {
             "test": await tools.detect_test_command(),
@@ -69,8 +71,9 @@ class ProjectInspector:
 
 
 def build_initial_plan(instruction: str, important_files: dict[str, str], detected_commands: dict[str, str | None]) -> list[str]:
+    task_summary = summarize_instruction(instruction)
     plan = [
-        f"Inspect the repository context relevant to: {instruction}",
+        f"Inspect the repository context relevant to: {task_summary}",
         "Make the smallest code changes that satisfy the requested behavior.",
     ]
     if important_files:
@@ -85,8 +88,9 @@ def build_initial_plan(instruction: str, important_files: dict[str, str], detect
 
 
 def build_acceptance_criteria(instruction: str, detected_commands: dict[str, str | None]) -> list[str]:
+    task_summary = summarize_instruction(instruction)
     criteria = [
-        f"The implementation directly satisfies the user instruction: {instruction}",
+        f"The implementation directly satisfies the requested task: {task_summary}",
         "The git diff is non-empty or an explicit requested artifact was produced.",
         "The final summary describes changed files, verification results, and remaining caveats.",
     ]
@@ -114,6 +118,21 @@ def extract_explicit_test_command(instruction: str) -> str | None:
         if match:
             return command
     return None
+
+
+def should_skip_important_file_reads(instruction: str) -> bool:
+    return is_crawler_instruction(instruction) and has_public_source_url(instruction)
+
+
+def has_public_source_url(instruction: str) -> bool:
+    return bool(re.search(r"https?://[^\s'\"`)>]+", instruction or "", flags=re.IGNORECASE))
+
+
+def summarize_instruction(instruction: str, limit: int = 240) -> str:
+    compact = " ".join(part.strip() for part in instruction.splitlines() if part.strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 13].rstrip() + " <truncated>"
 
 
 def _listing_contains(listing: str, path: str) -> bool:

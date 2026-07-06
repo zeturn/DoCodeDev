@@ -78,3 +78,22 @@ class SQLiteRepositoryTests(IsolatedAsyncioTestCase):
                 self.assertIsNone(second_claim)
             finally:
                 repo.close()
+
+    async def test_step_and_artifact_updates_refresh_job_timestamp(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = SQLiteJobRepository(Path(tmp) / "docode.db")
+            try:
+                job = await repo.create_job(CodingJob(id=new_id("job"), user_id="user-1", instruction="heartbeat"))
+                first = await repo.get_job(job.id)
+                assert first is not None
+                await repo.add_step(job.id, "system", {"type": "heartbeat"})
+                after_step = await repo.get_job(job.id)
+                assert after_step is not None
+                self.assertGreater(after_step.updated_at, first.updated_at)
+                await repo.add_artifact(job.id, "zip", "/tmp/out.zip", 5)
+                after_artifact = await repo.get_job(job.id)
+                assert after_artifact is not None
+                self.assertGreaterEqual(after_artifact.updated_at, after_step.updated_at)
+                self.assertGreater(after_artifact.updated_at, first.updated_at)
+            finally:
+                repo.close()

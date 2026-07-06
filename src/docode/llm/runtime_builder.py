@@ -51,11 +51,16 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
         if not str(exc).startswith("weav_ai_runtime_unavailable:"):
             raise
         return await build_fallback_runtime(job, resolver, usage_sink, usage_meter, tool_registry)
-    model_spec = await resolve_model_async(ai_runtime, provider=job.provider, model=job.model)
-    router = await build_runtime_router_async(ai_runtime, runtime_context)
-    provider_client = registered_provider(router, model_spec.provider)
+    try:
+        model_spec = await resolve_model_async(ai_runtime, provider=job.provider, model=job.model)
+        router = await build_runtime_router_async(ai_runtime, runtime_context)
+        provider_client = registered_provider(router, model_spec.provider)
+    except Exception as exc:
+        if "provider" not in str(exc).lower() and "registered" not in str(exc).lower():
+            raise
+        return await build_fallback_runtime(job, resolver, usage_sink, usage_meter, tool_registry)
     if provider_client is None:
-        raise RuntimeError(f"provider_not_registered:{model_spec.provider}")
+        return await build_fallback_runtime(job, resolver, usage_sink, usage_meter, tool_registry)
     return DocodeRuntime(
         provider=model_spec.provider,
         model=model_spec.model,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from unittest import IsolatedAsyncioTestCase
+from unittest.mock import patch
 
 import httpx
 
@@ -163,6 +164,35 @@ class CredentialResolverTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(credential.api_key, "")
         self.assertEqual(credential.base_url, "https://apicred.example/v1")
+
+    async def test_authorize_retries_apicred_runtime_calls_five_times(self) -> None:
+        attempts = {"count": 0}
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                _ = args, kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def request(self, method, url, json=None, params=None, headers=None):
+                _ = json, params, headers
+                attempts["count"] += 1
+                request = httpx.Request(method, url)
+                if attempts["count"] < 5:
+                    return httpx.Response(500, request=request, text="temporary upstream error")
+                return httpx.Response(200, request=request, json={"allowed": True})
+
+        resolver = APICredCredentialResolver("https://apicred.invalid/v1", "service-token", retry_delays=(0.0, 0.0, 0.0, 0.0))
+
+        with patch("httpx.AsyncClient", FakeAsyncClient):
+            authorization = await resolver.authorize(user_id="user-1", provider="openai", model="gpt-4o", job_id="job_1", max_iterations=5)
+
+        self.assertTrue(authorization.allowed)
+        self.assertEqual(attempts["count"], 5)
 
     async def test_runtime_authorization_repr_hides_raw_payload(self) -> None:
         authorization = RuntimeAuthorization(

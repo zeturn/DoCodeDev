@@ -1,8 +1,7 @@
 from __future__ import annotations
-
 from dataclasses import asdict
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -17,6 +16,7 @@ from docode.llm.model_policy import DocodeModelPolicy
 from docode.storage.models import public_job_dict
 from docode.storage.repository import JobRepository
 from docode.worker.queue import AsyncJobQueue
+from docode.worker.runner import JobRunnerService
 
 
 class CreateJobRequest(BaseModel):
@@ -40,9 +40,10 @@ class CreateJobRequest(BaseModel):
 
 def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: DocodeConfig, user_dependency=get_user_context) -> APIRouter:
     router = APIRouter(prefix="/v1/jobs", tags=["jobs"])
+    runner = JobRunnerService(config=config, repository=repository)
 
     @router.post("")
-    async def create_job(req: CreateJobRequest, user: UserContext = Depends(user_dependency)) -> dict[str, str]:
+    async def create_job(req: CreateJobRequest, background_tasks: BackgroundTasks, user: UserContext = Depends(user_dependency)) -> dict[str, str]:
         resolver = APICredCredentialResolver(config.apicred_base_url, config.apicred_token, config.apicred_mode)
         resolver.use_access_token(user.apicred_access_token)
         model_policy = DocodeModelPolicy(config, resolver)
@@ -75,6 +76,7 @@ def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: Do
             )
         except JobActionError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        background_tasks.add_task(runner.run_job, job.id)
         return {"job_id": job.id, "status": job.status.value}
 
     @router.get("/{job_id}")
