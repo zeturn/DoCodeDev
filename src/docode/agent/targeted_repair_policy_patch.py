@@ -12,13 +12,56 @@ def apply() -> None:
         loop_module._docode_original_allowed_tool_definitions_for_state = loop_module.allowed_tool_definitions_for_state
     if not hasattr(loop_module, "_docode_original_required_test_tool_block"):
         loop_module._docode_original_required_test_tool_block = loop_module.required_test_tool_block
+    if not hasattr(loop_module, "_docode_original_targeted_repair_targets"):
+        loop_module._docode_original_targeted_repair_targets = loop_module.targeted_repair_targets
 
+    loop_module.targeted_repair_targets = targeted_repair_targets
     loop_module.targeted_repair_forced_tool = targeted_repair_forced_tool
     loop_module.targeted_repair_allowed_tools_for_phase = targeted_repair_allowed_tools_for_phase
     loop_module.review_repair_target_files = review_repair_target_files
     loop_module.repair_action_from_quality_gate = repair_action_from_quality_gate
     loop_module.allowed_tool_definitions_for_state = allowed_tool_definitions_for_state
     loop_module.required_test_tool_block = required_test_tool_block
+
+
+def targeted_repair_targets(state: Any) -> set[str]:
+    """Return active repair targets, expanding parser mismatches to consistency files.
+
+    A parsed-value mismatch is not always a crawler.py bug. In generated artifact
+    tasks, the model may have produced an inconsistent fixture or test expectation
+    (for example fixture owner1 while the generated test expects owner). If the
+    repair target is locked to crawler.py only, the loop can reject the correct
+    fixture/test consistency repair until max_iterations. For this category, allow
+    the parser, tests, and fixture files to be repaired as one consistency unit.
+    """
+
+    from docode.agent import loop as loop_module
+
+    original = getattr(loop_module, "_docode_original_targeted_repair_targets")
+    targets = set(original(state))
+    action = state.active_repair_action or {}
+    category = str(action.get("category") or "")
+    signature = str(action.get("signature") or "")
+    reason = str(action.get("reason") or "")
+    instruction = str(action.get("instruction") or "")
+    combined = "\n".join([category, signature, reason, instruction]).lower()
+    if category == "parsed_value_mismatch" or "parsed_value_mismatch" in signature:
+        candidates = [
+            "crawler.py",
+            "tests/test_parser.py",
+            "fixtures/sample.html",
+            "fixtures/sample.csv",
+        ]
+        allowed = set(state.task_contract.must_modify_files) if state.task_contract is not None else set(candidates)
+        for path in candidates:
+            if path in allowed:
+                targets.add(path)
+    elif any(token in combined for token in ("fixture/test consistency", "fixture inconsistent", "test fixture")):
+        allowed = set(state.task_contract.must_modify_files) if state.task_contract is not None else set()
+        for path in ("tests/test_parser.py", "fixtures/sample.html", "fixtures/sample.csv"):
+            if not allowed or path in allowed:
+                targets.add(path)
+    return {loop_module.normalize_workspace_relative_path(path) for path in targets if path}
 
 
 def targeted_repair_forced_tool(
@@ -208,23 +251,28 @@ def review_repair_target_files(task_contract: Any | None, issue_text: str = "") 
             "sample html contradicts",
             "test fixture contradicts",
             "fixture/test consistency",
+            "assertionerror",
+            "tests/test_parser.py",
         )
     )
 
     if parser_issue:
         preferred.append("crawler.py")
-    if fixture_inconsistency:
-        preferred.append("fixtures/sample.html")
-    if "tests/test_parser.py" in lower or "test file" in lower or "parser tests" in lower:
         preferred.append("tests/test_parser.py")
+        preferred.append("fixtures/sample.html")
+        preferred.append("fixtures/sample.csv")
+    if fixture_inconsistency:
+        preferred.append("tests/test_parser.py")
+        preferred.append("fixtures/sample.html")
+        preferred.append("fixtures/sample.csv")
     if "schema" in lower:
         preferred.append("schemas/output.schema.json")
 
     preferred.extend(
         [
             "crawler.py",
-            "fixtures/sample.html",
             "tests/test_parser.py",
+            "fixtures/sample.html",
             "fixtures/sample.csv",
             "schemas/output.schema.json",
             "manifest.json",
