@@ -7,6 +7,7 @@ def apply() -> None:
     """Install repair and workflow policy overrides into docode.agent.loop."""
 
     from docode.agent import loop as loop_module
+    from docode.dobox import tools as dobox_tools_module
 
     if not hasattr(loop_module, "_docode_original_allowed_tool_definitions_for_state"):
         loop_module._docode_original_allowed_tool_definitions_for_state = loop_module.allowed_tool_definitions_for_state
@@ -14,6 +15,8 @@ def apply() -> None:
         loop_module._docode_original_required_test_tool_block = loop_module.required_test_tool_block
     if not hasattr(loop_module, "_docode_original_targeted_repair_targets"):
         loop_module._docode_original_targeted_repair_targets = loop_module.targeted_repair_targets
+    if not hasattr(dobox_tools_module.DoBoxTools, "_docode_original_definitions"):
+        dobox_tools_module.DoBoxTools._docode_original_definitions = dobox_tools_module.DoBoxTools.definitions
 
     loop_module.targeted_repair_targets = targeted_repair_targets
     loop_module.targeted_repair_forced_tool = targeted_repair_forced_tool
@@ -23,17 +26,74 @@ def apply() -> None:
     loop_module.allowed_tool_definitions_for_state = allowed_tool_definitions_for_state
     loop_module.required_test_tool_block = required_test_tool_block
 
+    dobox_tools_module.DoBoxTools.definitions = patched_dobox_definitions
+    dobox_tools_module.DoBoxTools.read_file_range = read_file_range
+    dobox_tools_module.DoBoxTools.read_symbol = read_symbol
+
+
+def patched_dobox_definitions(self: Any) -> list[Any]:
+    from docode.dobox import tools as dobox_tools_module
+
+    original = getattr(dobox_tools_module.DoBoxTools, "_docode_original_definitions")
+    definitions = list(original(self))
+    existing = {getattr(definition, "name", "") for definition in definitions}
+    if "read_file_range" not in existing:
+        definitions.append(
+            dobox_tools_module.ToolDefinition(
+                "read_file_range",
+                "Read a 1-based inclusive line range from a file under /workspace. Use this when read_file output is too long or truncated.",
+                {"path": "string", "start_line": "integer", "end_line": "integer"},
+                self.read_file_range,
+            )
+        )
+    if "read_symbol" not in existing:
+        definitions.append(
+            dobox_tools_module.ToolDefinition(
+                "read_symbol",
+                "Read the definition body for a Python function or class symbol from a file under /workspace, with nearby context lines.",
+                {"path": "string", "symbol": "string", "context_lines": "integer"},
+                self.read_symbol,
+            )
+        )
+    return definitions
+
+
+async def read_file_range(self: Any, path: str, start_line: int = 1, end_line: int = 120):
+    from docode.dobox import tools as dobox_tools_module
+    from docode.dobox.file_readers import read_line_range
+    from docode.dobox.types import FileResult, ToolResult
+
+    path_error = dobox_tools_module.workspace_path_error(path)
+    if path_error:
+        return dobox_tools_module.rejected_tool_result("read_file_range", path_error, {"path": path})
+    file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+    text = file_result.content if isinstance(file_result, FileResult) else str(file_result)
+    output, metadata = read_line_range(text, start_line, end_line)
+    metadata = {"path": path, **metadata, "source_truncated": bool(getattr(file_result, "truncated", False))}
+    return self._compress("read_file_range", output, 0, metadata, truncated=bool(getattr(file_result, "truncated", False)))
+
+
+async def read_symbol(self: Any, path: str, symbol: str, context_lines: int = 5):
+    from docode.dobox import tools as dobox_tools_module
+    from docode.dobox.file_readers import read_python_symbol
+    from docode.dobox.types import FileResult, ToolResult
+
+    path_error = dobox_tools_module.workspace_path_error(path)
+    if path_error:
+        return dobox_tools_module.rejected_tool_result("read_symbol", path_error, {"path": path, "symbol": symbol})
+    name = str(symbol or "").strip()
+    if not name:
+        return ToolResult(tool="read_symbol", output="symbol must be a non-empty string", exit_code=2, metadata={"path": path})
+    file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+    text = file_result.content if isinstance(file_result, FileResult) else str(file_result)
+    output, metadata = read_python_symbol(text, name, context_lines)
+    exit_code = 1 if output.startswith("symbol not found:") else 0
+    metadata = {"path": path, **metadata, "source_truncated": bool(getattr(file_result, "truncated", False))}
+    return self._compress("read_symbol", output, exit_code, metadata, truncated=bool(getattr(file_result, "truncated", False)))
+
 
 def targeted_repair_targets(state: Any) -> set[str]:
-    """Return active repair targets, expanding parser mismatches to consistency files.
-
-    A parsed-value mismatch is not always a crawler.py bug. In generated artifact
-    tasks, the model may have produced an inconsistent fixture or test expectation
-    (for example fixture owner1 while the generated test expects owner). If the
-    repair target is locked to crawler.py only, the loop can reject the correct
-    fixture/test consistency repair until max_iterations. For this category, allow
-    the parser, tests, and fixture files to be repaired as one consistency unit.
-    """
+    """Return active repair targets, expanding parser mismatches to consistency files."""
 
     from docode.agent import loop as loop_module
 
@@ -68,13 +128,7 @@ def targeted_repair_forced_tool(
     state: Any,
     tool_name: str,
 ) -> tuple[str, dict[str, object], str] | None:
-    """Force only deterministic targeted-repair actions.
-
-    This intentionally does not auto-write default crawler artifact templates during
-    repair. Template writes are useful while creating missing required files, but
-    during repair they can overwrite the model's current implementation and cause a
-    loop: failing test -> read_file -> forced default write -> same failing test.
-    """
+    """Force only deterministic targeted-repair actions."""
 
     from docode.agent import loop as loop_module
 
@@ -112,19 +166,22 @@ def targeted_repair_allowed_tools_for_phase(state: Any) -> set[str]:
 
     if loop_module.targeted_repair_modified_target(state):
         return {"run_command", "git_status", "git_diff"}
+    inspect_tools = {
+        "read_file",
+        "read_file_range",
+        "read_symbol",
+        "edit_file",
+        "write_file",
+        "replace_in_file",
+        "apply_patch",
+        "git_status",
+        "git_diff",
+    }
     if state.targeted_repair_phase == "inspect_allowed":
-        return {
-            "read_file",
-            "edit_file",
-            "write_file",
-            "replace_in_file",
-            "apply_patch",
-            "git_status",
-            "git_diff",
-        }
+        return inspect_tools
     if state.targeted_repair_phase == "edit_forced":
         return {"edit_file", "write_file", "replace_in_file", "apply_patch"}
-    return {"read_file", "edit_file", "write_file", "replace_in_file", "apply_patch"}
+    return inspect_tools
 
 
 def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> list[Any]:
@@ -204,7 +261,7 @@ def repair_action_from_quality_gate(result: Any):
         signature="quality:" + str(abs(hash(signature_source)))[:12],
         reason="quality_gate_blocked",
         target_files=target_files,
-        allowed_tools=["read_file", "edit_file", "write_file", "replace_in_file", "apply_patch", "git_status", "git_diff"],
+        allowed_tools=["read_file", "read_file_range", "read_symbol", "edit_file", "write_file", "replace_in_file", "apply_patch", "git_status", "git_diff"],
         forbidden_tools=["run_command", "web_search", "fetch_url", "preview", "logs"],
         instruction="\n".join(lines),
         rerun_commands=[],
