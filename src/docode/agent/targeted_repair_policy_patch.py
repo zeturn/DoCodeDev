@@ -123,7 +123,7 @@ def targeted_repair_targets(state: Any) -> set[str]:
 
 
 def targeted_repair_forced_tool(state: Any, tool_name: str) -> tuple[str, dict[str, object], str] | None:
-    """Force deterministic targeted-repair actions and focus repeated reads."""
+    """Force deterministic targeted-repair actions without allowing post-budget read loops."""
 
     from docode.agent import loop as loop_module
 
@@ -140,6 +140,9 @@ def targeted_repair_forced_tool(state: Any, tool_name: str) -> tuple[str, dict[s
 
     target = targets[0]
     read_count = loop_module.targeted_repair_read_count(state)
+    phase = state.targeted_repair_phase
+    if phase == "edit_forced":
+        return None
     if read_count <= 0 and tool_name in {"run_command", "git_status", "git_diff", "search", "list_files"}:
         return "read_file", {"path": target}, "active_repair_requires_inspection_or_patch"
     if read_count > 0 and tool_name in {"read_file", "search", "list_files"}:
@@ -175,7 +178,7 @@ def targeted_repair_allowed_tools_for_phase(state: Any) -> set[str]:
     if state.targeted_repair_phase == "inspect_allowed":
         return inspect_tools
     if state.targeted_repair_phase == "edit_forced":
-        return {"read_file_range", "read_symbol", "edit_file", "write_file", "replace_in_file", "apply_patch"}
+        return {"edit_file", "write_file", "replace_in_file", "apply_patch"}
     return inspect_tools
 
 
