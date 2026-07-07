@@ -6,6 +6,7 @@ import re
 
 
 FILE_REF_RE = re.compile(r"\b[\w./-]+\.(?:py|js|ts|go|rs|md|json|toml|yaml|yml|txt|csv|html)\b")
+NUMBERED_COMMAND_RE = re.compile(r"^\s*\d+[.)]\s+(.+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,31 +78,41 @@ def verification_commands_from_instruction(instruction: str) -> list[str]:
             in_verification_block = True
             continue
         if in_verification_block:
-            command = line[2:].strip(" `") if line.startswith("- ") else line.strip(" `")
+            command = normalize_command_line(line)
             if command and command_like(command):
                 commands.append(command)
                 continue
             if line and line.endswith(":"):
                 in_verification_block = verification_heading(line.lower().lstrip("- ").rstrip(":"))
                 continue
-            if line and not command_like(line):
+            if line and not command_like(command):
                 in_verification_block = False
         if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
             continue
         if lowered.startswith("semantic checks:") or lowered.startswith("- semantic checks:"):
             continue
         _, value = line.split(":", 1)
-        command = value.strip(" -`")
+        command = normalize_command_line(value)
         if command and command_like(command):
             commands.append(command)
     return commands[:8]
+
+
+def normalize_command_line(line: str) -> str:
+    text = line.strip().strip("`")
+    if text.startswith("- "):
+        text = text[2:].strip().strip("`")
+    numbered = NUMBERED_COMMAND_RE.match(text)
+    if numbered:
+        text = numbered.group(1).strip().strip("`")
+    return text.strip(" -`")
 
 
 def verification_heading(heading: str) -> bool:
     text = heading.strip().lower()
     if text in {"verification commands", "suggested verification commands"}:
         return True
-    return "verification commands" in text and any(word in text for word in ("run", "exact", "success", "before"))
+    return "verification commands" in text and any(word in text for word in ("run", "exact", "success", "before", "pass"))
 
 
 def command_like(value: str) -> bool:
