@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 
 from docode.agent.state import AgentState
 from docode.agent.task_contract import TaskContract
@@ -320,3 +321,56 @@ def target_file_modified_after_repair_start(state: AgentState) -> bool:
         if tool == "apply_patch" or path in targets:
             return True
     return False
+
+
+def meaningful_diff_exists(git_status_output: str) -> bool:
+    return any(meaningful_change_path(path) for path in changed_paths_from_status(git_status_output))
+
+
+def changed_paths_from_status(status: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in status.splitlines():
+        marker, path = parse_status_line(raw_line)
+        if path and (marker == "??" or marker.strip()) and meaningful_change_path(path):
+            paths.append(path)
+    return paths
+
+
+def parse_status_line(raw_line: str) -> tuple[str, str]:
+    line = strip_ansi(raw_line).rstrip()
+    if not line:
+        return "", ""
+    if line.startswith("?? "):
+        return "??", line[3:].strip()
+    if len(line) >= 4 and line[2] == " ":
+        marker = line[:2]
+        path = line[3:].strip()
+    elif len(line) >= 3 and line[1] == " ":
+        marker = line[:1]
+        path = line[2:].strip()
+    else:
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            return "", ""
+        marker, path = parts[0], parts[1].strip()
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[-1].strip()
+    return marker, path
+
+
+def meaningful_change_path(path: str) -> bool:
+    normalized = strip_ansi(path).strip().replace("\\", "/")
+    if not normalized:
+        return False
+    parts = normalized.split("/")
+    return not (
+        normalized in {".docode_probe", ".docode_probe_api"}
+        or normalized.startswith(".docode_probe")
+        or "__pycache__" in parts
+        or normalized.endswith((".pyc", ".pyo"))
+        or normalized.startswith(".git/")
+    )
+
+
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", value)
