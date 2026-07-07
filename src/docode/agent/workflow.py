@@ -8,6 +8,7 @@ from docode.agent.task_contract import TaskContract
 
 
 EDIT_TOOLS = {"edit_file", "write_file", "apply_patch", "replace_in_file"}
+FOCUSED_READ_TOOLS = {"read_file", "read_file_range", "read_symbol"}
 
 
 class WorkflowPhase(str, Enum):
@@ -94,14 +95,14 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             final_allowed=False,
             reason="active_targeted_repair",
             required_action=(
-                f"modify {target_file or 'the target file'} before rerunning tests"
+                f"inspect {target_file or 'the target file'} with read_symbol/read_file_range if needed, then modify it before rerunning tests"
                 if not modified
                 else f"rerun after patch: {rerun_commands[0] if rerun_commands else 'the failing command'}"
             ),
             missing_commands=missing_commands,
             active_repair_required=True,
             latest_test_failure_signature=latest_failure_signature,
-            allowed_next_tools=["read_file", "edit_file", "apply_patch", "write_file"] if not modified else ["run_command"],
+            allowed_next_tools=["read_symbol", "read_file_range", "read_file", "edit_file", "apply_patch", "write_file"] if not modified else ["run_command"],
             rerun_after_patch=rerun_commands[0] if rerun_commands else None,
             target_file=target_file,
             target_file_modified_after_repair=modified,
@@ -297,7 +298,7 @@ def commands_equivalent(observed: str, expected: str) -> bool:
     if observed == "python3 crawler.py --dry-run" and expected.startswith("python3 crawler.py "):
         return "--dry-run" in expected.split()
     if expected == "python3 crawler.py --preflight" and observed.startswith("python3 crawler.py "):
-        return "--dry-run" in observed.split()
+        return "--preflight" in observed.split()
     return False
 
 
@@ -319,56 +320,3 @@ def target_file_modified_after_repair_start(state: AgentState) -> bool:
         if tool == "apply_patch" or path in targets:
             return True
     return False
-
-
-def meaningful_diff_exists(git_status_output: str) -> bool:
-    return any(meaningful_change_path(path) for path in changed_paths_from_status(git_status_output))
-
-
-def changed_paths_from_status(status: str) -> list[str]:
-    paths: list[str] = []
-    for raw_line in status.splitlines():
-        marker, path = parse_status_line(raw_line)
-        if path and (marker == "??" or marker.strip()):
-            paths.append(path)
-    return paths
-
-
-def parse_status_line(raw_line: str) -> tuple[str, str]:
-    line = strip_ansi(raw_line).rstrip()
-    if not line:
-        return "", ""
-    if line.startswith("?? "):
-        return "??", line[3:].strip()
-    if len(line) >= 4 and line[2] == " ":
-        marker = line[:2]
-        path = line[3:].strip()
-    elif len(line) >= 3 and line[1] == " ":
-        marker = line[:1]
-        path = line[2:].strip()
-    else:
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2:
-            return "", ""
-        marker, path = parts[0], parts[1].strip()
-    if " -> " in path:
-        path = path.rsplit(" -> ", 1)[-1].strip()
-    return marker, path
-
-
-def meaningful_change_path(path: str) -> bool:
-    normalized = strip_ansi(path).strip().replace("\\", "/")
-    parts = normalized.split("/")
-    return not (
-        normalized in {".docode_probe", ".docode_probe_api"}
-        or normalized.startswith(".docode_probe")
-        or "__pycache__" in parts
-        or normalized.endswith((".pyc", ".pyo"))
-        or normalized.startswith(".git/")
-    )
-
-
-def strip_ansi(value: str) -> str:
-    import re
-
-    return re.sub(r"\x1b\[[0-9;]*m", "", value)
