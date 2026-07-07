@@ -12,9 +12,12 @@ CONTEXT_HEAVY_REPAIR_CATEGORIES = {
     "missing_required_field",
     "parsed_value_mismatch",
     "json_semantic_failure",
+    "parser_records_empty",
+    "parser_records_too_few",
+    "parser_record_count_mismatch",
 }
 
-MIN_CONTEXT_REPAIR_INSPECTION_BUDGET = 2
+MIN_CONTEXT_REPAIR_INSPECTION_BUDGET = 3
 
 
 def install() -> None:
