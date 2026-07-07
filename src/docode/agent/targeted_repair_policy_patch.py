@@ -61,7 +61,7 @@ def patched_dobox_definitions(self: Any) -> list[Any]:
 async def read_file_range(self: Any, path: str, start_line: int = 1, end_line: int = 120):
     from docode.dobox import tools as dobox_tools_module
     from docode.dobox.file_readers import read_line_range
-    from docode.dobox.types import FileResult, ToolResult
+    from docode.dobox.types import FileResult
 
     path_error = dobox_tools_module.workspace_path_error(path)
     if path_error:
@@ -158,7 +158,47 @@ def targeted_repair_forced_tool(
             {"path": target},
             "active_repair_requires_inspection_or_patch",
         )
+    if read_count > 0 and tool_name == "read_file":
+        symbol = _repair_symbol_hint(state)
+        if symbol:
+            return (
+                "read_symbol",
+                {"path": target, "symbol": symbol, "context_lines": 8},
+                "active_repair_retarget_repeated_read_to_symbol",
+            )
+        return (
+            "read_file_range",
+            {"path": target, "start_line": 1, "end_line": 160},
+            "active_repair_retarget_repeated_read_to_range",
+        )
     return None
+
+
+def _repair_symbol_hint(state: Any) -> str:
+    action = state.active_repair_action or {}
+    text = "\n".join(
+        str(action.get(key) or "")
+        for key in ("signature", "reason", "instruction")
+    )
+    lowered = text.lower()
+    known_symbols = [
+        "number_from_text",
+        "parse_trending",
+        "main",
+        "write_events",
+        "dry_run",
+        "preflight",
+    ]
+    for symbol in known_symbols:
+        if symbol.lower() in lowered:
+            return symbol
+    import re
+
+    for match in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        candidate = match.group(1)
+        if candidate not in {"assertEqual", "assertTrue", "assertFalse", "print", "str", "int"}:
+            return candidate
+    return ""
 
 
 def targeted_repair_allowed_tools_for_phase(state: Any) -> set[str]:
