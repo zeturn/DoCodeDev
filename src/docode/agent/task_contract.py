@@ -25,7 +25,7 @@ def task_contract_from_instruction(instruction: str) -> TaskContract:
         files = unique_preserving_order(["crawler.py", *files])
     explicit_commands = verification_commands_from_instruction(instruction)
     commands = unique_preserving_order([*suggested_commands(files), *explicit_commands])
-    if is_crawler_instruction(instruction):
+    if is_crawler_instruction(instruction) and not explicit_commands:
         crawler_defaults = [
             "python3 -m unittest discover -s tests",
             "python3 crawler.py --preflight",
@@ -73,16 +73,18 @@ def verification_commands_from_instruction(instruction: str) -> list[str]:
         line = raw_line.strip()
         lowered = line.lower()
         heading = lowered.lstrip("- ").rstrip(":")
-        if heading in {"verification commands", "suggested verification commands"}:
+        if verification_heading(heading):
             in_verification_block = True
             continue
         if in_verification_block:
-            if line.startswith("- "):
-                command = line[2:].strip(" `")
-                if command and command_like(command):
-                    commands.append(command)
+            command = line[2:].strip(" `") if line.startswith("- ") else line.strip(" `")
+            if command and command_like(command):
+                commands.append(command)
                 continue
-            if line and not line.endswith(":"):
+            if line and line.endswith(":"):
+                in_verification_block = verification_heading(line.lower().lstrip("- ").rstrip(":"))
+                continue
+            if line and not command_like(line):
                 in_verification_block = False
         if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
             continue
@@ -92,7 +94,14 @@ def verification_commands_from_instruction(instruction: str) -> list[str]:
         command = value.strip(" -`")
         if command and command_like(command):
             commands.append(command)
-    return commands[:5]
+    return commands[:8]
+
+
+def verification_heading(heading: str) -> bool:
+    text = heading.strip().lower()
+    if text in {"verification commands", "suggested verification commands"}:
+        return True
+    return "verification commands" in text and any(word in text for word in ("run", "exact", "success", "before"))
 
 
 def command_like(value: str) -> bool:
