@@ -284,8 +284,10 @@ def normalize_command(command: str) -> str:
 def commands_equivalent(observed: str, expected: str) -> bool:
     observed = normalize_command(observed)
     expected = normalize_command(expected)
-    if observed == expected or expected in observed:
+    if observed == expected:
         return True
+    if is_compound_shell_command(observed):
+        return False
     if observed.endswith(" -v") and observed[: -3] == expected:
         return True
     if expected.endswith(" -v") and expected[: -3] == observed:
@@ -295,12 +297,14 @@ def commands_equivalent(observed: str, expected: str) -> bool:
         extra = observed[len(unittest) :].strip()
         return extra in {"", "-v"}
     if expected == "python3 crawler.py --dry-run" and observed.startswith("python3 crawler.py "):
-        return "--dry-run" in observed.split()
-    if observed == "python3 crawler.py --dry-run" and expected.startswith("python3 crawler.py "):
-        return "--dry-run" in expected.split()
+        return set(observed.split()) == {"python3", "crawler.py", "--dry-run"}
     if expected == "python3 crawler.py --preflight" and observed.startswith("python3 crawler.py "):
-        return "--preflight" in observed.split()
+        return set(observed.split()) == {"python3", "crawler.py", "--preflight"}
     return False
+
+
+def is_compound_shell_command(command: str) -> bool:
+    return any(token in command for token in (";", "&&", "||", "|", "`", "$("))
 
 
 def target_file_modified_after_repair_start(state: AgentState) -> bool:
