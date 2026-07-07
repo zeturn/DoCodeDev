@@ -244,9 +244,11 @@ def targeted_repair_forced_tool(state: Any, tool_name: str) -> tuple[str, dict[s
 
     if state.repair_mode != "targeted_repair" or not state.active_repair_action:
         return None
+
     targets = sorted(loop_module.targeted_repair_targets(state))
     if not targets:
         return None
+
     if loop_module.targeted_repair_modified_target(state):
         command = next_targeted_repair_rerun_command(state)
         if not command:
@@ -254,18 +256,30 @@ def targeted_repair_forced_tool(state: Any, tool_name: str) -> tuple[str, dict[s
         if tool_name != "run_command":
             return "run_command", {"command": command}, "active_repair_requires_exact_rerun"
         return None
+
     phase = targeted_repair_phase(state)
-    if phase == "edit_forced":
-        return None
     target = targets[0]
+
+    if phase == "edit_forced" and tool_name not in EDIT_TOOLS:
+        content = loop_module.default_crawler_artifact_file_content(target, state)
+        if content is not None:
+            return (
+                "write_file",
+                {"path": target, "content": content},
+                "active_repair_controller_forced_target_edit",
+            )
+        return None
+
     read_count = targeted_repair_read_count(state)
     if read_count <= 0 and tool_name in {"run_command", "git_status", "git_diff", "search", "list_files", "web_search", "fetch_url"}:
         return "read_file", {"path": target}, "active_repair_requires_inspection_or_patch"
+
     if read_count > 0 and tool_name in BROAD_INSPECT_TOOLS:
         symbol = _repair_symbol_hint(state)
         if symbol:
             return "read_symbol", {"path": target, "symbol": symbol, "context_lines": 8}, "active_repair_retarget_repeated_read_to_symbol"
         return "read_file_range", {"path": target, "start_line": 1, "end_line": 160}, "active_repair_retarget_repeated_read_to_range"
+
     return None
 
 
