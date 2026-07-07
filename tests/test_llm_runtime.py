@@ -37,10 +37,17 @@ from docode.dobox.types import ToolResult
 class RuntimeResolver:
     def __init__(self) -> None:
         self.resolve_calls = 0
+        self.proxy_active = False
 
     async def resolve(self, *, user_id: str, provider: str, model: str) -> ProviderCredential:
         self.resolve_calls += 1
         return ProviderCredential(provider=provider, model=model, api_key="secret-key", base_url="https://llm.example/v1")
+
+
+class ProxyRuntimeResolver(RuntimeResolver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proxy_active = True
 
 
 class RuntimeTests(IsolatedAsyncioTestCase):
@@ -109,6 +116,21 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertIsInstance(runtime.provider_client, OpenAICompatibleChatClient)
         self.assertEqual(runtime.provider_client.base_url, "https://llm.example/v1")
         self.assertIsNotNone(runtime.tools.get("run_command"))
+
+    async def test_build_docode_runtime_uses_proxy_fallback_without_weav_router(self) -> None:
+        install_weav_stubs()
+        sys.modules.pop("weav_provider_router", None)
+        resolver = ProxyRuntimeResolver()
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="change code", provider="openrouter", model="tencent/hy3:free")
+
+        runtime = await build_docode_runtime(job, resolver, DoBoxTools(object(), "project-1"))
+
+        self.assertEqual(runtime.provider, "openrouter")
+        self.assertEqual(runtime.model, "tencent/hy3:free")
+        self.assertEqual(resolver.resolve_calls, 1)
+        self.assertIsInstance(runtime.router, LocalLLMRouter)
+        self.assertIsInstance(runtime.provider_client, OpenAICompatibleChatClient)
+        self.assertEqual(runtime.provider_client.base_url, "https://llm.example/v1")
 
     async def test_scripted_runtime_does_not_resolve_credentials(self) -> None:
         resolver = RuntimeResolver()

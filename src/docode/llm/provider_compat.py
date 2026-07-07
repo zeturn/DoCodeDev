@@ -74,8 +74,11 @@ class OpenAICompatibleChatClient:
         return data if isinstance(data, dict) else {"data": data}
 
 
+OPENAI_COMPATIBLE_PROVIDERS = {"openai", "openai-compatible", "apicred", "deepseek", "qwen", "zhipu", "openrouter"}
+
+
 def build_provider_client(provider: str, api_key: str | None, base_url: str | None) -> Any:
-    if base_url and provider.lower() in {"openai", "openai-compatible", "apicred", "deepseek", "qwen", "zhipu"}:
+    if base_url and provider.lower() in OPENAI_COMPATIBLE_PROVIDERS:
         return OpenAICompatibleChatClient(api_key=api_key, base_url=base_url)
     kwargs: dict[str, str] = {}
     if api_key:
@@ -87,7 +90,7 @@ def build_provider_client(provider: str, api_key: str | None, base_url: str | No
 
         return build_provider(provider, **kwargs)
     except Exception:
-        if provider.lower() in {"openai", "openai-compatible", "apicred", "deepseek", "qwen", "zhipu"}:
+        if provider.lower() in OPENAI_COMPATIBLE_PROVIDERS:
             return OpenAICompatibleChatClient(api_key=api_key, base_url=base_url)
         raise
 

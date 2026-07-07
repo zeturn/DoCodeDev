@@ -45,6 +45,8 @@ async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolv
             usage_sink=usage_sink,
             usage_meter=usage_meter,
         )
+    if resolver.proxy_active:
+        return await build_fallback_runtime(job, resolver, usage_sink, usage_meter, tool_registry)
     try:
         runtime_context, ai_runtime = build_weav_runtime(job, resolver, usage_sink)
     except RuntimeError as exc:

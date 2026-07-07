@@ -395,6 +395,10 @@ def required_test_tool_block(state: Any, workflow: Any, tool_name: str, args: di
     detail = original(state, workflow, tool_name, args)
     if not detail or workflow.phase != loop_module.WorkflowPhase.TEST_REQUIRED:
         return detail
+    if "required target files are still missing" in detail:
+        return detail
+    if tool_name == "run_command":
+        return detail
     missing = getattr(workflow, "missing_commands", None) or []
     command = str(missing[0]) if missing else ""
     return f"test_required_exact_command_control: run_command now with exactly: {command}" if command else "test_required_exact_command_control: run the exact required TEST_REQUIRED command now"

@@ -2145,7 +2145,13 @@ def missing_must_modify_targets(state: AgentState) -> list[str]:
         path
         for raw_path in task_contract.must_modify_files
         if (path := normalize_workspace_relative_path(raw_path)) and path not in changed and path not in edited_paths
+        and not generated_artifact_target(path)
     ]
+
+
+def generated_artifact_target(path: str) -> bool:
+    normalized = normalize_workspace_relative_path(path)
+    return normalized.startswith(("data/", "output/", "outputs/", "artifacts/"))
 
 
 def normalize_workspace_relative_path(path: str) -> str:

@@ -919,6 +919,28 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         )
         self.assertEqual(required_test_tool_block(missing_test_state, workflow, "write_file", {"path": "/workspace/tests/test_parser.py"}), "")
 
+    def test_test_required_does_not_block_on_generated_output_artifacts(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Build crawler."))
+        state.task_contract = TaskContract(
+            must_modify_files=["crawler.py", "tests/test_parser.py", "fixtures/sample.html", "data/output.json"],
+            must_run_commands=["python3 -m unittest discover -s tests"],
+        )
+        for path in ("crawler.py", "tests/test_parser.py", "fixtures/sample.html"):
+            state.messages.append(
+                {
+                    "role": "tool",
+                    "tool": "write_file",
+                    "exit_code": 0,
+                    "metadata": {"path": path},
+                }
+            )
+        workflow = SimpleNamespace(phase=WorkflowPhase.TEST_REQUIRED, missing_commands=["python3 -m unittest discover -s tests"])
+
+        self.assertEqual(
+            required_test_tool_block(state, workflow, "run_command", {"command": "python3 -m unittest discover -s tests"}),
+            "",
+        )
+
     async def test_agent_loop_sets_must_edit_when_tests_blocked_by_missing_target_files(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
