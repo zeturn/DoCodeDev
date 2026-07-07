@@ -83,7 +83,16 @@ class DoBoxClient:
         return CommandResult(output=str(data.get("output", "")), exit_code=int(data.get("exit_code", 0)), truncated=bool(data.get("truncated", False)))
 
     async def read_file(self, project_id: str, path: str, agent_session_id: str | None = None) -> FileResult:
-        data = await self._request("POST", f"/api/projects/{project_id}/files/read", json={"path": path, "agent_session_id": session_payload_id(agent_session_id)})
+        data = await self._request(
+            "POST",
+            f"/api/projects/{project_id}/files/read",
+            json={
+                "path": path,
+                "max_bytes": 1_000_000,
+                "max_lines": 20_000,
+                "agent_session_id": session_payload_id(agent_session_id),
+            },
+        )
         return FileResult(
             content=str(data.get("content", "")),
             path=str(data["path"]) if data.get("path") is not None else None,
