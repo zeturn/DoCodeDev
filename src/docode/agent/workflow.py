@@ -87,6 +87,7 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
         rerun_commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
         target_file = target_files[0] if target_files else None
         modified = target_file_modified_after_repair_start(state)
+        allowed_next_tools = targeted_repair_workflow_allowed_tools(state, modified)
         return WorkflowSnapshot(
             phase=WorkflowPhase.REPAIR_REQUIRED,
             diff_exists=diff_exists,
@@ -95,15 +96,11 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             required_tests_passed=tests_run,
             final_allowed=False,
             reason="active_targeted_repair",
-            required_action=(
-                f"inspect {target_file or 'the target file'} with read_symbol/read_file_range if needed, then modify it before rerunning tests"
-                if not modified
-                else f"rerun after patch: {rerun_commands[0] if rerun_commands else 'the failing command'}"
-            ),
+            required_action=targeted_repair_required_action(state, target_file, modified, rerun_commands),
             missing_commands=missing_commands,
             active_repair_required=True,
             latest_test_failure_signature=latest_failure_signature,
-            allowed_next_tools=["read_symbol", "read_file_range", "read_file", "edit_file", "apply_patch", "write_file"] if not modified else ["run_command"],
+            allowed_next_tools=allowed_next_tools,
             rerun_after_patch=rerun_commands[0] if rerun_commands else None,
             target_file=target_file,
             target_file_modified_after_repair=modified,
@@ -164,6 +161,24 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
         reason="ready",
         required_action="submit final_candidate for verifier review",
     )
+
+
+def targeted_repair_workflow_allowed_tools(state: AgentState, modified: bool) -> list[str]:
+    if modified:
+        return ["run_command", "git_status", "git_diff"]
+    phase = getattr(state, "targeted_repair_phase", None)
+    if phase == "edit_forced":
+        return ["edit_file", "apply_patch", "write_file", "replace_in_file"]
+    return ["read_symbol", "read_file_range", "read_file", "edit_file", "apply_patch", "write_file", "replace_in_file"]
+
+
+def targeted_repair_required_action(state: AgentState, target_file: str | None, modified: bool, rerun_commands: list[str]) -> str:
+    target = target_file or "the target file"
+    if modified:
+        return f"rerun after patch: {rerun_commands[0] if rerun_commands else 'the failing command'}"
+    if getattr(state, "targeted_repair_phase", None) == "edit_forced":
+        return f"modify {target} now with edit_file/apply_patch/write_file; do not read more context"
+    return f"inspect {target} with read_symbol/read_file_range if needed, then modify it before rerunning tests"
 
 
 def final_candidate_gate(state: AgentState, git_status_output: str) -> FinalGate:
