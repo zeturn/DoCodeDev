@@ -56,9 +56,11 @@ class ContextManager:
         targeted_repair_phase: str | None = None,
         workflow_phase: str | None = None,
     ) -> ContextPack:
-        compact_mode = workflow_phase in {"EDIT_REQUIRED", "TEST_REQUIRED", "FINAL_READY"}
+        repair_active = repair_mode == "targeted_repair" and active_repair_action is not None
+        compact_mode = (workflow_phase in {"EDIT_REQUIRED", "TEST_REQUIRED", "FINAL_READY"}) and not repair_active
         section_bytes = 1_200 if compact_mode else self.section_bytes
         recent_message_limit = 2 if compact_mode else self.recent_message_limit
+
         task_contract_text = self.task_contract(
             job,
             task_contract=task_contract,
@@ -75,7 +77,7 @@ class ContextManager:
             llm_tokens_used=llm_tokens_used,
             llm_cost_used=llm_cost_used,
         )
-        file_memory = self.file_memory(inspection, messages)
+        file_memory = self.file_memory(inspection, messages, repair_active=repair_active)
         latest_evidence = self.latest_evidence(
             git_status,
             messages,
@@ -91,8 +93,8 @@ class ContextManager:
             task_contract=clip_text(task_contract_text, 1_600 if compact_mode else section_bytes),
             repo_map=clip_text(repo_map, 700 if compact_mode else section_bytes),
             working_memory=clip_text(working_memory, 900 if compact_mode else section_bytes),
-            file_memory=clip_text(file_memory, 700 if compact_mode else section_bytes),
-            latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else section_bytes),
+            file_memory=clip_text(file_memory, 700 if compact_mode else (3_000 if repair_active else section_bytes)),
+            latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else (8_000 if repair_active else section_bytes)),
             recent_messages=recent_messages,
         )
 
@@ -137,13 +139,13 @@ class ContextManager:
         if repair_mode:
             parts.append(
                 "Repair Mode:\n"
-                "- The next action must be read_file, edit_file, write_file, replace_in_file, apply_patch, git_status, or git_diff.\n"
-                "- final_candidate and run_command are blocked until git_status shows a modified file."
+                "- The next action must follow the workflow phase and allowed tools.\n"
+                "- final_candidate and unrelated run_command are blocked until the repair target is modified."
             )
         if active_repair_action:
             phase = targeted_repair_phase or "inspect_allowed"
             targets = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "the target file"
-            next_action = f"modify {targets} now" if phase == "edit_forced" else f"inspect {targets} briefly, then modify it"
+            next_action = f"modify {targets} now using edit_file/apply_patch/write_file" if phase == "edit_forced" else f"inspect {targets} briefly, then modify it"
             parts.append(
                 "Active Targeted Repair:\n"
                 + json.dumps(active_repair_action, ensure_ascii=False, indent=2)
@@ -183,7 +185,7 @@ class ContextManager:
             f"Verifier / Model Feedback:\n{feedback or '- None yet.'}"
         )
 
-    def file_memory(self, inspection: ProjectInspection | None, messages: list[dict[str, Any]]) -> str:
+    def file_memory(self, inspection: ProjectInspection | None, messages: list[dict[str, Any]], *, repair_active: bool = False) -> str:
         important = sorted(inspection.important_files) if inspection else []
         touched = sorted(touched_paths(messages))
         parts: list[str] = []
@@ -191,6 +193,10 @@ class ContextManager:
             parts.append("Important files from inspection:\n" + "\n".join(f"- {path}" for path in important))
         if touched:
             parts.append("Touched or inspected paths:\n" + "\n".join(f"- {path}" for path in touched))
+        if repair_active:
+            snippets = repair_file_snippets(messages)
+            if snippets:
+                parts.append("Repair file snippets already available in context:\n" + snippets)
         return "\n\n".join(parts) if parts else "No file memory yet."
 
     def latest_evidence(
@@ -212,6 +218,7 @@ class ContextManager:
         if active_repair_action:
             target_files = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "<none>"
             rerun = ", ".join(str(command) for command in active_repair_action.get("rerun_commands") or []) or "<none>"
+            snippets = repair_file_snippets(messages, output_limit=1600)
             active = (
                 "\n\nActive Targeted Repair:\n"
                 f"- category: {active_repair_action.get('category')}\n"
@@ -219,7 +226,8 @@ class ContextManager:
                 f"- phase: {targeted_repair_phase or 'inspect_allowed'}\n"
                 f"- target_files: {target_files}\n"
                 f"- rerun: {rerun}\n"
-                f"- next_required_action: {'modify ' + target_files + ' now' if targeted_repair_phase == 'edit_forced' else 'inspect briefly, then modify target file'}"
+                f"- next_required_action: {'modify ' + target_files + ' now using edit_file/apply_patch/write_file' if targeted_repair_phase == 'edit_forced' else 'inspect briefly, then modify target file'}"
+                + ("\n\nRepair file snippets:\n" + snippets if snippets else "")
             )
         return (
             f"Git status:\n{git_status.output or '<clean>'}\n\n"
@@ -295,10 +303,37 @@ def tool_evidence(message: dict[str, Any], *, output_limit: int = 900) -> str:
     return f"{tool} exit={exit_code}{truncated}: {output or '<no output>'}{suffix}"
 
 
+def repair_file_snippets(messages: list[dict[str, Any]], *, output_limit: int = 1400) -> str:
+    snippets: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for message in reversed(messages):
+        if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
+            continue
+        tool = str(message.get("tool") or "")
+        if tool not in {"read_file", "read_file_range", "read_symbol"}:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = str(metadata.get("path") or metadata.get("resolved_path") or "<unknown>")
+        symbol = str(metadata.get("symbol") or "")
+        key = (path, symbol or tool)
+        if key in seen:
+            continue
+        seen.add(key)
+        header = f"### {tool}: {path}" + (f" symbol={symbol}" if symbol else "")
+        snippets.append(header + "\n" + clip_text(str(message.get("output") or ""), output_limit))
+        if len(snippets) >= 4:
+            break
+    return "\n\n".join(reversed(snippets))
+
+
 def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     keep = {}
     for key in (
         "path",
+        "symbol",
+        "start_line",
+        "end_line",
+        "definition_line",
         "command",
         "detected",
         "rejected",
