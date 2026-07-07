@@ -40,7 +40,7 @@ class _RepairContextFinder(importlib.abc.MetaPathFinder):
         if fullname != "docode.agent.loop":
             return None
         for finder in sys.meta_path:
-            if finder is self:
+            if finder is self or is_docode_repair_patch_finder(finder):
                 continue
             find_spec = getattr(finder, "find_spec", None)
             if find_spec is None:
@@ -51,6 +51,11 @@ class _RepairContextFinder(importlib.abc.MetaPathFinder):
             spec.loader = _RepairContextLoader(spec.loader)
             return spec
         return None
+
+
+def is_docode_repair_patch_finder(finder: object) -> bool:
+    module = finder.__class__.__module__
+    return module.startswith("docode.agent.targeted_repair_")
 
 
 class _RepairContextLoader(importlib.abc.Loader):
