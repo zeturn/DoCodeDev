@@ -21,6 +21,9 @@ def apply() -> None:
     loop_module.targeted_repair_targets = targeted_repair_targets
     loop_module.targeted_repair_forced_tool = targeted_repair_forced_tool
     loop_module.targeted_repair_allowed_tools_for_phase = targeted_repair_allowed_tools_for_phase
+    loop_module.targeted_repair_read_count = targeted_repair_read_count
+    loop_module.targeted_repair_rerun_satisfied = targeted_repair_rerun_satisfied
+    loop_module.targeted_repair_rerun_command_block = targeted_repair_rerun_command_block
     loop_module.review_repair_target_files = review_repair_target_files
     loop_module.repair_action_from_quality_gate = repair_action_from_quality_gate
     loop_module.allowed_tool_definitions_for_state = allowed_tool_definitions_for_state
@@ -106,12 +109,7 @@ def targeted_repair_targets(state: Any) -> set[str]:
     instruction = str(action.get("instruction") or "")
     combined = "\n".join([category, signature, reason, instruction]).lower()
     if category == "parsed_value_mismatch" or "parsed_value_mismatch" in signature:
-        candidates = [
-            "crawler.py",
-            "tests/test_parser.py",
-            "fixtures/sample.html",
-            "fixtures/sample.csv",
-        ]
+        candidates = ["crawler.py", "tests/test_parser.py", "fixtures/sample.html", "fixtures/sample.csv"]
         allowed = set(state.task_contract.must_modify_files) if state.task_contract is not None else set(candidates)
         for path in candidates:
             if path in allowed:
@@ -124,72 +122,39 @@ def targeted_repair_targets(state: Any) -> set[str]:
     return {loop_module.normalize_workspace_relative_path(path) for path in targets if path}
 
 
-def targeted_repair_forced_tool(
-    state: Any,
-    tool_name: str,
-) -> tuple[str, dict[str, object], str] | None:
-    """Force only deterministic targeted-repair actions."""
+def targeted_repair_forced_tool(state: Any, tool_name: str) -> tuple[str, dict[str, object], str] | None:
+    """Force deterministic targeted-repair actions and focus repeated reads."""
 
     from docode.agent import loop as loop_module
 
     if state.repair_mode != "targeted_repair" or not state.active_repair_action:
         return None
-
     targets = sorted(loop_module.targeted_repair_targets(state))
     if not targets:
         return None
-
     if loop_module.targeted_repair_modified_target(state):
-        action = state.active_repair_action or {}
-        commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
-        if not commands:
+        command = next_targeted_repair_rerun_command(state)
+        if not command:
             return None
-        return (
-            "run_command",
-            {"command": commands[0]},
-            "active_repair_requires_exact_rerun",
-        )
+        return "run_command", {"command": command}, "active_repair_requires_exact_rerun"
 
     target = targets[0]
     read_count = loop_module.targeted_repair_read_count(state)
     if read_count <= 0 and tool_name in {"run_command", "git_status", "git_diff", "search", "list_files"}:
-        return (
-            "read_file",
-            {"path": target},
-            "active_repair_requires_inspection_or_patch",
-        )
-    if read_count > 0 and tool_name == "read_file":
+        return "read_file", {"path": target}, "active_repair_requires_inspection_or_patch"
+    if read_count > 0 and tool_name in {"read_file", "search", "list_files"}:
         symbol = _repair_symbol_hint(state)
         if symbol:
-            return (
-                "read_symbol",
-                {"path": target, "symbol": symbol, "context_lines": 8},
-                "active_repair_retarget_repeated_read_to_symbol",
-            )
-        return (
-            "read_file_range",
-            {"path": target, "start_line": 1, "end_line": 160},
-            "active_repair_retarget_repeated_read_to_range",
-        )
+            return "read_symbol", {"path": target, "symbol": symbol, "context_lines": 8}, "active_repair_retarget_repeated_read_to_symbol"
+        return "read_file_range", {"path": target, "start_line": 1, "end_line": 160}, "active_repair_retarget_repeated_read_to_range"
     return None
 
 
 def _repair_symbol_hint(state: Any) -> str:
     action = state.active_repair_action or {}
-    text = "\n".join(
-        str(action.get(key) or "")
-        for key in ("signature", "reason", "instruction")
-    )
+    text = "\n".join(str(action.get(key) or "") for key in ("signature", "reason", "instruction"))
     lowered = text.lower()
-    known_symbols = [
-        "number_from_text",
-        "parse_trending",
-        "main",
-        "write_events",
-        "dry_run",
-        "preflight",
-    ]
-    for symbol in known_symbols:
+    for symbol in ("number_from_text", "parse_trending", "parse_repositories", "main", "write_events", "dry_run", "preflight"):
         if symbol.lower() in lowered:
             return symbol
     import re
@@ -206,22 +171,77 @@ def targeted_repair_allowed_tools_for_phase(state: Any) -> set[str]:
 
     if loop_module.targeted_repair_modified_target(state):
         return {"run_command", "git_status", "git_diff"}
-    inspect_tools = {
-        "read_file",
-        "read_file_range",
-        "read_symbol",
-        "edit_file",
-        "write_file",
-        "replace_in_file",
-        "apply_patch",
-        "git_status",
-        "git_diff",
-    }
+    inspect_tools = {"read_file", "read_file_range", "read_symbol", "edit_file", "write_file", "replace_in_file", "apply_patch", "git_status", "git_diff"}
     if state.targeted_repair_phase == "inspect_allowed":
         return inspect_tools
     if state.targeted_repair_phase == "edit_forced":
-        return {"edit_file", "write_file", "replace_in_file", "apply_patch"}
+        return {"read_file_range", "read_symbol", "edit_file", "write_file", "replace_in_file", "apply_patch"}
     return inspect_tools
+
+
+def targeted_repair_read_count(state: Any) -> int:
+    if state.active_repair_action is None:
+        return 0
+    count = 0
+    for message in state.messages[state.active_repair_started_at :]:
+        if message.get("role") == "tool" and message.get("tool") in {"read_file", "read_file_range", "read_symbol", "search", "list_files"}:
+            count += 1
+    return count
+
+
+def targeted_repair_rerun_satisfied(state: Any) -> bool:
+    from docode.agent import loop as loop_module
+
+    action = state.active_repair_action or {}
+    commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
+    if not commands:
+        return bool(action) and loop_module.targeted_repair_modified_target(state)
+    if not loop_module.targeted_repair_modified_target(state):
+        return False
+    observed = targeted_repair_successful_commands_after_latest_edit(state)
+    return all(any(loop_module.commands_equivalent(seen, command) for seen in observed) for command in commands)
+
+
+def targeted_repair_successful_commands_after_latest_edit(state: Any) -> list[str]:
+    start = state.active_repair_started_at
+    for index in range(len(state.messages) - 1, state.active_repair_started_at - 1, -1):
+        message = state.messages[index]
+        if message.get("role") == "tool" and message.get("tool") in {"write_file", "edit_file", "replace_in_file", "apply_patch"} and int(message.get("exit_code") or 0) == 0:
+            start = index + 1
+            break
+    observed: list[str] = []
+    for message in state.messages[start:]:
+        if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        command = " ".join(str(metadata.get("command") or "").split())
+        if command:
+            observed.append(command)
+    return observed
+
+
+def next_targeted_repair_rerun_command(state: Any) -> str:
+    from docode.agent import loop as loop_module
+
+    action = state.active_repair_action or {}
+    commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
+    observed = targeted_repair_successful_commands_after_latest_edit(state)
+    for command in commands:
+        if not any(loop_module.commands_equivalent(seen, command) for seen in observed):
+            return command
+    return ""
+
+
+def targeted_repair_rerun_command_block(state: Any, args: dict[str, object]) -> str:
+    from docode.agent import loop as loop_module
+
+    command = next_targeted_repair_rerun_command(state)
+    if not command:
+        return ""
+    observed = " ".join(str(args.get("command") or "").strip().split())
+    if loop_module.commands_equivalent(observed, command):
+        return ""
+    return f"Active targeted repair was modified; rerun this repair command now: {command}"
 
 
 def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> list[Any]:
@@ -230,6 +250,9 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> li
     from docode.agent import loop as loop_module
 
     loop_module.refresh_targeted_repair_phase(state)
+    if state.repair_mode == "targeted_repair" and state.active_repair_action:
+        allowed = targeted_repair_allowed_tools_for_phase(state)
+        return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     workflow = loop_module.workflow_snapshot(state, status_output)
     if workflow.phase == loop_module.WorkflowPhase.TEST_REQUIRED and not loop_module.missing_must_modify_targets(state):
@@ -265,7 +288,6 @@ def repair_action_from_quality_gate(result: Any):
     blockers = list(result.blockers())
     if not blockers:
         return None
-
     target_files: list[str] = []
     lines = ["Quality gate blocked finalization. Modify the listed target file(s) before running commands again."]
     for issue in blockers:
@@ -284,18 +306,11 @@ def repair_action_from_quality_gate(result: Any):
         from docode.agent import loop as loop_module
 
         issue_text = "\n".join(f"{getattr(issue, 'code', '')}: {getattr(issue, 'message', '')}" for issue in blockers)
-        return loop_module.plan_repair_from_tool_result(
-            tool="run_command",
-            output=issue_text,
-            metadata={"command": "python3 crawler.py --dry-run"},
-        )
+        return loop_module.plan_repair_from_tool_result(tool="run_command", output=issue_text, metadata={"command": "python3 crawler.py --dry-run"})
 
     from docode.agent.repair_planner import RepairAction
 
-    signature_source = "|".join(
-        f"{getattr(issue, 'code', '')}:{getattr(issue, 'message', '')}:{getattr(issue, 'path', '')}"
-        for issue in blockers
-    )
+    signature_source = "|".join(f"{getattr(issue, 'code', '')}:{getattr(issue, 'message', '')}:{getattr(issue, 'path', '')}" for issue in blockers)
     return RepairAction(
         category="quality_gate_repair",
         signature="quality:" + str(abs(hash(signature_source)))[:12],
@@ -313,67 +328,17 @@ def repair_action_from_quality_gate(result: Any):
 def review_repair_target_files(task_contract: Any | None, issue_text: str = "") -> list[str]:
     if task_contract is None or not task_contract.must_modify_files:
         return []
-
     lower = issue_text.lower()
     preferred: list[str] = []
-    parser_issue = any(
-        token in lower
-        for token in (
-            "parser",
-            "parse",
-            "parsed",
-            "output",
-            "owner",
-            "repository",
-            "url",
-            "language",
-            "stars",
-            "forks",
-            "record",
-            "field",
-            "schema",
-            "dry-run",
-            "json",
-            "events.jsonl",
-        )
-    )
-    fixture_inconsistency = any(
-        token in lower
-        for token in (
-            "fixture inconsistent",
-            "inconsistent fixture",
-            "fixture contradicts",
-            "sample html contradicts",
-            "test fixture contradicts",
-            "fixture/test consistency",
-            "assertionerror",
-            "tests/test_parser.py",
-        )
-    )
-
+    parser_issue = any(token in lower for token in ("parser", "parse", "parsed", "output", "owner", "repository", "url", "language", "stars", "forks", "record", "field", "schema", "dry-run", "json", "events.jsonl"))
+    fixture_inconsistency = any(token in lower for token in ("fixture inconsistent", "inconsistent fixture", "fixture contradicts", "sample html contradicts", "test fixture contradicts", "fixture/test consistency", "assertionerror", "tests/test_parser.py"))
     if parser_issue:
-        preferred.append("crawler.py")
-        preferred.append("tests/test_parser.py")
-        preferred.append("fixtures/sample.html")
-        preferred.append("fixtures/sample.csv")
+        preferred.extend(["crawler.py", "tests/test_parser.py", "fixtures/sample.html", "fixtures/sample.csv"])
     if fixture_inconsistency:
-        preferred.append("tests/test_parser.py")
-        preferred.append("fixtures/sample.html")
-        preferred.append("fixtures/sample.csv")
+        preferred.extend(["tests/test_parser.py", "fixtures/sample.html", "fixtures/sample.csv"])
     if "schema" in lower:
         preferred.append("schemas/output.schema.json")
-
-    preferred.extend(
-        [
-            "crawler.py",
-            "tests/test_parser.py",
-            "fixtures/sample.html",
-            "fixtures/sample.csv",
-            "schemas/output.schema.json",
-            "manifest.json",
-            "sources.json",
-        ]
-    )
+    preferred.extend(["crawler.py", "tests/test_parser.py", "fixtures/sample.html", "fixtures/sample.csv", "schemas/output.schema.json", "manifest.json", "sources.json"])
     available = set(task_contract.must_modify_files)
     ordered: list[str] = []
     for path in preferred:
