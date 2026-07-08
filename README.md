@@ -35,6 +35,22 @@ python -m pip install -e ".[dev]"
 uvicorn docode.main:app --reload --port 8110
 ```
 
+Recommended local test commands:
+
+Windows PowerShell:
+
+```powershell
+$env:PYTHONPATH='src'; python -m unittest discover -s tests
+```
+
+Unix/macOS:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+Use `python` for host-side local tests so the command works on platforms where `python3` is not installed. Agent tasks still preserve and enforce user-declared verification commands exactly.
+
 Create a deterministic smoke-test job against the configured DoBox API without calling a real LLM:
 
 ```bash
@@ -52,6 +68,12 @@ docode eval jobs .docode/eval-suite/manifest.json --results-dir .docode/eval-res
 docode eval run .docode/eval-results --report .docode/eval-report.json
 docode eval assert .docode/eval-report.json --min-success-rate 0.8 --max-avg-tool-calls 30 --max-cost 1.00
 ```
+
+Before attempting any GitHub Trends eval, run a minimal generic eval ladder:
+
+1. README edit: update `README.md` with one sentence; the agent must edit the file, produce a non-empty diff, and submit `final_candidate`.
+2. Calculator bugfix: a repo with `calculator.py` and `tests/test_calculator.py`; the instruction explicitly includes the verification command, and the agent must edit source, run that exact command, and submit `final_candidate`.
+3. Generic parser fixture: a repo with `parser.py`, `fixture.html`, and `tests/test_parser.py`; the task must avoid product-specific repository examples and validate reading the fixture/test/source, implementing the parser, and passing tests.
 
 `smoke-check` verifies configured DoBox health, local DoBox backend path, Docker CLI/daemon access, APICred model access, local `gh` availability, database path, and artifact directory. `smoke-run` first runs those checks and then executes a `provider=scripted` end-to-end job when DoBox is reachable. Pass `--start-dobox` to temporarily run `go run ./cmd/server` from the configured local DoBox backend directory for the duration of the smoke check or smoke job.
 `eval scaffold` creates ten small git repositories covering Python bugfix, Python CLI, crawler, API adapter, README-only, JS bugfix, no-test project, bad web source repair, large command output, and GitHub PR artifact export scenarios. `eval jobs` runs manifest cases through DoCode jobs and writes per-case result JSON files. `eval run` aggregates those saved eval results into a report with success rate, iterations, tool calls, token/cost totals, failure reasons, and verification-plan failures. `eval run` and `eval assert` accept `--min-success-rate`, `--max-avg-tool-calls`, and `--max-cost`; when a threshold fails, the report includes `regression`, `thresholds`, and `threshold_failures`, and the command exits non-zero.

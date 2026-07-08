@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
@@ -86,10 +87,12 @@ class SQLiteRepositoryTests(IsolatedAsyncioTestCase):
                 job = await repo.create_job(CodingJob(id=new_id("job"), user_id="user-1", instruction="heartbeat"))
                 first = await repo.get_job(job.id)
                 assert first is not None
+                await asyncio.sleep(0.01)
                 await repo.add_step(job.id, "system", {"type": "heartbeat"})
                 after_step = await repo.get_job(job.id)
                 assert after_step is not None
                 self.assertGreater(after_step.updated_at, first.updated_at)
+                await asyncio.sleep(0.01)
                 await repo.add_artifact(job.id, "zip", "/tmp/out.zip", 5)
                 after_artifact = await repo.get_job(job.id)
                 assert after_artifact is not None

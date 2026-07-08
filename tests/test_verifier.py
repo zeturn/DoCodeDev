@@ -7,6 +7,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
 
+from docode.runtime.python_cmd import local_python_command_args
 from docode.agent.verifier import (
     CodingVerifier,
     VerificationEvidence,
@@ -602,7 +603,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
             (output_dir / "output.json").write_text(json.dumps([{"name": "a"}, {"name": "b"}]), encoding="utf-8")
 
             result = subprocess.run(
-                ["python3", "-c", json_output_check_script(2)],
+                local_python_command_args("-c", json_output_check_script(2)),
                 cwd=tmp,
                 text=True,
                 capture_output=True,

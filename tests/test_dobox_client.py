@@ -74,7 +74,10 @@ class DoBoxClientTests(IsolatedAsyncioTestCase):
         self.assertEqual(result.bytes_read, 7)
         self.assertTrue(result.truncated)
         self.assertEqual(client.requests[0]["path"], "/api/projects/project-1/files/read")
-        self.assertEqual(client.requests[0]["json"], {"path": "large.txt", "agent_session_id": 42})
+        self.assertEqual(client.requests[0]["json"]["path"], "large.txt")
+        self.assertEqual(client.requests[0]["json"]["agent_session_id"], 42)
+        self.assertGreater(client.requests[0]["json"]["max_bytes"], 0)
+        self.assertGreater(client.requests[0]["json"]["max_lines"], 0)
 
     def test_session_payload_id_and_project_path_helpers(self) -> None:
         self.assertEqual(session_payload_id("7"), 7)
