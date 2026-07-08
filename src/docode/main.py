@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from docode.api.auth import make_user_context_dependency
+from docode.api.frontend import mount_frontend
 from docode.api.routes_artifacts import make_artifacts_router
 from docode.api.routes_health import router as health_router
 from docode.api.routes_jobs import make_jobs_router
@@ -64,3 +65,4 @@ app.include_router(health_router)
 app.include_router(make_jobs_router(repository, queue, config, user_context_dependency))
 app.include_router(make_artifacts_router(repository, user_context_dependency))
 app.include_router(make_runtime_router(config, user_context_dependency))
+mount_frontend(app)

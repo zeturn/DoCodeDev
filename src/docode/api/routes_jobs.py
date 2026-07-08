@@ -13,7 +13,7 @@ from docode.api.job_actions import CreateJobInput, JobActionError, cancel_existi
 from docode.config import DocodeConfig
 from docode.llm.credentials import APICredCredentialResolver
 from docode.llm.model_policy import DocodeModelPolicy
-from docode.storage.models import public_job_dict
+from docode.storage.models import JobStatus, public_job_dict
 from docode.storage.repository import JobRepository
 from docode.worker.queue import AsyncJobQueue
 from docode.worker.runner import JobRunnerService
@@ -41,6 +41,20 @@ class CreateJobRequest(BaseModel):
 def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: DocodeConfig, user_dependency=get_user_context) -> APIRouter:
     router = APIRouter(prefix="/v1/jobs", tags=["jobs"])
     runner = JobRunnerService(config=config, repository=repository)
+
+    @router.get("")
+    async def list_jobs(status: str | None = None, user: UserContext = Depends(user_dependency)) -> list[dict[str, object]]:
+        status_filter: set[JobStatus] | None = None
+        if status:
+            try:
+                status_filter = {JobStatus(status)}
+            except ValueError as exc:
+                allowed = ", ".join(status.value for status in JobStatus)
+                raise HTTPException(status_code=400, detail=f"unsupported job status '{status}', expected one of: {allowed}") from exc
+
+        jobs = [job for job in await repository.list_jobs(status_filter) if job.user_id == user.user_id]
+        jobs.sort(key=lambda job: job.created_at, reverse=True)
+        return jsonable_encoder([public_job_dict(job) for job in jobs])
 
     @router.post("")
     async def create_job(req: CreateJobRequest, background_tasks: BackgroundTasks, user: UserContext = Depends(user_dependency)) -> dict[str, str]:
