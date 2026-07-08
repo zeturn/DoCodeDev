@@ -1,4 +1,4 @@
-import React, { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { type Dispatch, type FormEvent, type SetStateAction, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Job,
   JobStatus,
@@ -67,18 +67,21 @@ function App() {
     try {
       const loaded = await listJobs(authToken, statusFilter || undefined);
       setJobs(loaded);
-      if (!selectedJobId && loaded.length > 0) {
-        setSelectedJobId(loaded[0].id);
-      }
-      if (selectedJobId && !loaded.some((job) => job.id === selectedJobId)) {
-        setSelectedJobId(loaded[0]?.id ?? null);
-      }
+      setSelectedJobId((current) => {
+        if (!current && loaded.length > 0) {
+          return loaded[0].id;
+        }
+        if (current && !loaded.some((job) => job.id === current)) {
+          return loaded[0]?.id ?? null;
+        }
+        return current;
+      });
     } catch (err) {
       setError(errorMessage(err));
     } finally {
       setLoadingJobs(false);
     }
-  }, [authToken, selectedJobId, statusFilter]);
+  }, [authToken, statusFilter]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_TOKEN_KEY, authToken);
@@ -96,7 +99,7 @@ function App() {
     }
 
     const controller = new AbortController();
-    setSelectedJob(selectedJobFromList);
+    setSelectedJob(null);
     setSteps([]);
     setStreamError(null);
     setStreaming(true);
@@ -137,7 +140,12 @@ function App() {
                 patchJobStatus(selectedJobId, nextStatus);
               }
               setStreaming(false);
-              void refreshJobs();
+              void getJob(selectedJobId, authToken).then((job) => {
+                if (!controller.signal.aborted) {
+                  setSelectedJob(job);
+                  upsertJob(setJobs, job);
+                }
+              }).catch(() => undefined);
             }
           },
           controller.signal
@@ -155,7 +163,7 @@ function App() {
 
     void loadAndStream();
     return () => controller.abort();
-  }, [authToken, refreshJobs, selectedJobFromList, selectedJobId]);
+  }, [authToken, selectedJobId]);
 
   const activeJob = selectedJob ?? selectedJobFromList;
 
@@ -186,8 +194,9 @@ function App() {
         authToken
       );
       setForm({ ...initialJobForm, github_repo: form.github_repo, repo_url: form.repo_url, base_branch: form.base_branch || 'main' });
+      setStatusFilter('');
       setSelectedJobId(created.job_id);
-      await refreshJobs();
+      setJobs(await listJobs(authToken));
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -441,7 +450,7 @@ function App() {
 
 export default App;
 
-function upsertJob(setJobs: React.Dispatch<React.SetStateAction<Job[]>>, job: Job) {
+function upsertJob(setJobs: Dispatch<SetStateAction<Job[]>>, job: Job) {
   setJobs((current) => {
     const exists = current.some((item) => item.id === job.id);
     const next = exists ? current.map((item) => (item.id === job.id ? job : item)) : [job, ...current];
