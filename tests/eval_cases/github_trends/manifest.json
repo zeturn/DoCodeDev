@@ -1,0 +1,17 @@
+{
+  "name": "github_trends_crawler",
+  "description": "External eval fixture for a GitHub Trending crawler. Production agent code must not embed this solution.",
+  "instruction": "Implement the crawler according to README.md. Do not hardcode the sample values; parse them from the provided HTML fixture.",
+  "repo_path": "tests/eval_cases/github_trends/repo",
+  "hidden_tests_path": "tests/eval_cases/github_trends/hidden_tests",
+  "must_modify_files": [
+    "crawler.py",
+    "tests/test_parser.py",
+    "fixtures/sample.html"
+  ],
+  "must_run_commands": [
+    "python3 -m unittest discover -s tests",
+    "python3 crawler.py --preflight",
+    "python3 crawler.py --dry-run"
+  ]
+}
