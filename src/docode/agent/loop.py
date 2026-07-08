@@ -173,7 +173,7 @@ class CodingAgentLoop:
                     )
                     tool_name = forced_tool_name
                     tool_args = forced_tool_args
-                review_retargeted_args = targeted_review_repair_retarget_args(state, tool_name)
+                review_retargeted_args = None
                 if review_retargeted_args is not None:
                     await self.repository.add_step(
                         job.id,
@@ -1384,7 +1384,7 @@ def refresh_targeted_repair_phase(state: AgentState) -> None:
     state.targeted_repair_phase = "edit_forced" if observed >= budget else "inspect_allowed"
 
 
-def targeted_repair_inspection_budget(state: AgentState) -> int:
+def _repaitargetedr_inspection_budget(state: AgentState) -> int:
     action = state.active_repair_action or {}
     try:
         raw_budget = action.get("initial_inspection_budget")
@@ -1707,7 +1707,7 @@ def crawler_missing_artifact_file_retarget_args(
     if tool_name == "write_file" and requested in missing:
         return None
     target = missing[0]
-    content = default_crawler_artifact_file_content(target, state)
+    content = None
     if content is None:
         return None
     return {"path": target, "content": content}
@@ -1748,7 +1748,7 @@ def targeted_repair_forced_tool(
         return "run_command", {"command": command}, "active_repair_requires_exact_rerun"
     refresh_targeted_repair_phase(state)
     if state.targeted_repair_phase == "edit_forced" and tool_name not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
-        content = default_crawler_artifact_file_content(target, state)
+        content = None
         if content is not None:
             return (
                 "write_file",
@@ -1764,7 +1764,7 @@ def targeted_repair_forced_tool(
             "active_repair_requires_inspection_or_patch",
         )
     if read_count > 0 and tool_name in {"run_command", "read_file", "search", "list_files"}:
-        content = default_crawler_artifact_file_content(target, state)
+        content = None
         if content is not None:
             return (
                 "write_file",
@@ -1796,369 +1796,6 @@ def preferred_targeted_repair_target(state: AgentState, targets: list[str]) -> s
         if candidate in targets:
             return candidate
     return targets[0]
-
-
-def targeted_review_repair_retarget_args(state: AgentState, tool_name: str) -> dict[str, object] | None:
-    action = state.active_repair_action or {}
-    if state.repair_mode != "targeted_repair" or action.get("category") not in {
-        "review_repair",
-        "json_semantic_failure",
-        "missing_required_field",
-    }:
-        return None
-    if targeted_repair_modified_target(state):
-        return None
-    if tool_name != "run_command":
-        return None
-    action_targets = [normalize_workspace_relative_path(str(path)) for path in action.get("target_files") or [] if str(path)]
-    target = next((path for path in action_targets if default_crawler_artifact_file_content(path, state) is not None), "")
-    if not target:
-        return None
-    content = default_crawler_artifact_file_content(target, state)
-    if content is None:
-        return None
-    return {"path": target, "content": content}
-
-
-def default_crawler_artifact_file_content(path: str, state: AgentState) -> str | None:
-    source_urls = instruction_source_urls(state.job.instruction)
-    source_url = source_urls[0] if source_urls else "https://github.com/trending"
-    domains = sorted(instruction_source_domains(state.job.instruction)) or ["github.com"]
-    objective_match = re.search(r"Objective id:\s*([A-Za-z0-9_.:-]+)", state.job.instruction)
-    objective_id = objective_match.group(1) if objective_match else state.job.id
-    if path == "crawler.py":
-        return f'''#!/usr/bin/env python3
-from __future__ import annotations
-
-import argparse
-import csv
-import html
-import html.parser
-import json
-import re
-import urllib.request
-from pathlib import Path
-
-SOURCE_URL = "{source_url}"
-OBJECTIVE_ID = "{objective_id}"
-SCHEMA = "https_github_com_trending"
-SINK_PATH = Path(".araneae/sink/events.jsonl")
-FIXTURE_PATH = Path("fixtures/sample.html")
-
-
-def number_from_text(value: str) -> int:
-    text = value.replace(",", "").strip().lower()
-    match = re.search(r"(\\d+(?:\\.\\d+)?)\\s*([km]?)", text)
-    if not match:
-        return 0
-    number = float(match.group(1))
-    suffix = match.group(2)
-    if suffix == "k":
-        number *= 1000
-    elif suffix == "m":
-        number *= 1000000
-    return int(number)
-
-
-class TrendingParser(html.parser.HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.records: list[dict[str, object]] = []
-        self.current: dict[str, object] | None = None
-        self.capture: str | None = None
-        self.link_seen = False
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attrs_dict = dict(attrs)
-        class_name = attrs_dict.get("class", "")
-        if tag == "article" and "Box-row" in class_name:
-            self.current = {{"description": "", "language": "", "stars_today": 0, "total_stars": 0, "forks": 0}}
-            self.link_seen = False
-        if self.current is None:
-            return
-        href = attrs_dict.get("href", "")
-        if tag == "a" and href.startswith("/") and href.count("/") >= 2 and not self.link_seen:
-            parts = [part.strip() for part in href.strip("/").split("/")[:2]]
-            if len(parts) == 2:
-                self.current["owner"] = parts[0]
-                self.current["repository_name"] = parts[1]
-                self.current["url"] = "https://github.com/" + "/".join(parts)
-                self.link_seen = True
-        if tag == "p":
-            self.capture = "description"
-        elif tag == "span":
-            self.capture = "span"
-        elif tag == "a" and "Link--muted" in class_name:
-            self.capture = "stat"
-
-    def handle_data(self, data: str) -> None:
-        if self.current is None:
-            return
-        text = " ".join(data.split())
-        if not text:
-            return
-        if self.capture == "description" and not self.current.get("description"):
-            self.current["description"] = text
-        elif self.capture == "span":
-            if "stars today" in text.lower():
-                self.current["stars_today"] = number_from_text(text)
-            elif not self.current.get("language") and not any(char.isdigit() for char in text):
-                self.current["language"] = text
-        elif self.capture == "stat":
-            if not self.current.get("total_stars"):
-                self.current["total_stars"] = number_from_text(text)
-            elif not self.current.get("forks"):
-                self.current["forks"] = number_from_text(text)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in {{"p", "span", "a"}}:
-            self.capture = None
-        if tag == "article" and self.current is not None:
-            if self.current.get("owner") and self.current.get("repository_name"):
-                self.records.append(normalize_record(self.current))
-            self.current = None
-
-
-def normalize_record(raw: dict[str, object]) -> dict[str, object]:
-    owner = str(raw.get("owner") or "")
-    repository_name = str(raw.get("repository_name") or "")
-    repository = f"{{owner}}/{{repository_name}}" if owner and repository_name else ""
-    return {{
-        "repository": repository,
-        "repository_name": repository_name,
-        "owner": owner,
-        "description": str(raw.get("description") or ""),
-        "language": str(raw.get("language") or ""),
-        "stars_today": int(raw.get("stars_today") or 0),
-        "total_stars": int(raw.get("total_stars") or 0),
-        "forks": int(raw.get("forks") or 0),
-        "url": str(raw.get("url") or ""),
-    }}
-
-
-def strip_tags(value: str) -> str:
-    return html.unescape(" ".join(re.sub(r"<[^>]+>", " ", value).split()))
-
-
-def first_match(pattern: str, text: str, default: str = "") -> str:
-    match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-    return html.unescape(match.group(1).strip()) if match else default
-
-
-def parse_trending(html_text: str) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    articles = re.findall(r"<article\\b[^>]*>(.*?)</article>", html_text, flags=re.IGNORECASE | re.DOTALL)
-    if not articles:
-        articles = re.findall(r"<div\\b[^>]*class=[\\\"'][^\\\"']*Box-row[^\\\"']*[\\\"'][^>]*>(.*?)</div>", html_text, flags=re.IGNORECASE | re.DOTALL)
-    for article in articles:
-        href = first_match(r"<h2\\b.*?<a\\b[^>]*href=[\\\"'](/[^\\\"']+/[^\\\"']+)[\\\"']", article)
-        if not href:
-            href = first_match(r"<a\\b[^>]*href=[\\\"'](/[^\\\"']+/[^\\\"']+)[\\\"']", article)
-        parts = [part.strip() for part in href.strip("/").split("/")[:2]]
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            continue
-        description = strip_tags(first_match(r"<p\\b[^>]*>(.*?)</p>", article))
-        language = strip_tags(first_match(r"itemprop=[\\\"']programmingLanguage[\\\"'][^>]*>(.*?)</span>", article))
-        if not language:
-            language = strip_tags(first_match(r"repo-language-color.*?</span>\\s*<span[^>]*>(.*?)</span>", article))
-        stars_today_text = first_match(r"([0-9][0-9,.]*\\s*(?:[kKmM])?\\s+stars?\\s+today)", article)
-        stars_text = first_match(r"href=[\\\"'][^\\\"']*/stargazers[\\\"'][^>]*>(.*?)</a>", article)
-        forks_text = first_match(r"href=[\\\"'][^\\\"']*/forks[\\\"'][^>]*>(.*?)</a>", article)
-        records.append(
-            normalize_record(
-                {{
-                    "owner": parts[0],
-                    "repository_name": parts[1],
-                    "description": description,
-                    "language": language,
-                    "stars_today": number_from_text(stars_today_text),
-                    "total_stars": number_from_text(strip_tags(stars_text)),
-                    "forks": number_from_text(strip_tags(forks_text)),
-                    "url": "https://github.com/" + "/".join(parts),
-                }}
-            )
-        )
-    return records
-
-
-def fetch_source() -> str:
-    request = urllib.request.Request(SOURCE_URL, headers={{"User-Agent": "cis-araneae-github-trends/1.0"}})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8", errors="replace")
-
-
-def write_sink(records: list[dict[str, object]], path: Path = SINK_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            event = {{"type": "record", "schema": SCHEMA, "objective_id": OBJECTIVE_ID, "record": record}}
-            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\\n")
-
-
-def write_sample_csv(records: list[dict[str, object]]) -> None:
-    Path("fixtures").mkdir(exist_ok=True)
-    with Path("fixtures/sample.csv").open("w", encoding="utf-8", newline="") as handle:
-        fieldnames = ["repository", "repository_name", "owner", "description", "language", "stars_today", "total_stars", "forks", "url"]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(records)
-
-
-def load_fixture() -> str:
-    return FIXTURE_PATH.read_text(encoding="utf-8")
-
-
-def preflight() -> int:
-    html = load_fixture()
-    records = parse_trending(html)
-    if not records:
-        raise SystemExit("fixture produced no records")
-    print(f"preflight ok: {{len(records)}} fixture record(s)")
-    return 0
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--preflight", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--source")
-    parser.add_argument("--output")
-    args = parser.parse_args()
-    if args.preflight:
-        return preflight()
-    if args.source:
-        html = Path(args.source).read_text(encoding="utf-8")
-    else:
-        html = load_fixture() if args.dry_run else fetch_source()
-    records = parse_trending(html)
-    if not records:
-        raise SystemExit("no GitHub trending records parsed")
-    write_sink(records)
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(records, ensure_ascii=False, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
-    if args.dry_run:
-        write_sample_csv(records)
-        target = args.output or str(SINK_PATH)
-        print(f"dry-run complete: wrote {{len(records)}} record(s) to {{target}}")
-    else:
-        print(f"crawl complete: wrote {{len(records)}} record(s) to {{SINK_PATH}}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-'''
-    if path == "manifest.json":
-        return json_dumps_compact(
-            {
-                "name": "github-trending-crawler",
-                "version": "0.1.0",
-                "runtime": "python3",
-                "entry_command": "python crawler.py",
-                "hashslip": {"enabled": True},
-                "preflight": {"required": True},
-                "safety": {
-                    "allowed_domains": domains,
-                    "blocked_private_networks": True,
-                    "disable_shell": True,
-                    "network_egress_policy": "manifest_only",
-                    "secrets_access": "none",
-                },
-            }
-        )
-    if path == "requirements.txt":
-        return ""
-    if path == "tests/test_parser.py":
-        return (
-            "import importlib.util\n"
-            "import pathlib\n"
-            "import unittest\n\n"
-            "ROOT = pathlib.Path(__file__).resolve().parents[1]\n"
-            "SPEC = importlib.util.spec_from_file_location('crawler', ROOT / 'crawler.py')\n"
-            "crawler = importlib.util.module_from_spec(SPEC)\n"
-            "SPEC.loader.exec_module(crawler)\n\n\n"
-            "class ParserTest(unittest.TestCase):\n"
-            "    def test_parse_fixture_records(self):\n"
-            "        html = (ROOT / 'fixtures' / 'sample.html').read_text(encoding='utf-8')\n"
-            "        records = crawler.parse_trending(html)\n"
-            "        self.assertGreaterEqual(len(records), 2)\n"
-            "        first = records[0]\n"
-            "        self.assertEqual(first['owner'], 'owner')\n"
-            "        self.assertEqual(first['repository'], 'owner/repo')\n"
-            "        self.assertEqual(first['repository_name'], 'repo')\n"
-            "        self.assertEqual(first['url'], 'https://github.com/owner/repo')\n"
-            "        self.assertEqual(first['language'], 'Python')\n"
-            "        self.assertEqual(first['stars_today'], 56)\n"
-            "        self.assertEqual(first['total_stars'], 1234)\n"
-            "        self.assertEqual(first['forks'], 78)\n\n"
-            "    def test_number_parser(self):\n"
-            "        self.assertEqual(crawler.number_from_text('1.2k'), 1200)\n"
-            "        self.assertEqual(crawler.number_from_text('56 stars today'), 56)\n\n\n"
-            "if __name__ == '__main__':\n"
-            "    unittest.main()\n"
-        )
-    if path == "fixtures/sample.html":
-        return (
-            "<!doctype html><html><body><main>\n"
-            "<article class=\"Box-row\">\n"
-            "<h2 class=\"h3 lh-condensed\"><a href=\"/owner/repo\">owner / repo</a></h2>\n"
-            "<p class=\"col-9 color-fg-muted my-1 pr-4\">A sample trending repository.</p>\n"
-            "<span itemprop=\"programmingLanguage\">Python</span>\n"
-            "<a class=\"Link--muted d-inline-block mr-3\" href=\"/owner/repo/stargazers\">1,234</a>\n"
-            "<a class=\"Link--muted d-inline-block mr-3\" href=\"/owner/repo/forks\">78</a>\n"
-            "<span class=\"d-inline-block float-sm-right\">56 stars today</span>\n"
-            "</article>\n"
-            "<article class=\"Box-row\">\n"
-            "<h2 class=\"h3 lh-condensed\"><a href=\"/acme/tools\">acme / tools</a></h2>\n"
-            "<p class=\"col-9 color-fg-muted my-1 pr-4\">Useful developer tools.</p>\n"
-            "<span itemprop=\"programmingLanguage\">Go</span>\n"
-            "<a class=\"Link--muted d-inline-block mr-3\" href=\"/acme/tools/stargazers\">2,345</a>\n"
-            "<a class=\"Link--muted d-inline-block mr-3\" href=\"/acme/tools/forks\">120</a>\n"
-            "<span class=\"d-inline-block float-sm-right\">42 stars today</span>\n"
-            "</article>\n"
-            "</main></body></html>\n"
-        )
-    if path == "fixtures/sample.csv":
-        return "repository,repository_name,owner,description,language,stars_today,total_stars,forks,url\nowner/repo,repo,owner,A sample trending repository.,Python,56,1234,0,https://github.com/owner/repo\n"
-    if path in {"schemas/output.schema.json", "schemas/github_trends.schema.json"}:
-        return json_dumps_compact(
-            {
-                "type": "object",
-                "required": [
-                    "rank",
-                    "owner",
-                    "repository_name",
-                    "repository",
-                    "url",
-                    "description",
-                    "language",
-                    "stars_today",
-                    "total_stars",
-                    "forks",
-                ],
-                "properties": {
-                    "rank": {"type": "integer"},
-                    "repository": {"type": "string"},
-                    "repository_name": {"type": "string"},
-                    "owner": {"type": "string"},
-                    "description": {"type": "string"},
-                    "language": {"type": "string"},
-                    "stars_today": {"type": "integer"},
-                    "total_stars": {"type": "integer"},
-                    "forks": {"type": "integer"},
-                    "url": {"type": "string"},
-                },
-            }
-        )
-    if path == "sources.json":
-        return json_dumps_compact([{"name": "GitHub Trending Page", "url": source_url, "allowed_domains": domains}])
-    if path == "CHANGELOG.md":
-        return "# Changelog\n\n- Initial GitHub Trending crawler artifact.\n"
-    if path == "README.md":
-        return "# GitHub Trending Crawler\n\nRun `python crawler.py --preflight` or `python crawler.py --dry-run`.\n"
-    return None
 
 
 def json_dumps_compact(value: object) -> str:
