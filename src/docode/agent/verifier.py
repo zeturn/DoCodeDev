@@ -642,7 +642,7 @@ def evaluate_verification_plan(
     fixes: list[str] = []
     changed_files = changed_files_from_diff(diff)
     diff_lowered = diff.lower()
-    if plan.require_test_change and not bugfix_test_evidence_ok(test_result, smoke_result) and not has_test_change(changed_files) and not evidence.has_no_test_reason:
+    if plan.require_test_change and not bugfix_test_evidence_ok(test_result, smoke_result, evidence) and not has_test_change(changed_files) and not evidence.has_no_test_reason:
         fixes.append("add or update a related test for this bugfix, or record why no automated test is appropriate")
     if plan.forbid_code_changes:
         code_changes = [path for path in changed_files if has_code_like_changes([path]) and not path.endswith((".md", ".mdx", ".txt"))]
@@ -670,11 +670,18 @@ def has_test_change(changed_files: list[str]) -> bool:
     return any("/test" in path or path.startswith("test") or path.startswith("tests/") for path in changed_files)
 
 
-def bugfix_test_evidence_ok(test_result: ToolResult, smoke_result: ToolResult) -> bool:
+def bugfix_test_evidence_ok(test_result: ToolResult, smoke_result: ToolResult, evidence: VerificationEvidence | None = None) -> bool:
     if test_result.exit_code == 0 and test_result.metadata and test_result.metadata.get("detected"):
         return True
     command = str((smoke_result.metadata or {}).get("command") or "").lower()
-    return smoke_result.exit_code == 0 and any(marker in command for marker in ("pytest", "unittest", "npm test", "go test", "cargo test"))
+    if smoke_result.exit_code == 0 and command_is_test_command(command):
+        return True
+    return any(command_is_test_command(command) for command in (evidence.successful_commands or []) if evidence is not None)
+
+
+def command_is_test_command(command: str) -> bool:
+    lowered = command.lower()
+    return any(marker in lowered for marker in ("pytest", "unittest", "npm test", "go test", "cargo test"))
 
 
 def diff_contains_file_terms(diff: str, path: str, terms: list[str]) -> bool:

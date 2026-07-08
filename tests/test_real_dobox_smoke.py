@@ -23,9 +23,15 @@ from tests.test_real_llm_smoke import build_real_llm_or_skip, summarize_job_step
 from tests.test_smoke_readme_job import DiffAcceptingVerifier
 
 
-FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "repos" / "readme_edit"
+README_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "repos" / "readme_edit"
+CALCULATOR_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "repos" / "calculator_bug"
 SMOKE_SENTENCE = "This project has a smoke test."
 README_INSTRUCTION = "Update README.md by adding one sentence that says this project has a smoke test."
+CALCULATOR_REQUIRED_COMMAND = "python -m unittest discover -s tests"
+CALCULATOR_INSTRUCTION = f"""Fix calculator.py so the tests pass.
+
+Verification commands:
+1. {CALCULATOR_REQUIRED_COMMAND}"""
 REAL_LLM_SMOKE_ENABLED = os.getenv("DOCODE_REAL_LLM_SMOKE", "").lower() in {"1", "true", "yes", "on"}
 
 
@@ -67,7 +73,7 @@ class RealDoBoxSmokeTests(IsolatedAsyncioTestCase):
             )
             session = await client.create_agent_session(project.project_id, name="docode-real-dobox-readme")
             try:
-                await self._seed_fixture(client, project.project_id, session.session_id)
+                await self._seed_fixture(client, project.project_id, session.session_id, README_FIXTURE_ROOT)
                 tools = DoBoxTools(
                     client,
                     project.project_id,
@@ -144,7 +150,7 @@ class RealDoBoxSmokeTests(IsolatedAsyncioTestCase):
             )
             session = await client.create_agent_session(project.project_id, name="docode-real-llm-dobox-readme")
             try:
-                await self._seed_fixture(client, project.project_id, session.session_id)
+                await self._seed_fixture(client, project.project_id, session.session_id, README_FIXTURE_ROOT)
                 tools = DoBoxTools(
                     client,
                     project.project_id,
@@ -203,6 +209,81 @@ class RealDoBoxSmokeTests(IsolatedAsyncioTestCase):
             finally:
                 await client.delete_project(project.project_id)
 
+    async def test_real_llm_real_dobox_calculator_smoke(self) -> None:
+        if not REAL_LLM_SMOKE_ENABLED:
+            self.skipTest("set DOCODE_REAL_LLM_SMOKE=1 with DOCODE_REAL_DOBOX_SMOKE=1 to run the real LLM + real DoBox smoke")
+        with TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts"
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="real-llm-dobox-smoke",
+                    instruction=CALCULATOR_INSTRUCTION,
+                    max_iterations=18,
+                    max_runtime_seconds=240,
+                    max_tool_calls=36,
+                    sandbox_network_mode="no_internet",
+                )
+            )
+            llm = await build_real_llm_or_skip(self, job)
+            config = await self._real_dobox_config(artifact_dir, skip_if_unavailable=True)
+            client = DoBoxClient(config.dobox_base_url, config.dobox_token)
+            project = await client.create_project(
+                name=f"docode-real-llm-dobox-calculator-{new_id('smoke')}",
+                network_mode=config.sandbox_network_mode,
+            )
+            session = await client.create_agent_session(project.project_id, name="docode-real-llm-dobox-calculator")
+            try:
+                await self._seed_fixture(client, project.project_id, session.session_id, CALCULATOR_FIXTURE_ROOT)
+                await self._ensure_python_command(client, project.project_id, session.session_id)
+                tools = DoBoxTools(
+                    client,
+                    project.project_id,
+                    agent_session_id=session.session_id,
+                    command_timeout_seconds=30,
+                    output_limit_bytes=200_000,
+                )
+                job = await repo.update_job(
+                    job.id,
+                    dobox_project_id=project.project_id,
+                    dobox_sandbox_id=project.sandbox_id,
+                    dobox_agent_session_id=session.session_id,
+                    sandbox_network_mode=config.sandbox_network_mode,
+                )
+                loop = CodingAgentLoop(
+                    llm=llm,
+                    tools=tools,
+                    verifier=CodingVerifier(),
+                    repository=repo,
+                    exporter=ArtifactExporter(
+                        artifact_dir,
+                        repo,
+                        workspace_archive_provider=lambda: client.archive_workspace(project.project_id, agent_session_id=session.session_id),
+                        workspace_file_reader=lambda path: client.read_file(project.project_id, path, agent_session_id=session.session_id),
+                    ),
+                    stop_policy=StopPolicy(max_iterations=18, max_runtime_seconds=240, max_consecutive_failures=10, max_tool_calls=36),
+                    quality_gate=QualityGate(),
+                    llm_retry_delays=(),
+                )
+
+                completed = await loop.run(job)
+                steps = await repo.list_steps(job.id)
+                if completed.status != JobStatus.SUCCEEDED:
+                    status = await client.git_status(project.project_id, agent_session_id=session.session_id)
+                    diff = await client.git_diff_result(project.project_id, agent_session_id=session.session_id)
+                    self.fail(
+                        "real LLM + real DoBox calculator smoke failed "
+                        f"with status={completed.status} reason={completed.failure_reason}\n\n"
+                        f"Git status:\n{status.output}\n\nGit diff:\n{diff.output[:2000]}\n\n"
+                        f"Command results:\n{summarize_command_results(steps)}\n\n"
+                        f"Recent steps:\n{summarize_job_steps(steps)}"
+                    )
+
+                await self._assert_calculator_smoke_outputs(client, project.project_id, session.session_id, repo, job.id, artifact_dir, steps)
+            finally:
+                await client.delete_project(project.project_id)
+
     async def _real_dobox_config(self, artifact_dir: Path, *, skip_if_unavailable: bool):
         config = load_config()
         config.artifact_dir = artifact_dir
@@ -247,10 +328,61 @@ class RealDoBoxSmokeTests(IsolatedAsyncioTestCase):
             names = set(archive.getnames())
         self.assertTrue(any(name.endswith("README.md") for name in names))
 
-    async def _seed_fixture(self, client: DoBoxClient, project_id: str, session_id: str) -> None:
-        for path in sorted(FIXTURE_ROOT.rglob("*")):
+    async def _assert_calculator_smoke_outputs(
+        self,
+        client: DoBoxClient,
+        project_id: str,
+        session_id: str,
+        repo: InMemoryJobRepository,
+        job_id: str,
+        artifact_dir: Path,
+        steps,
+    ) -> None:
+        calculator = await client.read_file(project_id, "calculator.py", agent_session_id=session_id)
+        self.assertIn("return a + b", calculator.content)
+        self.assertNotIn("return a - b", calculator.content)
+        status = await client.git_status(project_id, agent_session_id=session_id)
+        diff = await client.git_diff_result(project_id, agent_session_id=session_id)
+        self.assertIn("calculator.py", status.output)
+        self.assertIn("return a + b", diff.output)
+        self.assertTrue(
+            any(
+                step.content.get("type") == "tool_result"
+                and step.content.get("tool") == "read_file"
+                and str((step.content.get("metadata") or {}).get("path") or "") in {"calculator.py", "tests/test_calculator.py"}
+                for step in steps
+            ),
+            summarize_job_steps(steps),
+        )
+        self.assertTrue(
+            any(
+                step.content.get("type") == "tool_result"
+                and step.content.get("tool") in {"edit_file", "write_file", "replace_in_file", "apply_patch"}
+                and (
+                    str((step.content.get("metadata") or {}).get("path") or "") == "calculator.py"
+                    or step.content.get("tool") == "apply_patch"
+                )
+                for step in steps
+            ),
+            summarize_job_steps(steps),
+        )
+        command_step_index = successful_calculator_command_step_index(steps)
+        self.assertIsNotNone(command_step_index, summarize_command_results(steps))
+        final_step_index = final_candidate_step_index(steps)
+        self.assertIsNotNone(final_step_index, summarize_job_steps(steps))
+        assert command_step_index is not None
+        assert final_step_index is not None
+        self.assertLess(command_step_index, final_step_index, summarize_job_steps(steps))
+        artifacts = await repo.list_artifacts(job_id)
+        self.assertIn("report", {artifact.kind for artifact in artifacts})
+        self.assertIn("result", {artifact.kind for artifact in artifacts})
+        self.assertTrue((artifact_dir / job_id / "final_report.md").exists())
+        self.assertTrue((artifact_dir / job_id / "result.json").exists())
+
+    async def _seed_fixture(self, client: DoBoxClient, project_id: str, session_id: str, fixture_root: Path) -> None:
+        for path in sorted(fixture_root.rglob("*")):
             if path.is_file():
-                relative = path.relative_to(FIXTURE_ROOT).as_posix()
+                relative = path.relative_to(fixture_root).as_posix()
                 await client.write_file(project_id, relative, path.read_text(encoding="utf-8"), agent_session_id=session_id)
         result = await client.run_command(
             project_id,
@@ -266,3 +398,57 @@ class RealDoBoxSmokeTests(IsolatedAsyncioTestCase):
         )
         if result.exit_code != 0:
             self.fail(f"failed to initialize fixture git repository:\n{result.output}")
+
+    async def _ensure_python_command(self, client: DoBoxClient, project_id: str, session_id: str) -> None:
+        result = await client.run_command(
+            project_id,
+            [
+                "sh",
+                "-lc",
+                "command -v python >/dev/null 2>&1 || "
+                "(mkdir -p /tmp/docode-bin && ln -sf \"$(command -v python3)\" /tmp/docode-bin/python && "
+                "printf 'export PATH=/tmp/docode-bin:$PATH\\n' > \"$HOME/.bash_profile\") && "
+                "bash -lc 'python --version'",
+            ],
+            cwd="/workspace",
+            timeout_sec=30,
+            agent_session_id=session_id,
+        )
+        if result.exit_code != 0:
+            self.fail(f"failed to make python command available in calculator smoke sandbox:\n{result.output}")
+
+
+def successful_calculator_command_step_index(steps) -> int | None:
+    for index, step in enumerate(steps):
+        content = step.content
+        if content.get("type") != "tool_result" or content.get("tool") != "run_command" or content.get("exit_code") != 0:
+            continue
+        command = str((content.get("metadata") or {}).get("command") or "").lower()
+        if "unittest" in command and "discover -s tests" in command:
+            return index
+    return None
+
+
+def final_candidate_step_index(steps) -> int | None:
+    for index, step in enumerate(steps):
+        content = step.content
+        if content.get("type") == "auto_final_candidate":
+            return index
+        if content.get("type") == "llm_decision" and content.get("decision_type") == "final_candidate":
+            return index
+    return None
+
+
+def summarize_command_results(steps) -> str:
+    lines: list[str] = []
+    for index, step in enumerate(steps):
+        content = step.content
+        if content.get("type") != "tool_result":
+            continue
+        metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+        command = metadata.get("command")
+        if not command:
+            continue
+        output = str(content.get("output") or content.get("summary") or "")[:600]
+        lines.append(f"{index}: exit={content.get('exit_code')} command={command!r} output={output!r}")
+    return "\n".join(lines[-20:]) or "<no command results>"

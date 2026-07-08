@@ -111,13 +111,13 @@ Optional real DoBox smoke, using the workspace venv on macOS:
 PATH="$(pwd)/../.venv/bin:$PATH" DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_smoke
 ```
 
-Optional real LLM + real DoBox README smoke:
+Optional real LLM + real DoBox README and calculator smoke:
 
 ```bash
 PATH="$(pwd)/../.venv/bin:$PATH" DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_smoke
 ```
 
-The real DoBox smoke uses a no-internet project sandbox and the README fixture. When both real-smoke flags are set, the suite also runs the combined real LLM + real DoBox path with the same credential settings used by `tests.test_real_llm_smoke`.
+The real DoBox smoke uses no-internet project sandboxes and local fixtures. When both real-smoke flags are set, the suite also runs the combined real LLM + real DoBox README and calculator paths with the same credential settings used by `tests.test_real_llm_smoke`.
 
 Workers claim queued jobs by atomically moving them to `preparing` before APICred authorization or DoBox project creation, so duplicate queue deliveries do not start duplicate sandboxes for the same job. On API startup, jobs interrupted in `preparing`, `running`, or `verifying` are requeued with an audit step before the worker begins claiming jobs.
 
