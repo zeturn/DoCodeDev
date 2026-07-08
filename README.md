@@ -35,24 +35,10 @@ python -m pip install -e ".[dev]"
 uvicorn docode.main:app --reload --port 8110
 ```
 
-Recommended local test commands:
-
-Windows PowerShell:
-
-```powershell
-$env:PYTHONPATH='src'; python -m unittest discover -s tests
-```
-
-Unix/macOS:
+Recommended deterministic test command:
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests
-```
-
-macOS workspace venv:
-
-```bash
-PATH="$(pwd)/../.venv/bin:$PATH" PYTHONPATH=src ../.venv/bin/python -m unittest discover -s tests
+PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH PYTHONPATH=src ../.venv/bin/python -m unittest discover -s tests
 ```
 
 Use `python` for host-side local tests so the command works on platforms where `python3` is not installed. Agent tasks still preserve and enforce user-declared verification commands exactly.
@@ -85,39 +71,52 @@ Generic smoke ladder:
 `smoke-check` verifies configured DoBox health, local DoBox backend path, Docker CLI/daemon access, APICred model access, local `gh` availability, database path, and artifact directory. `smoke-run` first runs those checks and then executes a `provider=scripted` end-to-end job when DoBox is reachable. Pass `--start-dobox` to temporarily run `go run ./cmd/server` from the configured local DoBox backend directory for the duration of the smoke check or smoke job.
 `eval scaffold` creates ten small git repositories covering Python bugfix, Python CLI, crawler, API adapter, README-only, JS bugfix, no-test project, bad web source repair, large command output, and GitHub PR artifact export scenarios. `eval jobs` runs manifest cases through DoCode jobs and writes per-case result JSON files. `eval run` aggregates those saved eval results into a report with success rate, iterations, tool calls, token/cost totals, failure reasons, and verification-plan failures. `eval run` and `eval assert` accept `--min-success-rate`, `--max-avg-tool-calls`, and `--max-cost`; when a threshold fails, the report includes `regression`, `thresholds`, and `threshold_failures`, and the command exits non-zero.
 
-Optional real LLM smoke:
+### Optional Smoke Tests
 
-PowerShell:
+Optional smoke tests are skipped unless their environment flags are set. The commands below use the macOS workspace venv pattern.
 
-```powershell
-$env:DOCODE_REAL_LLM_SMOKE='1'
-$env:DOCODE_BASALTPASS_ENABLED='true'
-$env:DOCODE_BASALTPASS_SUBJECT_TOKEN='<BasaltPass access token for the DoCode user>'
-$env:PYTHONPATH='src'
-python -m unittest tests.test_real_llm_smoke
-```
-
-Unix:
-
-```sh
-DOCODE_REAL_LLM_SMOKE=1 DOCODE_BASALTPASS_ENABLED=true DOCODE_BASALTPASS_SUBJECT_TOKEN='<BasaltPass access token for the DoCode user>' PYTHONPATH=src python -m unittest tests.test_real_llm_smoke
-```
-
-The smoke exchanges the BasaltPass subject token for an APICred token and selects a `deepseek` model from the APICred model catalog by default. Set `DOCODE_REAL_LLM_PROVIDER` or `DOCODE_REAL_LLM_MODEL` to override the selected catalog entry.
-
-Optional real DoBox smoke, using the workspace venv on macOS:
+Default deterministic tests:
 
 ```bash
-PATH="$(pwd)/../.venv/bin:$PATH" DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_smoke
+PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH PYTHONPATH=src ../.venv/bin/python -m unittest discover -s tests
 ```
 
-Optional real LLM + real DoBox README and calculator smoke:
+Real LLM with fake fixture tools:
 
 ```bash
-PATH="$(pwd)/../.venv/bin:$PATH" DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_smoke
+PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH DOCODE_REAL_LLM_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_llm_smoke
 ```
 
-The real DoBox smoke uses no-internet project sandboxes and local fixtures. When both real-smoke flags are set, the suite also runs the combined real LLM + real DoBox README and calculator paths with the same credential settings used by `tests.test_real_llm_smoke`.
+Real DoBox with scripted LLM:
+
+```bash
+PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_smoke.RealDoBoxSmokeTests.test_readme_edit_runs_through_real_dobox
+```
+
+Real LLM with real DoBox README and calculator:
+
+```bash
+PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_smoke
+```
+
+Generic local crawler CLI smoke with real LLM and real DoBox:
+
+```bash
+PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_crawler_smoke
+```
+
+The real LLM smoke exchanges the BasaltPass subject token for an APICred token and selects a `deepseek` model from the APICred model catalog by default when that configuration is present. Set `DOCODE_REAL_LLM_PROVIDER` or `DOCODE_REAL_LLM_MODEL` to override the selected catalog entry. The real DoBox smoke uses local fixtures; the combined real LLM + real DoBox tests use the same credential settings as `tests.test_real_llm_smoke`.
+
+Integration matrix:
+
+| Tools | LLM | Current status |
+| --- | --- | --- |
+| Fake tools | Scripted LLM | Passing: README, calculator, parser, parser repair |
+| Fake tools | Real LLM | Passing: README, calculator |
+| Real DoBox | Scripted LLM | Passing: README |
+| Real DoBox | Real LLM | Passing: README, calculator, generic local crawler CLI |
+
+See [docs/agent_mvp_status.md](docs/agent_mvp_status.md) for the current MVP status, non-goals, and known limitations.
 
 Workers claim queued jobs by atomically moving them to `preparing` before APICred authorization or DoBox project creation, so duplicate queue deliveries do not start duplicate sandboxes for the same job. On API startup, jobs interrupted in `preparing`, `running`, or `verifying` are requeued with an audit step before the worker begins claiming jobs.
 
