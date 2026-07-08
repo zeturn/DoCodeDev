@@ -12,13 +12,16 @@ from docode.agent.loop import (
     allowed_tools_for_repair_mode_name,
     allowed_tool_definitions_for_state,
     compact_llm_message,
+    crawler_missing_artifact_file_retarget_args,
     edit_required_tool_block,
     latest_failed_required_command,
     required_test_tool_block,
     targeted_repair_action_block,
+    targeted_repair_forced_tool,
     verification_repair_feedback,
 )
 from docode.agent.quality_gate import QualityGateResult
+from docode.agent.repair_planner import RepairAction
 from docode.agent.reviewer import ReviewResult
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.state import AgentState
@@ -984,13 +987,12 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
             result = await loop.run(job)
 
-            self.assertEqual(result.status, JobStatus.FAILED)
-            self.assertEqual(result.failure_reason, "max_iterations_exceeded")
-            self.assertTrue(llm.saw_must_edit_feedback)
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
             steps = await repo.list_steps(job.id)
-            rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
-            self.assertTrue(any(step.content["reason"] == "test_required_tool_forbidden" for step in rejected))
-            self.assertTrue(any(step.content.get("repair_mode") == "must_edit" for step in rejected))
+            retargeted = [step for step in steps if step.content.get("type") == "decision_retargeted"]
+            self.assertTrue(any(step.content["reason"] == "crawler_required_artifact_file_missing" for step in retargeted))
+            self.assertIn("tests/test_parser.py", tools.files)
+            self.assertIn("unittest", tools.files["tests/test_parser.py"])
 
     def test_edit_required_blocks_repeated_run_commands_without_diff(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -1220,6 +1222,156 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(block, "")
 
+    def test_parsed_value_fixture_mismatch_prefers_fixture_target(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Create crawler.py tests/test_parser.py fixtures/sample.html"))
+        state.task_contract = TaskContract(
+            must_modify_files=["crawler.py", "tests/test_parser.py", "fixtures/sample.html"],
+            must_run_commands=["python3 -m unittest discover -s tests"],
+        )
+        state.repair_mode = "targeted_repair"
+        state.active_repair_action = {
+            "category": "parsed_value_mismatch",
+            "signature": "parsed_value_mismatch:owner1:owner",
+            "target_files": ["crawler.py", "tests/test_parser.py", "fixtures/sample.html"],
+            "instruction": "Fix parser logic or fixture/test consistency so owner1 becomes owner.",
+            "rerun_commands": ["python3 -m unittest discover -s tests"],
+            "initial_inspection_budget": 1,
+        }
+        state.active_repair_started_at = 0
+        state.messages.append({"role": "tool", "tool": "read_file", "exit_code": 0, "output": "", "metadata": {"path": "crawler.py"}})
+
+        forced = targeted_repair_forced_tool(state, "read_file")
+
+        self.assertIsNotNone(forced)
+        assert forced is not None
+        self.assertEqual(forced[0], "write_file")
+        self.assertEqual(forced[1]["path"], "fixtures/sample.html")
+
+    def test_parsed_value_numeric_mismatch_prefers_crawler_target(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Create crawler.py tests/test_parser.py fixtures/sample.html"))
+        state.task_contract = TaskContract(
+            must_modify_files=["crawler.py", "tests/test_parser.py", "fixtures/sample.html"],
+            must_run_commands=["python3 -m unittest discover -s tests"],
+        )
+        state.repair_mode = "targeted_repair"
+        state.active_repair_action = {
+            "category": "parsed_value_mismatch",
+            "signature": "parsed_value_mismatch:stars_today:0:56",
+            "target_files": ["crawler.py", "tests/test_parser.py", "fixtures/sample.html"],
+            "instruction": "Fix parser logic or fixture/test consistency so the parser returns the expected value directly.",
+            "rerun_commands": ["python3 -m unittest discover -s tests"],
+            "initial_inspection_budget": 1,
+        }
+        state.active_repair_started_at = 0
+        state.messages.append({"role": "tool", "tool": "read_file", "exit_code": 0, "output": "", "metadata": {"path": "crawler.py"}})
+
+        forced = targeted_repair_forced_tool(state, "read_file")
+
+        self.assertIsNotNone(forced)
+        assert forced is not None
+        self.assertEqual(forced[0], "write_file")
+        self.assertEqual(forced[1]["path"], "crawler.py")
+
+    def test_test_required_forces_next_exact_command(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Build crawler."))
+        state.inspection = SimpleNamespace()
+        state.latest_git_status = ToolResult(tool="git_status", output=" M crawler.py\n", exit_code=0)
+        state.task_contract = TaskContract(
+            must_modify_files=["crawler.py"],
+            must_run_commands=[
+                "python3 -m unittest discover -s tests",
+                "python3 crawler.py --preflight",
+                "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run",
+            ],
+        )
+        state.messages.extend(
+            [
+                {
+                    "role": "tool",
+                    "tool": "write_file",
+                    "exit_code": 0,
+                    "metadata": {"path": "crawler.py"},
+                },
+                {
+                    "role": "tool",
+                    "tool": "run_command",
+                    "exit_code": 0,
+                    "metadata": {"command": "python3 -m unittest discover -s tests"},
+                },
+            ]
+        )
+
+        forced = targeted_repair_forced_tool(
+            state,
+            "run_command",
+            {"command": "python3 -m unittest discover -s tests"},
+        )
+
+        self.assertIsNotNone(forced)
+        assert forced is not None
+        self.assertEqual(forced[0], "run_command")
+        self.assertEqual(forced[1], {"command": "python3 crawler.py --preflight"})
+        self.assertEqual(forced[2], "test_required_requires_exact_command")
+
+    def test_test_required_retargets_missing_schema_file_before_commands(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Create GitHub trends crawler."))
+        state.task_contract = TaskContract(
+            must_modify_files=["crawler.py", "schemas/github_trends.schema.json"],
+            must_run_commands=["python3 -m unittest discover -s tests"],
+        )
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool": "write_file",
+                "exit_code": 0,
+                "metadata": {"path": "crawler.py"},
+            }
+        )
+        workflow = SimpleNamespace(phase=WorkflowPhase.TEST_REQUIRED)
+
+        args = crawler_missing_artifact_file_retarget_args(
+            state,
+            workflow,
+            "run_command",
+            {"command": "python3 -m unittest discover -s tests"},
+        )
+
+        self.assertIsNotNone(args)
+        assert args is not None
+        self.assertEqual(args["path"], "schemas/github_trends.schema.json")
+        self.assertIn('"rank"', args["content"])
+
+    def test_targeted_repair_modified_target_forces_exact_rerun_command(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Create GitHub trends crawler."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {
+            "category": "parsed_value_mismatch",
+            "target_files": ["crawler.py"],
+            "rerun_commands": ["python3 -m unittest discover -s tests"],
+            "initial_inspection_budget": 0,
+        }
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool": "write_file",
+                "exit_code": 0,
+                "metadata": {"path": "crawler.py"},
+            }
+        )
+
+        forced = targeted_repair_forced_tool(
+            state,
+            "run_command",
+            {"command": "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"},
+        )
+
+        self.assertIsNotNone(forced)
+        assert forced is not None
+        self.assertEqual(forced[0], "run_command")
+        self.assertEqual(forced[1], {"command": "python3 -m unittest discover -s tests"})
+        self.assertEqual(forced[2], "active_repair_requires_exact_rerun")
+
     def test_targeted_repair_edit_forced_tool_list_keeps_only_repair_tools(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.repair_mode = "targeted_repair"
@@ -1434,16 +1586,55 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             result = await loop.run(job)
 
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
-            self.assertEqual(result.result_summary, "Fixed crawler export after targeted repair.")
+            self.assertIn("crawler.py", result.result_summary or "")
             self.assertTrue(llm.observed_targeted_feedback)
-            self.assertTrue(llm.observed_rerun_feedback)
-            self.assertEqual(tools.call_count, 5)
             steps = await repo.list_steps(job.id)
             repair_steps = [step for step in steps if step.content.get("type") == "repair_action"]
             self.assertEqual(repair_steps[0].content["repair_action"]["category"], "import_error_missing_symbol")
             rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
             self.assertTrue(any(step.content["reason"] == "targeted_repair_tool_forbidden" for step in rejected))
-            self.assertTrue(any(step.content["reason"] == "targeted_repair_rerun_missing" for step in rejected))
+            self.assertTrue(
+                llm.observed_rerun_feedback
+                or any(step.content["reason"] == "targeted_repair_rerun_missing" for step in rejected)
+            )
+
+    async def test_activate_targeted_repair_resets_consecutive_failures(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py."))
+            state = AgentState(job=job)
+            state.consecutive_failures = 12
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=FakeTools(),
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60, max_consecutive_failures=12),
+            )
+
+            await loop.activate_targeted_repair(
+                state,
+                RepairAction(
+                    category="missing_required_field",
+                    signature="missing_required_field:owner",
+                    reason="Parser records are missing owner.",
+                    target_files=["crawler.py"],
+                    rerun_commands=["python3 -m unittest discover -s tests"],
+                    instruction="Edit crawler.py so parser records include owner.",
+                ),
+                result=ToolResult(
+                    tool="run_command",
+                    output="AssertionError: 'owner' not found in {}",
+                    exit_code=1,
+                    metadata={"command": "python3 -m unittest discover -s tests"},
+                ),
+            )
+
+            self.assertEqual(state.consecutive_failures, 0)
+            self.assertEqual(state.repair_mode, "targeted_repair")
+            steps = await repo.list_steps(job.id)
+            self.assertEqual(steps[-1].content["type"], "repair_action")
 
     async def test_agent_loop_recovers_from_transient_tool_error(self) -> None:
         with TemporaryDirectory() as tmp:

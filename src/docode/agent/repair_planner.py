@@ -59,6 +59,9 @@ IMPORT_NAME_RE = re.compile(
 DID_YOU_MEAN_RE = re.compile(r"Did you mean:\s*['\"]?(?P<suggestion>[A-Za-z_][A-Za-z0-9_]*)['\"]?")
 MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError:\s+No module named ['\"](?P<module>[A-Za-z_][A-Za-z0-9_]*)['\"]")
 NAME_ERROR_RE = re.compile(r"NameError:\s+name ['\"](?P<missing>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined")
+UNBOUND_LOCAL_RE = re.compile(
+    r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"
+)
 KEY_ERROR_RE = re.compile(r"KeyError:\s+['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*)['\"]")
 ASSERT_NOT_FOUND_RE = re.compile(r"AssertionError:\s+['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*)['\"] not found in")
 ASSERT_MIN_RECORDS_RE = re.compile(
@@ -70,6 +73,10 @@ ASSERT_VALUE_MISMATCH_RE = re.compile(
 FILE_NOT_FOUND_RE = re.compile(r"(?:FileNotFoundError|No such file or directory).*?['\"](?P<path>[^'\"]+(?:fixtures|fixture)[^'\"]*)['\"]")
 SYNTAX_ERROR_FILE_RE = re.compile(r'File ["\'](?P<path>[^"\']+\.py)["\'], line (?P<line>\d+)')
 TRACEBACK_FILE_RE = re.compile(r'File ["\'](?P<path>[^"\']+\.py)["\'], line \d+')
+ARGPARSE_UNRECOGNIZED_RE = re.compile(r"(?P<script>[A-Za-z0-9_./-]+\.py):\s+error:\s+unrecognized arguments:\s+(?P<args>.+)")
+INVALID_INT_LITERAL_RE = re.compile(
+    r"ValueError:\s+invalid literal for int\(\) with base 10:\s+['\"](?P<value>[^'\"]+)['\"]"
+)
 
 FIELD_DEFAULT_HINTS = {
     "language": '""',
@@ -96,6 +103,7 @@ def plan_repair_from_tool_result(*, tool: str, output: str, metadata: dict[str, 
     for planner in (
         plan_import_error_missing_symbol,
         plan_name_error_did_you_mean,
+        plan_unbound_local_error,
         plan_module_not_found,
         plan_missing_required_field,
         plan_parser_records_empty,
@@ -103,6 +111,8 @@ def plan_repair_from_tool_result(*, tool: str, output: str, metadata: dict[str, 
         plan_no_tests_ran,
         plan_fixture_missing,
         plan_json_semantic_failure,
+        plan_cli_unrecognized_arguments,
+        plan_invalid_number_literal,
         plan_dependency_failure,
         plan_syntax_error,
     ):
@@ -110,6 +120,100 @@ def plan_repair_from_tool_result(*, tool: str, output: str, metadata: dict[str, 
         if action is not None:
             return action
     return None
+
+
+def plan_unbound_local_error(*, output: str, command: str) -> RepairAction | None:
+    match = UNBOUND_LOCAL_RE.search(output)
+    if not match:
+        return None
+    name = match.group("name")
+    target = "crawler.py"
+    file_matches = TRACEBACK_FILE_RE.findall(output)
+    if file_matches:
+        target = normalize_workspace_relative_path(file_matches[-1])
+    rerun = command or "python3 -m unittest discover -s tests"
+    return RepairAction(
+        category="unbound_local_error",
+        signature=f"unbound_local_error:{target}:{name}",
+        reason=f"{target} references local variable `{name}` before it is assigned.",
+        target_files=[target],
+        allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
+        forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
+        instruction=(
+            f"The command failed because `{name}` is treated as a local variable before assignment.\n\n"
+            "Required fix:\n"
+            f"1. Edit `{target}` so `{name}` is imported or assigned at module scope, or remove the later local assignment/import that shadows it.\n"
+            "2. Keep the CLI behavior and tests intact.\n"
+            f"3. Rerun exactly: `{rerun}`."
+        ),
+        rerun_commands=[rerun],
+        exploration_forbidden=True,
+        initial_inspection_budget=0,
+    )
+
+
+def plan_invalid_number_literal(*, output: str, command: str) -> RepairAction | None:
+    match = INVALID_INT_LITERAL_RE.search(output)
+    if not match:
+        return None
+    value = match.group("value")
+    target = "crawler.py"
+    file_matches = TRACEBACK_FILE_RE.findall(output)
+    if file_matches:
+        target = normalize_workspace_relative_path(file_matches[-1])
+    rerun = command or "python3 -m unittest discover -s tests"
+    return RepairAction(
+        category="number_parser_invalid_literal",
+        signature=f"number_parser_invalid_literal:{stable_signature_fragment(value)}",
+        reason=f"number_from_text tried to parse non-numeric text as int: {value!r}.",
+        target_files=[target],
+        allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
+        forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
+        instruction=(
+            "The test failed because numeric parsing called int() on text that still contains words.\n\n"
+            f"Input value: `{value}`\n\n"
+            "Required fix:\n"
+            "1. Update `number_from_text` so it extracts the first numeric token from mixed text.\n"
+            "2. Support commas and k/m suffixes, for example `56 stars today` -> 56, `1,234` -> 1234, `1.2k` -> 1200.\n"
+            "3. Do not weaken or delete parser tests.\n"
+            f"4. Rerun exactly: `{rerun}`."
+        ),
+        rerun_commands=[rerun],
+        exploration_forbidden=True,
+        initial_inspection_budget=0,
+    )
+
+
+def plan_cli_unrecognized_arguments(*, output: str, command: str) -> RepairAction | None:
+    match = ARGPARSE_UNRECOGNIZED_RE.search(output)
+    if not match:
+        return None
+    script = normalize_workspace_relative_path(match.group("script"))
+    if not script.endswith(".py"):
+        return None
+    args = " ".join(match.group("args").split())
+    rerun = command or f"python3 {script}"
+    return RepairAction(
+        category="cli_unrecognized_arguments",
+        signature=f"cli_unrecognized_arguments:{script}:{stable_signature_fragment(args)}",
+        reason=f"{script} does not accept required CLI arguments: {args}",
+        target_files=[script],
+        allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
+        forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
+        rerun_commands=[rerun],
+        instruction=(
+            f"The required verification command failed because `{script}` rejects required CLI arguments.\n\n"
+            f"Unrecognized arguments: `{args}`\n\n"
+            "Required next action:\n"
+            f"1. Edit `{script}` to add argparse support for those options.\n"
+            "2. Preserve the existing working options and parser functions.\n"
+            "3. If `--source` is present, read that local fixture path instead of fetching the network.\n"
+            "4. If `--output` is present, write JSON output there, including in dry-run mode.\n"
+            "5. Do not weaken or delete tests.\n"
+            f"6. Rerun exactly: `{rerun}`."
+        ),
+        initial_inspection_budget=1,
+    )
 
 
 def plan_parser_records_empty(*, output: str, command: str) -> RepairAction | None:
@@ -155,13 +259,15 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
         return None
     actual = clean_assertion_value(match.group("actual"))
     expected = clean_assertion_value(match.group("expected"))
-    if not actual or not expected:
+    if actual is None or expected is None:
         return None
+    field = assertion_field_name(output)
     targets = infer_python_traceback_files(output) or ["crawler.py"]
     rerun = command or "python3 -m unittest discover -s tests"
+    field_line = f"Field under test: `{field}`\n" if field else ""
     return RepairAction(
         category="parsed_value_mismatch",
-        signature=f"parsed_value_mismatch:{stable_signature_fragment(actual)}:{stable_signature_fragment(expected)}",
+        signature=f"parsed_value_mismatch:{field or 'value'}:{stable_signature_fragment(actual)}:{stable_signature_fragment(expected)}",
         reason=f"Parser/function returned value {actual!r}, but tests expected {expected!r}.",
         target_files=targets,
         allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
@@ -169,6 +275,7 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
         rerun_commands=[rerun],
         instruction=(
             f"The required test command failed because a parser-returned value was incorrect.\n\n"
+            f"{field_line}"
             f"Observed value: `{actual}`\n"
             f"Expected value: `{expected}`\n\n"
             "Important:\n"
@@ -182,7 +289,7 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
             "5. Do not call web_search or fetch_url for this repair.\n"
             f"6. Rerun exactly: `{rerun}`."
         ),
-        initial_inspection_budget=1,
+        initial_inspection_budget=0 if field in {"stars_today", "stars", "forks", "total_stars", "owner", "repository", "repository_name"} else 1,
     )
 
 
@@ -561,6 +668,20 @@ def clean_assertion_value(value: str) -> str:
     if cleaned.startswith(("'", '"')) and cleaned.endswith(("'", '"')) and len(cleaned) >= 2:
         cleaned = cleaned[1:-1]
     return cleaned.strip()
+
+
+def assertion_field_name(output: str) -> str:
+    search_text = output.split("AssertionError:", 1)[0]
+    for pattern in (
+        r"\bfirst\[['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*)['\"]\]",
+        r"\brepo\[['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*)['\"]\]",
+        r"\brecord\[['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*)['\"]\]",
+        r"\bitem\[['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*)['\"]\]",
+    ):
+        matches = list(re.finditer(pattern, search_text))
+        if matches:
+            return matches[-1].group("field")
+    return ""
 
 
 def stable_signature_fragment(value: str) -> str:

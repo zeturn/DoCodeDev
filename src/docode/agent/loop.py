@@ -33,6 +33,15 @@ from docode.storage.models import CodingJob, JobStatus
 from docode.storage.repository import JobRepository
 
 INITIAL_NO_DIFF_EXPLORATION_BUDGET = 3
+CONTEXT_HEAVY_REPAIR_CATEGORIES = {
+    "missing_required_field",
+    "parsed_value_mismatch",
+    "json_semantic_failure",
+    "parser_records_empty",
+    "parser_records_too_few",
+    "parser_record_count_mismatch",
+}
+MIN_CONTEXT_REPAIR_INSPECTION_BUDGET = 3
 
 
 class CodingAgentLoop:
@@ -148,7 +157,7 @@ class CodingAgentLoop:
                     continue
                 tool_name = decision.tool_name
                 tool_args = decision.args or {}
-                forced_repair = targeted_repair_forced_tool(state, tool_name)
+                forced_repair = targeted_repair_forced_tool(state, tool_name, tool_args)
                 if forced_repair is not None:
                     forced_tool_name, forced_tool_args, forced_reason = forced_repair
                     await self.repository.add_step(
@@ -541,6 +550,7 @@ class CodingAgentLoop:
         state.targeted_repair_edits = 0
         state.repair_mode = "targeted_repair"
         state.add_feedback(format_repair_action(action, repeated_count=count))
+        state.consecutive_failures = 0
         await self.repository.add_step(
             state.job.id,
             "system",
@@ -988,14 +998,70 @@ def review_repair_feedback(result: ReviewResult) -> str:
 
 
 def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction | None:
-    issue_text = "\n".join(f"{issue.code}: {issue.message}" for issue in result.blockers())
-    if not issue_text:
+    blockers = list(result.blockers())
+    if not blockers:
         return None
-    return plan_repair_from_tool_result(
-        tool="run_command",
-        output=issue_text,
-        metadata={"command": "python3 crawler.py --dry-run"},
+    target_files: list[str] = []
+    rerun_commands: list[str] = []
+    lines = ["Quality gate blocked finalization. Modify the listed target file(s) before running commands again."]
+    for issue in blockers:
+        path = str(issue.path or "").strip()
+        code = str(issue.code or "quality_blocker")
+        repair_path = quality_gate_repair_target(path, code)
+        if repair_path and repair_path not in target_files:
+            target_files.append(repair_path)
+        if repair_path == "crawler.py":
+            command = quality_gate_rerun_command(path)
+            if command not in rerun_commands:
+                rerun_commands.append(command)
+        where = f" ({path})" if path else ""
+        lines.append(f"- [{code}] {issue.message}{where}")
+        if issue.repair_hint:
+            lines.append(f"  Repair hint: {issue.repair_hint}")
+    if not target_files:
+        issue_text = "\n".join(f"{issue.code}: {issue.message}" for issue in blockers)
+        return plan_repair_from_tool_result(
+            tool="run_command",
+            output=issue_text,
+            metadata={"command": "python3 crawler.py --dry-run"},
+        )
+    signature_source = "|".join(f"{issue.code}:{issue.message}:{issue.path}" for issue in blockers)
+    return RepairAction(
+        category="quality_gate_repair",
+        signature="quality:" + str(abs(hash(signature_source)))[:12],
+        reason="quality_gate_blocked",
+        target_files=target_files,
+        allowed_tools=[
+            "apply_patch",
+            "edit_file",
+            "git_diff",
+            "git_status",
+            "read_file",
+            "read_file_range",
+            "read_symbol",
+            "replace_in_file",
+            "write_file",
+        ],
+        forbidden_tools=["run_command", "web_search", "fetch_url", "preview", "logs"],
+        instruction="\n".join(lines),
+        rerun_commands=rerun_commands,
+        exploration_forbidden=True,
+        initial_inspection_budget=1,
     )
+
+
+def quality_gate_repair_target(path: str, code: str = "") -> str:
+    normalized = normalize_workspace_relative_path(path)
+    if normalized.startswith(("data/", "output/", "outputs/", "artifacts/")) or str(code).startswith("json_"):
+        return "crawler.py"
+    return normalized
+
+
+def quality_gate_rerun_command(path: str) -> str:
+    normalized = normalize_workspace_relative_path(path)
+    if normalized == "data/output.json":
+        return "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"
+    return "python3 crawler.py --dry-run"
 
 
 def repair_action_from_review(result: ReviewResult, task_contract: TaskContract | None) -> RepairAction | None:
@@ -1088,6 +1154,14 @@ def repair_action_contract(action: RepairAction, state: AgentState) -> dict[str,
     target_file = target_files[0] if target_files else None
     rerun_commands = [str(command) for command in payload.get("rerun_commands") or [] if str(command)]
     instruction = str(payload.get("instruction") or "")
+    category = str(payload.get("category") or "")
+    raw_budget = payload.get("initial_inspection_budget")
+    try:
+        inspection_budget = int(raw_budget if raw_budget is not None else 2)
+    except (TypeError, ValueError):
+        inspection_budget = 2
+    if category in CONTEXT_HEAVY_REPAIR_CATEGORIES and inspection_budget != 0:
+        inspection_budget = max(inspection_budget, MIN_CONTEXT_REPAIR_INSPECTION_BUDGET)
     must_change_symbols = []
     for symbol in ("number_from_text", "parse_trending", "parse_repositories", "parse_repos"):
         if symbol in instruction:
@@ -1099,10 +1173,11 @@ def repair_action_contract(action: RepairAction, state: AgentState) -> dict[str,
             "phase": "REPAIR_REQUIRED",
             "target_file": target_file,
             "must_change_symbols": must_change_symbols,
-            "next_allowed_tools": ["read_file", "apply_patch", "edit_file", "write_file"],
+            "next_allowed_tools": ["read_file", "read_file_range", "read_symbol", "apply_patch", "edit_file", "write_file", "replace_in_file"],
             "forbidden_until_modified": ["run_command"],
             "rerun_after_modified": rerun_commands[0] if rerun_commands else None,
             "created_at_message_index": len(state.messages),
+            "initial_inspection_budget": inspection_budget,
         }
     )
     return payload
@@ -1187,6 +1262,8 @@ def targeted_repair_allowed_tools_for_phase(state: AgentState) -> set[str]:
     if state.targeted_repair_phase == "inspect_allowed":
         return {
             "read_file",
+            "read_file_range",
+            "read_symbol",
             "edit_file",
             "write_file",
             "replace_in_file",
@@ -1245,7 +1322,7 @@ def targeted_repair_exploration_block(state: AgentState, tool_name: str) -> str:
         return ""
     if state.targeted_repair_phase != "edit_forced":
         return ""
-    if tool_name in {"read_file", "search", "list_files", "run_command"}:
+    if tool_name in {"read_file", "read_file_range", "read_symbol", "search", "list_files", "run_command", "web_search", "fetch_url"}:
         targets = state.active_repair_action.get("target_files") or []
         target_text = ", ".join(str(target) for target in targets) or "the target file"
         return f"You have already inspected enough context for the active targeted repair. Modify {target_text} now."
@@ -1287,7 +1364,7 @@ def note_targeted_repair_tool_result(state: AgentState, result: ToolResult) -> N
     if not result.ok:
         refresh_targeted_repair_phase(state)
         return
-    if result.tool in {"read_file", "search", "list_files"}:
+    if result.tool in {"read_file", "read_file_range", "read_symbol", "search", "list_files"}:
         state.targeted_repair_inspections += 1
     elif result.tool in {"edit_file", "write_file", "replace_in_file", "apply_patch"}:
         state.targeted_repair_edits += 1
@@ -1356,7 +1433,7 @@ def targeted_repair_read_count(state: AgentState) -> int:
         return 0
     count = 0
     for message in state.messages[state.active_repair_started_at :]:
-        if message.get("role") == "tool" and message.get("tool") in {"read_file", "search", "list_files"}:
+        if message.get("role") == "tool" and message.get("tool") in {"read_file", "read_file_range", "read_symbol", "search", "list_files"}:
             count += 1
     return count
 
@@ -1568,14 +1645,49 @@ def required_test_tool_block(state: AgentState, workflow: Any, tool_name: str, a
 
 
 def targeted_repair_rerun_command_block(state: AgentState, args: dict[str, object]) -> str:
+    command = next_targeted_repair_rerun_command(state)
+    if not command:
+        return ""
+    observed = " ".join(str(args.get("command") or "").strip().split())
+    if commands_equivalent(observed, command):
+        return ""
+    return f"Active targeted repair was modified; rerun only the repair command now: {command}"
+
+
+def targeted_repair_successful_commands_after_latest_edit(state: AgentState) -> list[str]:
+    start = state.active_repair_started_at
+    targets = targeted_repair_targets(state)
+    for index, message in enumerate(state.messages[state.active_repair_started_at :], start=state.active_repair_started_at):
+        if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
+            continue
+        tool = str(message.get("tool") or "")
+        if tool not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if tool == "apply_patch" or not targets or path in targets:
+            start = index + 1
+    observed: list[str] = []
+    for message in state.messages[start:]:
+        if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        command = " ".join(str(metadata.get("command") or "").split())
+        if command:
+            observed.append(command)
+    return observed
+
+
+def next_targeted_repair_rerun_command(state: AgentState) -> str:
     action = state.active_repair_action or {}
     commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
     if not commands:
         return ""
-    observed = " ".join(str(args.get("command") or "").strip().split())
-    if any(commands_equivalent(observed, command) for command in commands):
-        return ""
-    return f"Active targeted repair was modified; rerun only the repair command now: {commands[0]}"
+    observed = targeted_repair_successful_commands_after_latest_edit(state)
+    for command in commands:
+        if not any(commands_equivalent(seen, command) for seen in observed):
+            return command
+    return ""
 
 
 def crawler_missing_artifact_file_retarget_args(
@@ -1591,8 +1703,6 @@ def crawler_missing_artifact_file_retarget_args(
     missing = missing_must_modify_targets(state)
     if not missing:
         return None
-    if tool_name == "run_command":
-        return None
     requested = normalize_workspace_relative_path(str(args.get("path") or ""))
     if tool_name == "write_file" and requested in missing:
         return None
@@ -1603,15 +1713,49 @@ def crawler_missing_artifact_file_retarget_args(
     return {"path": target, "content": content}
 
 
-def targeted_repair_forced_tool(state: AgentState, tool_name: str) -> tuple[str, dict[str, object], str] | None:
+def targeted_repair_forced_tool(
+    state: AgentState,
+    tool_name: str,
+    args: dict[str, object] | None = None,
+) -> tuple[str, dict[str, object], str] | None:
     if state.repair_mode != "targeted_repair" or not state.active_repair_action:
-        return None
-    if targeted_repair_modified_target(state):
-        return None
+        status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
+        workflow = workflow_snapshot(state, status_output)
+        if workflow.phase != WorkflowPhase.TEST_REQUIRED:
+            return None
+        if missing_must_modify_targets(state):
+            return None
+        missing = list(getattr(workflow, "missing_commands", None) or [])
+        if not missing:
+            return None
+        command = str(missing[0])
+        observed = " ".join(str((args or {}).get("command") or "").split()) if tool_name == "run_command" else ""
+        if tool_name == "run_command" and commands_equivalent(observed, command):
+            return None
+        return "run_command", {"command": command}, "test_required_requires_exact_command"
+
     targets = sorted(targeted_repair_targets(state))
     if not targets:
         return None
-    target = targets[0]
+    target = preferred_targeted_repair_target(state, targets)
+    if targeted_repair_modified_target(state):
+        command = next_targeted_repair_rerun_command(state)
+        if not command:
+            return None
+        observed = " ".join(str((args or {}).get("command") or "").split()) if tool_name == "run_command" else ""
+        if tool_name == "run_command" and commands_equivalent(observed, command):
+            return None
+        return "run_command", {"command": command}, "active_repair_requires_exact_rerun"
+    refresh_targeted_repair_phase(state)
+    if state.targeted_repair_phase == "edit_forced" and tool_name not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
+        content = default_crawler_artifact_file_content(target, state)
+        if content is not None:
+            return (
+                "write_file",
+                {"path": target, "content": content},
+                "active_repair_controller_forced_target_edit",
+            )
+        return None
     read_count = targeted_repair_read_count(state)
     if read_count <= 0 and tool_name in {"run_command", "git_status", "git_diff", "search", "list_files"}:
         return (
@@ -1628,6 +1772,30 @@ def targeted_repair_forced_tool(state: AgentState, tool_name: str) -> tuple[str,
                 "active_repair_requires_target_patch",
             )
     return None
+
+
+def preferred_targeted_repair_target(state: AgentState, targets: list[str]) -> str:
+    action = state.active_repair_action or {}
+    category = str(action.get("category") or "")
+    signature = str(action.get("signature") or "").lower()
+    instruction = str(action.get("instruction") or "").lower()
+    combined = "\n".join([category.lower(), signature, instruction])
+    if category == "parsed_value_mismatch" and any(
+        token in combined
+        for token in (
+            "owner1",
+            "repo1",
+            "fixture inconsistent",
+            "test fixture",
+        )
+    ):
+        for candidate in ("fixtures/sample.html", "tests/test_parser.py"):
+            if candidate in targets:
+                return candidate
+    for candidate in ("crawler.py", "tests/test_parser.py", "fixtures/sample.html"):
+        if candidate in targets:
+            return candidate
+    return targets[0]
 
 
 def targeted_review_repair_retarget_args(state: AgentState, tool_name: str) -> dict[str, object] | None:
@@ -1664,6 +1832,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import html.parser
 import json
 import re
@@ -1751,9 +1920,13 @@ class TrendingParser(html.parser.HTMLParser):
 
 
 def normalize_record(raw: dict[str, object]) -> dict[str, object]:
+    owner = str(raw.get("owner") or "")
+    repository_name = str(raw.get("repository_name") or "")
+    repository = f"{{owner}}/{{repository_name}}" if owner and repository_name else ""
     return {{
-        "repository_name": str(raw.get("repository_name") or ""),
-        "owner": str(raw.get("owner") or ""),
+        "repository": repository,
+        "repository_name": repository_name,
+        "owner": owner,
         "description": str(raw.get("description") or ""),
         "language": str(raw.get("language") or ""),
         "stars_today": int(raw.get("stars_today") or 0),
@@ -1763,10 +1936,49 @@ def normalize_record(raw: dict[str, object]) -> dict[str, object]:
     }}
 
 
-def parse_trending(html: str) -> list[dict[str, object]]:
-    parser = TrendingParser()
-    parser.feed(html)
-    return parser.records
+def strip_tags(value: str) -> str:
+    return html.unescape(" ".join(re.sub(r"<[^>]+>", " ", value).split()))
+
+
+def first_match(pattern: str, text: str, default: str = "") -> str:
+    match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    return html.unescape(match.group(1).strip()) if match else default
+
+
+def parse_trending(html_text: str) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    articles = re.findall(r"<article\\b[^>]*>(.*?)</article>", html_text, flags=re.IGNORECASE | re.DOTALL)
+    if not articles:
+        articles = re.findall(r"<div\\b[^>]*class=[\\\"'][^\\\"']*Box-row[^\\\"']*[\\\"'][^>]*>(.*?)</div>", html_text, flags=re.IGNORECASE | re.DOTALL)
+    for article in articles:
+        href = first_match(r"<h2\\b.*?<a\\b[^>]*href=[\\\"'](/[^\\\"']+/[^\\\"']+)[\\\"']", article)
+        if not href:
+            href = first_match(r"<a\\b[^>]*href=[\\\"'](/[^\\\"']+/[^\\\"']+)[\\\"']", article)
+        parts = [part.strip() for part in href.strip("/").split("/")[:2]]
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            continue
+        description = strip_tags(first_match(r"<p\\b[^>]*>(.*?)</p>", article))
+        language = strip_tags(first_match(r"itemprop=[\\\"']programmingLanguage[\\\"'][^>]*>(.*?)</span>", article))
+        if not language:
+            language = strip_tags(first_match(r"repo-language-color.*?</span>\\s*<span[^>]*>(.*?)</span>", article))
+        stars_today_text = first_match(r"([0-9][0-9,.]*\\s*(?:[kKmM])?\\s+stars?\\s+today)", article)
+        stars_text = first_match(r"href=[\\\"'][^\\\"']*/stargazers[\\\"'][^>]*>(.*?)</a>", article)
+        forks_text = first_match(r"href=[\\\"'][^\\\"']*/forks[\\\"'][^>]*>(.*?)</a>", article)
+        records.append(
+            normalize_record(
+                {{
+                    "owner": parts[0],
+                    "repository_name": parts[1],
+                    "description": description,
+                    "language": language,
+                    "stars_today": number_from_text(stars_today_text),
+                    "total_stars": number_from_text(strip_tags(stars_text)),
+                    "forks": number_from_text(strip_tags(forks_text)),
+                    "url": "https://github.com/" + "/".join(parts),
+                }}
+            )
+        )
+    return records
 
 
 def fetch_source() -> str:
@@ -1786,7 +1998,7 @@ def write_sink(records: list[dict[str, object]], path: Path = SINK_PATH) -> None
 def write_sample_csv(records: list[dict[str, object]]) -> None:
     Path("fixtures").mkdir(exist_ok=True)
     with Path("fixtures/sample.csv").open("w", encoding="utf-8", newline="") as handle:
-        fieldnames = ["repository_name", "owner", "description", "language", "stars_today", "total_stars", "forks", "url"]
+        fieldnames = ["repository", "repository_name", "owner", "description", "language", "stars_today", "total_stars", "forks", "url"]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(records)
@@ -1809,17 +2021,27 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--source")
+    parser.add_argument("--output")
     args = parser.parse_args()
     if args.preflight:
         return preflight()
-    html = load_fixture() if args.dry_run else fetch_source()
+    if args.source:
+        html = Path(args.source).read_text(encoding="utf-8")
+    else:
+        html = load_fixture() if args.dry_run else fetch_source()
     records = parse_trending(html)
     if not records:
         raise SystemExit("no GitHub trending records parsed")
     write_sink(records)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(records, ensure_ascii=False, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
     if args.dry_run:
         write_sample_csv(records)
-        print(f"dry-run complete: wrote {{len(records)}} record(s) to {{SINK_PATH}}")
+        target = args.output or str(SINK_PATH)
+        print(f"dry-run complete: wrote {{len(records)}} record(s) to {{target}}")
     else:
         print(f"crawl complete: wrote {{len(records)}} record(s) to {{SINK_PATH}}")
     return 0
@@ -1864,6 +2086,7 @@ if __name__ == "__main__":
             "        self.assertGreaterEqual(len(records), 2)\n"
             "        first = records[0]\n"
             "        self.assertEqual(first['owner'], 'owner')\n"
+            "        self.assertEqual(first['repository'], 'owner/repo')\n"
             "        self.assertEqual(first['repository_name'], 'repo')\n"
             "        self.assertEqual(first['url'], 'https://github.com/owner/repo')\n"
             "        self.assertEqual(first['language'], 'Python')\n"
@@ -1898,12 +2121,26 @@ if __name__ == "__main__":
             "</main></body></html>\n"
         )
     if path == "fixtures/sample.csv":
-        return "repository_name,owner,description,language,stars_today,total_stars,forks,url\nrepo,owner,A sample trending repository.,Python,56,1234,0,https://github.com/owner/repo\n"
-    if path == "schemas/output.schema.json":
+        return "repository,repository_name,owner,description,language,stars_today,total_stars,forks,url\nowner/repo,repo,owner,A sample trending repository.,Python,56,1234,0,https://github.com/owner/repo\n"
+    if path in {"schemas/output.schema.json", "schemas/github_trends.schema.json"}:
         return json_dumps_compact(
             {
                 "type": "object",
+                "required": [
+                    "rank",
+                    "owner",
+                    "repository_name",
+                    "repository",
+                    "url",
+                    "description",
+                    "language",
+                    "stars_today",
+                    "total_stars",
+                    "forks",
+                ],
                 "properties": {
+                    "rank": {"type": "integer"},
+                    "repository": {"type": "string"},
                     "repository_name": {"type": "string"},
                     "owner": {"type": "string"},
                     "description": {"type": "string"},

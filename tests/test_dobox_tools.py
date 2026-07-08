@@ -309,6 +309,8 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(registry.get("edit_file"))
         self.assertIsNotNone(registry.get("replace_in_file"))
         self.assertIsNotNone(registry.get("apply_patch"))
+        self.assertIsNotNone(registry.get("read_file_range"))
+        self.assertIsNotNone(registry.get("read_symbol"))
         self.assertIsNotNone(registry.get("preview"))
         self.assertIsNotNone(registry.get("logs"))
 
@@ -319,6 +321,27 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
 
         preview = await registry.call("preview", {"port": 3000})
         self.assertEqual(preview["content"], "https://preview.example/project-123/3000")
+
+    async def test_read_file_range_returns_numbered_excerpt(self) -> None:
+        tools = DoBoxTools(FakeDoBoxClient(), "project-123")
+
+        result = await tools.read_file_range("README.md", start_line=2, end_line=2)
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.output, "2: world")
+        self.assertEqual(result.metadata["path"], "README.md")
+        self.assertEqual(result.metadata["start_line"], 2)
+
+    async def test_read_symbol_returns_python_definition(self) -> None:
+        client = FakeDoBoxClient()
+        client.files["crawler.py"] = "x = 1\n\nclass Parser:\n    def parse(self):\n        return []\n\n"
+        tools = DoBoxTools(client, "project-123")
+
+        result = await tools.read_symbol("crawler.py", "Parser", context_lines=0)
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("3: class Parser:", result.output)
+        self.assertEqual(result.metadata["symbol"], "Parser")
 
     async def test_registers_with_name_handler_registry_shape(self) -> None:
         class NameHandlerRegistry:

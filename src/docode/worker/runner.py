@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from docode.agent.loop import CodingAgentLoop
-from docode.agent import targeted_repair_policy_patch
 from docode.agent.reviewer import IndependentReviewer
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.tools import CompositeAgentTools
@@ -23,9 +22,6 @@ from docode.llm.weav_apicred_store import usage_record_from_snapshot
 from docode.storage.models import JobStatus
 from docode.storage.repository import JobRepository, terminal_status
 from docode.web.tools import WebTools, WebToolsConfig
-
-
-targeted_repair_policy_patch.apply()
 
 
 DoBoxClientFactory = Callable[[], DoBoxClient]

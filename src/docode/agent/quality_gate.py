@@ -448,14 +448,17 @@ def inferred_required_json_fields(instruction: str) -> list[str]:
 
 
 def github_repository_value(row: dict[str, Any]) -> Any:
-    for key in ("repository_name", "repository", "name"):
+    for key in ("repository", "name"):
         value = row.get(key)
         if value not in {None, ""}:
             return value
     owner = row.get("owner")
-    name = row.get("repo") or row.get("project")
+    name = row.get("repository_name") or row.get("repo") or row.get("project")
     if owner and name:
         return f"{owner}/{name}"
+    value = row.get("repository_name")
+    if value not in {None, ""}:
+        return value
     return None
 
 
@@ -479,21 +482,32 @@ async def inspect_markdown_artifacts(tools: DoBoxTools, task_contract: TaskContr
 
 def detect_empty_markdown_sections(path: str, text: str) -> list[QualityIssue]:
     issues: list[QualityIssue] = []
-    sections = re.split(r"(?m)^#{1,6}\s+", text)
-    for section in sections:
-        lines = [line.strip() for line in section.splitlines() if line.strip()]
-        if not lines:
+    matches = list(re.finditer(r"(?m)^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$", text))
+    for index, match in enumerate(matches):
+        title = match.group("title").strip()
+        normalized_title = title.lower()
+        if normalized_title not in {"installation", "usage", "configuration", "examples"}:
             continue
-        title = lines[0].lower()
-        body = lines[1:]
-        if title in {"installation", "usage", "configuration", "examples"} and len(" ".join(body)) < 20:
+        level = len(match.group("marks"))
+        end = len(text)
+        for next_match in matches[index + 1 :]:
+            if len(next_match.group("marks")) <= level:
+                end = next_match.start()
+                break
+        body_text = text[match.end() : end]
+        body_lines = [
+            line.strip()
+            for line in body_text.splitlines()
+            if line.strip() and not re.match(r"^#{1,6}\s+", line.strip())
+        ]
+        if len(" ".join(body_lines)) < 20:
             issues.append(
                 QualityIssue(
                     severity="blocker",
                     code="markdown_section_empty",
                     path=path,
-                    message=f"Markdown section '{lines[0]}' is empty or too thin.",
-                    repair_hint=f"Add concrete content, commands, or examples to the '{lines[0]}' section.",
+                    message=f"Markdown section '{title}' is empty or too thin.",
+                    repair_hint=f"Add concrete content, commands, or examples to the '{title}' section.",
                 )
             )
     return issues

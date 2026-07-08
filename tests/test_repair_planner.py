@@ -72,6 +72,67 @@ def test_fixture_missing_normalizes_parent_segments() -> None:
     assert action.target_files == ["tests/fixtures/trending.html"]
 
 
+def test_cli_unrecognized_arguments_repair() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "usage: crawler.py [-h] [--preflight] [--dry-run]\n"
+            "crawler.py: error: unrecognized arguments: --source fixtures/sample.html --output data/output.json"
+        ),
+        metadata={"command": "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"},
+    )
+
+    assert action is not None
+    assert action.category == "cli_unrecognized_arguments"
+    assert action.target_files == ["crawler.py"]
+    assert "--source fixtures/sample.html --output data/output.json" in action.instruction
+    assert action.rerun_commands == ["python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"]
+
+
+def test_number_parser_invalid_literal_repair() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/tests/test_parser.py", line 28, in test_number_parser\n'
+            "    self.assertEqual(crawler.number_from_text('56 stars today'), 56)\n"
+            '  File "/workspace/crawler.py", line 20, in number_from_text\n'
+            "    return int(text)\n"
+            "ValueError: invalid literal for int() with base 10: '56 stars today'\n"
+        ),
+        metadata={"command": "python3 -m unittest discover -s tests"},
+    )
+
+    assert action is not None
+    assert action.category == "number_parser_invalid_literal"
+    assert action.target_files == ["crawler.py"]
+    assert "56 stars today" in action.instruction
+    assert "1.2k" in action.instruction
+    assert action.initial_inspection_budget == 0
+
+
+def test_unbound_local_error_repair() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/crawler.py", line 240, in <module>\n'
+            "    main()\n"
+            '  File "/workspace/crawler.py", line 233, in main\n'
+            "    json.dump(records, f, indent=2)\n"
+            "    ^^^^\n"
+            "UnboundLocalError: cannot access local variable 'json' where it is not associated with a value"
+        ),
+        metadata={"command": "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"},
+    )
+
+    assert action is not None
+    assert action.category == "unbound_local_error"
+    assert action.target_files == ["crawler.py"]
+    assert "json" in action.instruction
+    assert action.rerun_commands == ["python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"]
+
+
 def test_name_error_did_you_mean_repair() -> None:
     action = plan_repair_from_tool_result(
         tool="run_command",
@@ -92,6 +153,56 @@ def test_name_error_did_you_mean_repair() -> None:
     assert action.target_files == ["crawler.py"]
     assert "replace the undefined symbol `_GitHubTrendingParser` with `GitHubTrendingParser`" in action.instruction
     assert action.initial_inspection_budget == 1
+
+
+def test_parsed_value_mismatch_uses_failing_assertion_field() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "FAIL: test_parse (tests.test_parser.ParserTests.test_parse)\n"
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/tests/test_parser.py", line 14, in test_parse\n'
+            "    self.assertEqual(first['owner'], 'owner')\n"
+            '  File "/workspace/tests/test_parser.py", line 15, in test_parse\n'
+            "    self.assertEqual(first['stars_today'], 56)\n"
+            "AssertionError: 0 != 56\n"
+        ),
+        metadata={"command": "python3 -m unittest discover -s tests"},
+    )
+
+    assert action is not None
+    assert action.category == "parsed_value_mismatch"
+    assert action.signature == "parsed_value_mismatch:stars_today:0:56"
+    assert "Field under test: `stars_today`" in action.instruction
+
+
+def test_parsed_value_mismatch_uses_first_failure_block() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "FF\n"
+            "======================================================================\n"
+            "FAIL: test_number_parser (test_parser.ParserTest.test_number_parser)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/tests/test_parser.py", line 28, in test_number_parser\n'
+            "    self.assertEqual(crawler.number_from_text('56 stars today'), 56)\n"
+            "AssertionError: 0 != 56\n\n"
+            "======================================================================\n"
+            "FAIL: test_parse_fixture_records (test_parser.ParserTest.test_parse_fixture_records)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/tests/test_parser.py", line 23, in test_parse_fixture_records\n'
+            "    self.assertEqual(first['total_stars'], 1234)\n"
+            "AssertionError: 0 != 1234\n"
+        ),
+        metadata={"command": "python3 -m unittest discover -s tests"},
+    )
+
+    assert action is not None
+    assert action.category == "parsed_value_mismatch"
+    assert action.signature == "parsed_value_mismatch:value:0:56"
+    assert "Field under test" not in action.instruction
 
 
 def test_json_repository_semantic_repair() -> None:
@@ -201,6 +312,44 @@ def test_parsed_value_mismatch_repair() -> None:
     assert "Observed value: `user1/repo1`" in action.instruction
     assert "Expected value: `user/repo`" in action.instruction
     assert "fixture/test consistency" in action.instruction
+
+
+def test_empty_actual_value_mismatch_repair() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "FAIL: test_parse_fixture_records (test_parser.ParserTest.test_parse_fixture_records)\n"
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/tests/test_parser.py", line 17, in test_parse_fixture_records\n'
+            "    self.assertEqual(first['owner'], 'owner')\n"
+            "AssertionError: '' != 'owner'\n"
+            "+ owner\n"
+        ),
+        metadata={"command": "python3 -m unittest discover -s tests"},
+    )
+
+    assert action is not None
+    assert action.category == "parsed_value_mismatch"
+    assert "Expected value: `owner`" in action.instruction
+
+
+def test_stars_today_mismatch_forces_direct_repair() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "FAIL: test_parse_fixture_records (test_parser.ParserTest.test_parse_fixture_records)\n"
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/tests/test_parser.py", line 22, in test_parse_fixture_records\n'
+            "    self.assertEqual(first['stars_today'], 56)\n"
+            "AssertionError: 0 != 56\n"
+        ),
+        metadata={"command": "python3 -m unittest discover -s tests"},
+    )
+
+    assert action is not None
+    assert action.category == "parsed_value_mismatch"
+    assert "Field under test: `stars_today`" in action.instruction
+    assert action.initial_inspection_budget == 0
 
 
 def test_syntax_error_ignores_stdlib_traceback_target() -> None:

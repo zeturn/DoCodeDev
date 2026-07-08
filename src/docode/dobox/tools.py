@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .client import DoBoxClient
+from .file_readers import read_line_range, read_python_symbol
 from .types import FileResult, ToolResult
 
 
@@ -90,6 +91,18 @@ class DoBoxTools:
         return [
             ToolDefinition("run_command", "Run a shell command inside the project sandbox.", {"command": "string", "cwd": "string"}, self.run_command),
             ToolDefinition("read_file", "Read a file under /workspace.", {"path": "string"}, self.read_file),
+            ToolDefinition(
+                "read_file_range",
+                "Read a 1-based inclusive line range from a file under /workspace. Use this when read_file output is too long or truncated.",
+                {"path": "string", "start_line": "integer", "end_line": "integer"},
+                self.read_file_range,
+            ),
+            ToolDefinition(
+                "read_symbol",
+                "Read the definition body for a Python function or class symbol from a file under /workspace, with nearby context lines.",
+                {"path": "string", "symbol": "string", "context_lines": "integer"},
+                self.read_symbol,
+            ),
             ToolDefinition("write_file", "Write a file under /workspace.", {"path": "string", "content": "string"}, self.write_file),
             ToolDefinition(
                 "edit_file",
@@ -151,6 +164,30 @@ class DoBoxTools:
                 metadata["bytes"] = file_result.bytes_read
             return self._compress("read_file", file_result.content, 0, metadata, truncated=file_result.truncated)
         return self._compress("read_file", str(file_result), 0, {"path": path})
+
+    async def read_file_range(self, path: str, start_line: int = 1, end_line: int = 120) -> ToolResult:
+        path_error = workspace_path_error(path)
+        if path_error:
+            return rejected_tool_result("read_file_range", path_error, {"path": path})
+        file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+        text = file_result.content if isinstance(file_result, FileResult) else str(file_result)
+        output, metadata = read_line_range(text, start_line, end_line)
+        metadata = {"path": path, **metadata, "source_truncated": bool(getattr(file_result, "truncated", False))}
+        return self._compress("read_file_range", output, 0, metadata, truncated=bool(getattr(file_result, "truncated", False)))
+
+    async def read_symbol(self, path: str, symbol: str, context_lines: int = 5) -> ToolResult:
+        path_error = workspace_path_error(path)
+        if path_error:
+            return rejected_tool_result("read_symbol", path_error, {"path": path, "symbol": symbol})
+        name = str(symbol or "").strip()
+        if not name:
+            return ToolResult(tool="read_symbol", output="symbol must be a non-empty string", exit_code=2, metadata={"path": path})
+        file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+        text = file_result.content if isinstance(file_result, FileResult) else str(file_result)
+        output, metadata = read_python_symbol(text, name, context_lines)
+        exit_code = 1 if output.startswith("symbol not found:") else 0
+        metadata = {"path": path, **metadata, "source_truncated": bool(getattr(file_result, "truncated", False))}
+        return self._compress("read_symbol", output, exit_code, metadata, truncated=bool(getattr(file_result, "truncated", False)))
 
     async def write_file(self, path: str, content: str) -> ToolResult:
         path_error = workspace_path_error(path)

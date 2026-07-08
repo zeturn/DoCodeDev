@@ -4,6 +4,7 @@ import json
 from unittest import IsolatedAsyncioTestCase
 
 from docode.agent.quality_gate import QualityGate
+from docode.agent.quality_gate import detect_empty_markdown_sections
 from docode.agent.task_contract import TaskContract
 from docode.dobox.types import ToolResult
 
@@ -86,6 +87,25 @@ class QualityGateTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.blockers(), [])
 
+    async def test_prefers_full_repository_over_repository_name(self) -> None:
+        result = await QualityGate().run(
+            tools=QualityGateTools(
+                artifact=[
+                    {
+                        "owner": "owner",
+                        "repository_name": "repo",
+                        "repository": "owner/repo",
+                        "url": "https://github.com/owner/repo",
+                    }
+                ]
+            ),
+            task_contract=TaskContract(must_modify_files=["data/github_trending.json"]),
+            instruction="Build a GitHub Trending crawler that writes data/github_trending.json",
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.blockers(), [])
+
     async def test_blocks_undeclared_third_party_dependency(self) -> None:
         result = await QualityGate().run(
             tools=QualityGateTools(
@@ -98,3 +118,16 @@ class QualityGateTests(IsolatedAsyncioTestCase):
 
         self.assertFalse(result.passed)
         self.assertTrue(any(issue.code == "undeclared_third_party_dependency" for issue in result.issues))
+
+    def test_markdown_parent_section_counts_child_heading_content(self) -> None:
+        issues = detect_empty_markdown_sections(
+            "README.md",
+            "# GitHub Trends Crawler\n\n"
+            "## Usage\n\n"
+            "### Basic usage\n\n"
+            "```bash\n"
+            "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run\n"
+            "```\n",
+        )
+
+        self.assertEqual(issues, [])
