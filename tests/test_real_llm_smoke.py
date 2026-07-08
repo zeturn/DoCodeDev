@@ -145,6 +145,16 @@ async def build_real_llm_or_skip(testcase: IsolatedAsyncioTestCase, job: CodingJ
         testcase.skipTest(
             "DOCODE_REAL_LLM_SMOKE=1 is set, but no BasaltPass subject token, APICred token, or direct OpenAI key is configured."
         )
+    if not apicred_token and local_credentials:
+        requested_provider = os.getenv("DOCODE_REAL_LLM_PROVIDER") or "openai"
+        credential = local_credentials.get(requested_provider)
+        if credential is None:
+            testcase.skipTest(
+                f"direct local credentials are configured for {sorted(local_credentials)}, "
+                f"but DOCODE_REAL_LLM_PROVIDER requested {requested_provider!r}."
+            )
+        job.provider = credential.provider
+        job.model = os.getenv("DOCODE_REAL_LLM_MODEL") or config.default_model or credential.model
     resolver = APICredCredentialResolver(
         config.apicred_base_url,
         apicred_token,
