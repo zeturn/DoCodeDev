@@ -263,6 +263,8 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
         return None
     field = assertion_field_name(output)
     targets = infer_python_traceback_files(output) or ["crawler.py"]
+    if fixture_consistency_mismatch(field, actual, expected):
+        targets = ["fixtures/sample.html", *[target for target in targets if target != "fixtures/sample.html"]]
     rerun = command or "python3 -m unittest discover -s tests"
     field_line = f"Field under test: `{field}`\n" if field else ""
     return RepairAction(
@@ -291,6 +293,28 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
         ),
         initial_inspection_budget=0 if field in {"stars_today", "stars", "forks", "total_stars", "owner", "repository", "repository_name"} else 1,
     )
+
+
+def fixture_consistency_mismatch(field: str, actual: str, expected: str) -> bool:
+    if field not in {"owner", "repository", "repository_name", "repo", "name"}:
+        return False
+    normalized_actual = actual.strip().lower()
+    normalized_expected = expected.strip().lower()
+    if not normalized_actual or not normalized_expected:
+        return False
+    if normalized_actual == normalized_expected:
+        return False
+    sample_values = {
+        ("owner1", "owner"),
+        ("repo1", "repo"),
+        ("owner1/repo1", "owner/repo"),
+        ("user1", "user"),
+        ("repo1", "repo"),
+        ("user1/repo1", "user/repo"),
+    }
+    if (normalized_actual, normalized_expected) in sample_values:
+        return True
+    return normalized_actual.replace("1", "") == normalized_expected
 
 
 def plan_name_error_did_you_mean(*, output: str, command: str) -> RepairAction | None:
@@ -456,13 +480,22 @@ def plan_module_not_found(*, output: str, command: str) -> RepairAction | None:
 
 def plan_no_tests_ran(*, output: str, command: str) -> RepairAction | None:
     lowered = output.lower()
-    if not any(pattern in lowered for pattern in ("no tests ran", "ran 0 tests", "collected 0 items")):
+    if not any(
+        pattern in lowered
+        for pattern in (
+            "no tests ran",
+            "ran 0 tests",
+            "collected 0 items",
+            "start directory is not importable: 'tests'",
+            'start directory is not importable: "tests"',
+        )
+    ):
         return None
     rerun = command or "python3 -m unittest discover -s tests"
     return RepairAction(
         category="no_tests_ran",
         signature=f"no_tests_ran:{rerun}",
-        reason="The required test command discovered zero tests.",
+        reason="The required test command did not discover importable tests.",
         target_files=["tests/test_parser.py", "tests/test_crawler.py"],
         allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
         forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
@@ -476,7 +509,7 @@ def plan_no_tests_ran(*, output: str, command: str) -> RepairAction | None:
             "4. Do not continue unrelated diagnosis.\n"
             f"5. Rerun exactly: `{rerun}`."
         ),
-        initial_inspection_budget=1,
+        initial_inspection_budget=0,
     )
 
 

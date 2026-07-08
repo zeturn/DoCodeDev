@@ -308,7 +308,7 @@ def test_parsed_value_mismatch_repair() -> None:
 
     assert action is not None
     assert action.category == "parsed_value_mismatch"
-    assert action.target_files == ["crawler.py"]
+    assert action.target_files == ["fixtures/sample.html", "crawler.py"]
     assert "Observed value: `user1/repo1`" in action.instruction
     assert "Expected value: `user/repo`" in action.instruction
     assert "fixture/test consistency" in action.instruction
@@ -352,6 +352,25 @@ def test_stars_today_mismatch_forces_direct_repair() -> None:
     assert action.initial_inspection_budget == 0
 
 
+def test_fixture_owner_sample_mismatch_targets_fixture_first() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "FAIL: test_parse_fixture_records (test_parser.ParserTest.test_parse_fixture_records)\n"
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/tests/test_parser.py", line 17, in test_parse_fixture_records\n'
+            "    self.assertEqual(first['owner'], 'owner')\n"
+            "AssertionError: 'owner1' != 'owner'\n"
+        ),
+        metadata={"command": "python3 -m unittest discover -s tests"},
+    )
+
+    assert action is not None
+    assert action.category == "parsed_value_mismatch"
+    assert action.target_files[0] == "fixtures/sample.html"
+    assert "crawler.py" in action.target_files
+
+
 def test_syntax_error_ignores_stdlib_traceback_target() -> None:
     action = plan_repair_from_tool_result(
         tool="run_command",
@@ -372,3 +391,22 @@ def test_syntax_error_ignores_stdlib_traceback_target() -> None:
     assert action.category == "syntax_error"
     assert action.target_files == ["crawler.py"]
     assert "usr/lib" not in action.instruction
+
+
+def test_unittest_missing_tests_directory_requires_test_file_creation() -> None:
+    action = plan_repair_from_tool_result(
+        tool="run_command",
+        output=(
+            "Traceback (most recent call last):\n"
+            '  File "/usr/lib/python3.12/unittest/loader.py", line 307, in discover\n'
+            "    raise ImportError('Start directory is not importable: %r' % start_dir)\n"
+            "ImportError: Start directory is not importable: 'tests'\n"
+        ),
+        metadata={"command": "python3 -m unittest discover -s tests"},
+    )
+
+    assert action is not None
+    assert action.category == "no_tests_ran"
+    assert action.reason == "The required test command did not discover importable tests."
+    assert action.target_files == ["tests/test_parser.py", "tests/test_crawler.py"]
+    assert action.initial_inspection_budget == 0

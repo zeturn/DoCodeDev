@@ -131,3 +131,32 @@ class QualityGateTests(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(issues, [])
+
+    def test_markdown_duplicate_section_passes_when_one_has_content(self) -> None:
+        issues = detect_empty_markdown_sections(
+            "README.md",
+            "# GitHub Trends Crawler\n\n"
+            "## Usage\n\n"
+            "## Output\n\n"
+            "Writes structured GitHub trending repository records.\n\n"
+            "## Usage\n\n"
+            "### Basic usage\n\n"
+            "```bash\n"
+            "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run\n"
+            "python3 crawler.py --preflight\n"
+            "```\n",
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_markdown_duplicate_section_blocks_when_all_are_thin(self) -> None:
+        issues = detect_empty_markdown_sections(
+            "README.md",
+            "# GitHub Trends Crawler\n\n"
+            "## Usage\n\n"
+            "## Output\n\n"
+            "Writes structured output.\n\n"
+            "## Usage\n\n",
+        )
+
+        self.assertTrue(any(issue.code == "markdown_section_empty" and issue.path == "README.md" for issue in issues))

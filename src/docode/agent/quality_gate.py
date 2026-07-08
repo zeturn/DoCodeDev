@@ -482,11 +482,14 @@ async def inspect_markdown_artifacts(tools: DoBoxTools, task_contract: TaskContr
 
 def detect_empty_markdown_sections(path: str, text: str) -> list[QualityIssue]:
     issues: list[QualityIssue] = []
+    target_titles = {"installation", "usage", "configuration", "examples"}
+    section_titles: dict[str, str] = {}
+    section_lengths: dict[str, list[int]] = {}
     matches = list(re.finditer(r"(?m)^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$", text))
     for index, match in enumerate(matches):
         title = match.group("title").strip()
         normalized_title = title.lower()
-        if normalized_title not in {"installation", "usage", "configuration", "examples"}:
+        if normalized_title not in target_titles:
             continue
         level = len(match.group("marks"))
         end = len(text)
@@ -500,7 +503,12 @@ def detect_empty_markdown_sections(path: str, text: str) -> list[QualityIssue]:
             for line in body_text.splitlines()
             if line.strip() and not re.match(r"^#{1,6}\s+", line.strip())
         ]
-        if len(" ".join(body_lines)) < 20:
+        section_titles.setdefault(normalized_title, title)
+        section_lengths.setdefault(normalized_title, []).append(len(" ".join(body_lines)))
+
+    for normalized_title, lengths in section_lengths.items():
+        if max(lengths, default=0) < 20:
+            title = section_titles[normalized_title]
             issues.append(
                 QualityIssue(
                     severity="blocker",
