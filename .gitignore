@@ -5,3 +5,5 @@
 .docode_artifacts*/
 __pycache__/
 *.py[cod]
+frontend/node_modules/
+frontend/dist/

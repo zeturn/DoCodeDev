@@ -12,6 +12,7 @@ from docode.agent.verifier import (
     CodingVerifier,
     VerificationEvidence,
     build_verification_plan,
+    diff_contains_placeholder,
     json_output_check_script,
     requires_json_output_check,
     verification_evidence_from_steps,
@@ -797,6 +798,28 @@ class VerifierTests(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(plan.smoke_commands, [])
+
+    def test_numbered_verification_commands_become_smoke_commands(self) -> None:
+        plan = build_verification_plan(
+            "Implement crawler.py so it parses fixtures/products.html and writes product records to JSON.\n\n"
+            "Verification commands:\n"
+            "1. python -m unittest discover -s tests\n"
+            "2. python crawler.py fixtures/products.html --output out.json"
+        )
+
+        self.assertEqual(
+            plan.smoke_commands,
+            [
+                "python -m unittest discover -s tests",
+                "python crawler.py fixtures/products.html --output out.json",
+            ],
+        )
+        self.assertFalse(plan.require_external_source_verified)
+        self.assertTrue(plan.require_crawler_artifacts)
+
+    def test_placeholder_check_allows_legitimate_pass_statement(self) -> None:
+        self.assertFalse(diff_contains_placeholder("+except ValueError:\n+    pass\n"))
+        self.assertTrue(diff_contains_placeholder("+    pass  # TODO implement later\n"))
 
     async def test_source_repair_accepts_fetch_evidence_without_test_change(self) -> None:
         result = await CodingVerifier(judge=VetoingJudge()).verify(
