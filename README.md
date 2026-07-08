@@ -73,7 +73,7 @@ Generic smoke ladder:
 
 1. README edit smoke: run `python -m unittest tests.test_smoke_readme_job`; the agent must edit `README.md`, produce a non-empty diff, record loop/tool/verifier steps, and export terminal artifacts.
 2. Calculator bugfix smoke: a repo with `calculator.py` and `tests/test_calculator.py`; the instruction explicitly includes the verification command, and the agent must edit source, run that exact command, and submit `final_candidate`.
-3. Generic parser fixture smoke: a repo with `parser.py`, `fixture.html`, and `tests/test_parser.py`; the task must avoid product-specific repository examples and validate reading the fixture/test/source, implementing the parser, and passing tests.
+3. Product parser fixture smoke: run `python -m unittest tests.test_smoke_product_parser_job`; a repo with `parser.py`, `fixtures/products.html`, and `tests/test_parser.py` validates reading the fixture/test/source, implementing parser logic, and passing the explicit verification command.
 4. External GitHub Trends eval: run only after the first three generic cases pass. GitHub Trends is not a production shortcut or embedded runtime capability.
 
 `smoke-check` verifies configured DoBox health, local DoBox backend path, Docker CLI/daemon access, APICred model access, local `gh` availability, database path, and artifact directory. `smoke-run` first runs those checks and then executes a `provider=scripted` end-to-end job when DoBox is reachable. Pass `--start-dobox` to temporarily run `go run ./cmd/server` from the configured local DoBox backend directory for the duration of the smoke check or smoke job.

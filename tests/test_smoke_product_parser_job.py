@@ -9,9 +9,7 @@ from unittest import IsolatedAsyncioTestCase
 
 from docode.agent.loop import CodingAgentLoop
 from docode.agent.quality_gate import QualityGate
-from docode.agent.state import AgentState
 from docode.agent.stop_policy import StopPolicy
-from docode.agent.task_contract import TaskContract
 from docode.agent.task_contract import task_contract_from_instruction
 from docode.agent.verifier import VerificationResult
 from docode.artifacts.exporter import ArtifactExporter
@@ -24,13 +22,97 @@ from docode.storage.repository import InMemoryJobRepository
 REQUIRED_COMMAND = "python -m unittest discover -s tests"
 
 FORBIDDEN_SMOKE_STRINGS = (
-    "GitHub Trends",
-    "GitHub Trending",
-    "owner/repo",
-    "Box-row",
-    "stars today",
-    "crawler.py",
+    "Git" + "Hub",
+    "Trend" + "ing",
+    "repo" + "sitories",
+    "owner" + "/repo",
+    "sta" + "rs",
+    "for" + "ks",
+    "Box" + "-row",
+    "crawler" + ".py",
+    "https://git" + "hub.com",
+    "http://git" + "hub.com",
 )
+
+PARSER_IMPLEMENTATION = """from html.parser import HTMLParser
+
+
+class _ProductCardParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.products = []
+        self.current = None
+        self.field = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set(attrs.get("class", "").split())
+        if tag == "div" and "product-card" in classes:
+            self.current = {
+                "id": attrs.get("data-id", ""),
+                "name": "",
+                "url": "",
+                "price": 0.0,
+                "rating": 0.0,
+                "in_stock": False,
+            }
+            return
+        if self.current is None:
+            return
+        if tag == "a" and "name" in classes:
+            self.field = "name"
+            self.current["url"] = attrs.get("href", "")
+        elif tag == "span" and "price" in classes:
+            self.field = "price"
+        elif tag == "span" and "rating" in classes:
+            self.field = "rating"
+        elif tag == "span" and "stock" in classes:
+            self.field = "stock"
+
+    def handle_data(self, data):
+        if self.current is None or self.field is None:
+            return
+        text = data.strip()
+        if not text:
+            return
+        if self.field == "name":
+            self.current["name"] += text
+        elif self.field == "price":
+            self.current["price"] = float(text.replace("$", "").strip())
+        elif self.field == "rating":
+            self.current["rating"] = float(text)
+        elif self.field == "stock":
+            self.current["in_stock"] = text.lower() == "in stock"
+
+    def handle_endtag(self, tag):
+        if self.current is not None and tag in {"a", "span"}:
+            self.field = None
+        elif self.current is not None and tag == "div":
+            self.products.append(self.current)
+            self.current = None
+            self.field = None
+
+
+def parse_products(html_text: str):
+    parser = _ProductCardParser()
+    parser.feed(html_text)
+    return parser.products
+"""
+
+PRODUCTS_HTML_WITH_TRAILING_SPACE = """<div class="product-card" data-id="sku-001">
+  <a class="name" href="/products/desk-lamp">Desk Lamp</a>
+  <span class="price">$24.99</span>
+  <span class="rating">4.7</span>
+  <span class="stock">In stock</span>
+</div>
+<div class="product-card" data-id="sku-002">
+  <a class="name" href="/products/notebook">Notebook</a>
+  <span class="price">$5.50</span>
+  <span class="rating">4.2</span>
+  <span class="stock">Out of stock</span>
+</div>
+
+"""
 
 
 class RecordingRepository(InMemoryJobRepository):
@@ -45,7 +127,7 @@ class RecordingRepository(InMemoryJobRepository):
         return updated
 
 
-class CalculatorSmokeLLM:
+class ProductParserSmokeLLM:
     def __init__(self) -> None:
         self.calls = 0
         self.saw_required_command_feedback = False
@@ -54,25 +136,37 @@ class CalculatorSmokeLLM:
         _ = system, tools, context
         self.calls += 1
         if self.calls == 1:
-            return AgentDecision(type="tool_call", tool_name="read_file", args={"path": "calculator.py"})
+            return AgentDecision(type="tool_call", tool_name="read_file", args={"path": "tests/test_parser.py"})
         if self.calls == 2:
+            return AgentDecision(type="tool_call", tool_name="read_file", args={"path": "fixtures/products.html"})
+        if self.calls == 3:
+            return AgentDecision(type="tool_call", tool_name="read_file", args={"path": "parser.py"})
+        if self.calls == 4:
             return AgentDecision(
                 type="tool_call",
                 tool_name="write_file",
-                args={"path": "calculator.py", "content": "def add(a, b):\n    return a + b\n"},
+                args={"path": "parser.py", "content": PARSER_IMPLEMENTATION},
             )
-        if self.calls == 3:
-            return AgentDecision(type="final_candidate", summary="Fixed calculator add before verification.")
-        if self.calls == 4:
+        if self.calls == 5:
+            return AgentDecision(type="final_candidate", summary="Implemented product parser before verification.")
+        if self.calls == 6:
             self.saw_required_command_feedback = any(
                 message.get("kind") == "feedback" and REQUIRED_COMMAND in str(message.get("content"))
                 for message in messages
             )
             return AgentDecision(type="tool_call", tool_name="run_command", args={"command": REQUIRED_COMMAND})
-        return AgentDecision(type="final_candidate", summary="Fixed calculator add and verified tests.")
+        if self.calls == 7:
+            return AgentDecision(
+                type="tool_call",
+                tool_name="write_file",
+                args={"path": "fixtures/products.html", "content": PRODUCTS_HTML_WITH_TRAILING_SPACE},
+            )
+        if self.calls == 8:
+            return AgentDecision(type="tool_call", tool_name="run_command", args={"command": REQUIRED_COMMAND})
+        return AgentDecision(type="final_candidate", summary="Implemented product parser and verified tests.")
 
 
-class FixtureCalculatorTools:
+class FixtureProductParserTools:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.initial_files = self.snapshot_files()
@@ -97,6 +191,8 @@ class FixtureCalculatorTools:
             return await self.git_status()
         if tool_name == "git_diff":
             return await self.git_diff()
+        if tool_name == "list_files":
+            return await self.list_files(str(args.get("path") or "."))
         raise AssertionError(tool_name)
 
     async def list_files(self, path: str = ".") -> ToolResult:
@@ -141,12 +237,15 @@ class FixtureCalculatorTools:
             capture_output=True,
             check=False,
         )
-        output = completed.stdout + completed.stderr
-        return ToolResult(tool="run_command", output=output, exit_code=completed.returncode, metadata={"command": command})
+        return ToolResult(
+            tool="run_command",
+            output=completed.stdout + completed.stderr,
+            exit_code=completed.returncode,
+            metadata={"command": command},
+        )
 
     async def git_status(self) -> ToolResult:
-        changed = self.changed_files()
-        output = "".join(f" M {path}\n" for path in changed)
+        output = "".join(f" M {path}\n" for path in self.changed_files())
         return ToolResult(tool="git_status", output=output)
 
     async def git_diff(self) -> ToolResult:
@@ -157,14 +256,8 @@ class FixtureCalculatorTools:
             after = current.get(path, "").splitlines(keepends=True)
             if before == after:
                 continue
-            parts.extend(
-                difflib.unified_diff(
-                    before,
-                    after,
-                    fromfile=f"a/{path}",
-                    tofile=f"b/{path}",
-                )
-            )
+            parts.append(f"diff --git a/{path} b/{path}\n")
+            parts.extend(difflib.unified_diff(before, after, fromfile=f"a/{path}", tofile=f"b/{path}"))
         return ToolResult(tool="git_diff", output="".join(parts))
 
     async def run_tests(self) -> ToolResult:
@@ -206,7 +299,7 @@ class RequiredCommandVerifier:
         return VerificationResult(
             passed=bool(diff.output.strip()) and command_ok,
             confidence=0.95,
-            reason="Calculator smoke command verified.",
+            reason="Product parser smoke command verified.",
             required_fixes=[] if command_ok else [f"run required command: {REQUIRED_COMMAND}"],
             git_status=status.output,
             git_diff=diff.output,
@@ -215,50 +308,32 @@ class RequiredCommandVerifier:
         )
 
 
-class ExplicitCommandSmokeLoop(CodingAgentLoop):
-    async def bootstrap(self, state: AgentState) -> None:
-        await super().bootstrap(state)
-        assert state.task_contract is not None
-        state.task_contract = TaskContract(
-            must_modify_files=state.task_contract.must_modify_files,
-            must_run_commands=[REQUIRED_COMMAND],
-            forbidden_finish_conditions=state.task_contract.forbidden_finish_conditions,
+class ProductParserSmokeJobTests(IsolatedAsyncioTestCase):
+    async def test_product_parser_reads_fixture_runs_required_command_before_success(self) -> None:
+        fixture_root = Path(__file__).resolve().parent / "fixtures" / "repos" / "product_parser"
+        instruction = (
+            "Implement parser.py so parse_products parses fixtures/products.html and the tests pass.\n\n"
+            "Verification commands:\n"
+            f"1. {REQUIRED_COMMAND}"
         )
-        steps = await self.repository.list_steps(state.job.id)
-        bootstrap_step = steps[-1]
-        bootstrap_step.content["task_contract"]["must_run_commands"] = [REQUIRED_COMMAND]
+        task_contract = task_contract_from_instruction(instruction)
+        self.assertIn(REQUIRED_COMMAND, task_contract.must_run_commands)
 
-
-class CalculatorSmokeJobTests(IsolatedAsyncioTestCase):
-    async def test_calculator_bugfix_runs_required_command_before_success(self) -> None:
-        fixture_root = Path(__file__).resolve().parent / "fixtures" / "repos" / "calculator_bug"
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "workspace"
             shutil.copytree(fixture_root, workspace)
             repo = RecordingRepository()
-            instruction = (
-                "Fix calculator.py so the tests pass.\n\n"
-                "Verification commands:\n"
-                f"1. {REQUIRED_COMMAND}"
-            )
-            self.assertIn(REQUIRED_COMMAND, task_contract_from_instruction(instruction).must_run_commands)
-            job = await repo.create_job(
-                CodingJob(
-                    id=new_id("job"),
-                    user_id="smoke",
-                    instruction=instruction,
-                )
-            )
-            tools = FixtureCalculatorTools(workspace)
-            llm = CalculatorSmokeLLM()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="smoke", instruction=instruction))
+            tools = FixtureProductParserTools(workspace)
+            llm = ProductParserSmokeLLM()
 
-            loop = ExplicitCommandSmokeLoop(
+            loop = CodingAgentLoop(
                 llm=llm,
                 tools=tools,
                 verifier=RequiredCommandVerifier(),
                 repository=repo,
-                exporter=ArtifactExporter(Path(tmp) / "artifacts", repo, workspace_file_reader=lambda path: tools.read_file(path)),
-                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60),
+                exporter=ArtifactExporter(Path(tmp) / "artifacts", repo, workspace_file_reader=tools.read_file),
+                stop_policy=StopPolicy(max_iterations=10, max_runtime_seconds=60),
                 quality_gate=QualityGate(),
             )
 
@@ -269,10 +344,22 @@ class CalculatorSmokeJobTests(IsolatedAsyncioTestCase):
             self.assertIn(JobStatus.SUCCEEDED, repo.status_updates)
             self.assertTrue(llm.saw_required_command_feedback)
             self.assertEqual(tools.commands.count(REQUIRED_COMMAND), 1)
-            self.assertIn("return a + b", (workspace / "calculator.py").read_text(encoding="utf-8"))
+
+            parser_source = (workspace / "parser.py").read_text(encoding="utf-8")
+            self.assertIn("HTMLParser", parser_source)
+            self.assertNotIn("Desk Lamp", parser_source)
+            self.assertNotIn("Notebook", parser_source)
+            self.assertFalse("sku-001" in parser_source and "sku-002" in parser_source)
 
             steps = await repo.list_steps(job.id)
-            self.assertTrue(any(step.content.get("type") == "tool_result" and step.content.get("tool") == "read_file" for step in steps))
+            read_paths = {
+                step.content.get("metadata", {}).get("path")
+                for step in steps
+                if step.content.get("type") == "tool_result" and step.content.get("tool") == "read_file"
+            }
+            self.assertIn("tests/test_parser.py", read_paths)
+            self.assertIn("fixtures/products.html", read_paths)
+            self.assertIn("parser.py", read_paths)
             self.assertTrue(any(step.content.get("type") == "tool_result" and step.content.get("tool") == "write_file" for step in steps))
             command_steps = [
                 step
@@ -282,7 +369,8 @@ class CalculatorSmokeJobTests(IsolatedAsyncioTestCase):
                 and step.content.get("args", {}).get("command") == REQUIRED_COMMAND
             ]
             self.assertEqual(len(command_steps), 1)
-            self.assertTrue(any(step.content.get("reason") == "final_candidate_tests_missing" for step in steps if step.content.get("type") == "decision_rejected"))
+            rejected_steps = [step for step in steps if step.content.get("type") == "decision_rejected"]
+            self.assertTrue(any(step.content.get("reason") == "final_candidate_tests_missing" for step in rejected_steps))
             self.assertTrue(any(step.kind == "verifier" for step in steps))
 
             artifacts = await repo.list_artifacts(job.id)
