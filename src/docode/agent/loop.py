@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import posixpath
 import re
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -313,6 +314,7 @@ class CodingAgentLoop:
         action = plan_repair_from_tool_result(tool=result.tool, output=result.output, metadata=result.metadata or {})
         if action is None:
             return
+        action = refine_repair_action_targets(action, state.task_contract)
         await self.activate_targeted_repair(state, action, result=result)
 
     async def maybe_activate_required_command_repair(self, state: AgentState, workflow: Any) -> bool:
@@ -324,6 +326,7 @@ class CodingAgentLoop:
         action = plan_repair_from_tool_result(tool=failed.tool, output=failed.output, metadata=failed.metadata or {})
         if action is None:
             return False
+        action = refine_repair_action_targets(action, state.task_contract)
         current_signature = str((state.active_repair_action or {}).get("signature") or "")
         if state.repair_mode == "targeted_repair" and current_signature == action.signature:
             return False
@@ -980,6 +983,44 @@ def review_repair_feedback(result: ReviewResult) -> str:
             lines.append(f"- {warning}")
     lines.append("After repairing, rerun the relevant verification command(s), inspect artifacts, then submit final_candidate again.")
     return "\n".join(lines)
+
+
+def refine_repair_action_targets(action: RepairAction, task_contract: TaskContract | None) -> RepairAction:
+    if action.category != "parsed_value_mismatch":
+        return action
+    source_targets = task_contract_source_targets(task_contract)
+    if not source_targets:
+        return action
+    target_files = unique_preserving_paths([*source_targets, *action.target_files])
+    if target_files == action.target_files:
+        return action
+    return replace(action, target_files=target_files)
+
+
+def task_contract_source_targets(task_contract: TaskContract | None) -> list[str]:
+    if task_contract is None:
+        return []
+    targets: list[str] = []
+    for path in task_contract.must_modify_files:
+        normalized = normalize_workspace_relative_path(path)
+        if not normalized or normalized.startswith(("tests/", "test_")):
+            continue
+        if "/fixtures/" in f"/{normalized}" or "/fixture/" in f"/{normalized}":
+            continue
+        if normalized.endswith(".py"):
+            targets.append(normalized)
+    return unique_preserving_paths(targets)
+
+
+def unique_preserving_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for path in paths:
+        normalized = normalize_workspace_relative_path(path)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            ordered.append(normalized)
+    return ordered
 
 
 def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction | None:

@@ -15,7 +15,9 @@ from docode.agent.loop import (
     edit_required_tool_block,
     latest_failed_required_command,
     preferred_targeted_repair_target,
+    refine_repair_action_targets,
     required_test_tool_block,
+    task_contract_source_targets,
     targeted_repair_action_block,
     targeted_repair_exploration_block,
     targeted_repair_forced_tool,
@@ -1713,6 +1715,21 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertIsNone(forced)
         self.assertIn("requires modifying calculator.py before running commands", block)
+
+    def test_parsed_value_mismatch_prefers_contract_source_targets(self) -> None:
+        action = RepairAction(
+            category="parsed_value_mismatch",
+            signature="parsed_value_mismatch:value:False:True",
+            reason="Parser returned the wrong value.",
+            target_files=["tests/test_parser.py"],
+            rerun_commands=["python -m unittest discover -s tests"],
+        )
+        contract = TaskContract(must_modify_files=["parser.py", "fixtures/products.html"])
+
+        refined = refine_repair_action_targets(action, contract)
+
+        self.assertEqual(task_contract_source_targets(contract), ["parser.py"])
+        self.assertEqual(refined.target_files, ["parser.py", "tests/test_parser.py"])
 
     async def test_activate_targeted_repair_resets_consecutive_failures(self) -> None:
         with TemporaryDirectory() as tmp:

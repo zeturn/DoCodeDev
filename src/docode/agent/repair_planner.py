@@ -636,6 +636,8 @@ def normalize_workspace_relative_path(path: str) -> str:
     normalized = path.strip().replace("\\", "/")
     if normalized.startswith("/workspace/"):
         normalized = normalized[len("/workspace/") :]
+    elif "/workspace/" in normalized:
+        normalized = normalized.rsplit("/workspace/", 1)[1]
     normalized = normalized.lstrip("./")
     normalized = posixpath.normpath(normalized)
     return "" if normalized == "." else normalized

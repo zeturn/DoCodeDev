@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 
-from docode.agent.repair_planner import plan_repair_from_tool_result
+from docode.agent.repair_planner import normalize_workspace_relative_path, plan_repair_from_tool_result
 
 
 def load_tests(loader, tests, pattern):
@@ -166,6 +166,13 @@ def test_name_error_did_you_mean_repair() -> None:
     assert action.target_files == ["crawler.py"]
     assert "replace the undefined symbol `_GitHubTrendingParser` with `GitHubTrendingParser`" in action.instruction
     assert action.initial_inspection_budget == 1
+
+
+def test_workspace_relative_path_normalizes_windows_workspace_paths() -> None:
+    assert (
+        normalize_workspace_relative_path("C:\\Users\\me\\AppData\\Local\\Temp\\tmp123\\workspace\\tests\\test_parser.py")
+        == "tests/test_parser.py"
+    )
 
 
 def test_parsed_value_mismatch_uses_failing_assertion_field() -> None:
