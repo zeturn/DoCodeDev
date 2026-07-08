@@ -311,10 +311,6 @@ def commands_equivalent(observed: str, expected: str) -> bool:
     if observed.startswith(unittest) and expected == unittest:
         extra = observed[len(unittest) :].strip()
         return extra in {"", "-v"}
-    if expected == "python3 crawler.py --dry-run" and observed.startswith("python3 crawler.py "):
-        return set(observed.split()) == {"python3", "crawler.py", "--dry-run"}
-    if expected == "python3 crawler.py --preflight" and observed.startswith("python3 crawler.py "):
-        return set(observed.split()) == {"python3", "crawler.py", "--preflight"}
     return False
 
 

@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+import sys
+import unittest
+
 from docode.agent.repair_planner import plan_repair_from_tool_result
+
+
+def load_tests(loader, tests, pattern):
+    _ = loader, tests, pattern
+    suite = unittest.TestSuite()
+    module = sys.modules[__name__]
+    for name in sorted(dir(module)):
+        if name.startswith("test_") and callable(getattr(module, name)):
+            suite.addTest(unittest.FunctionTestCase(getattr(module, name)))
+    return suite
 
 
 def test_import_error_missing_symbol_repair() -> None:
@@ -44,7 +57,7 @@ def test_no_tests_ran_repair() -> None:
 
     assert action is not None
     assert action.category == "no_tests_ran"
-    assert "tests/test_parser.py" in action.target_files
+    assert action.target_files == ["tests/test_app.py"]
 
 
 def test_fixture_missing_repair() -> None:
@@ -107,7 +120,7 @@ def test_number_parser_invalid_literal_repair() -> None:
     assert action.category == "number_parser_invalid_literal"
     assert action.target_files == ["crawler.py"]
     assert "56 stars today" in action.instruction
-    assert "1.2k" in action.instruction
+    assert "compact magnitude suffixes" in action.instruction
     assert action.initial_inspection_budget == 0
 
 
@@ -232,7 +245,7 @@ def test_key_error_missing_required_field_repair() -> None:
 
     assert action is not None
     assert action.category == "missing_required_field"
-    assert action.target_files == ["crawler.py"]
+    assert action.target_files == ["main.py"]
     assert "forks" in action.instruction
     assert "parser function itself" in action.instruction
     assert "forks: default 0" in action.instruction
@@ -284,7 +297,7 @@ def test_parser_records_empty_repair() -> None:
 
     assert action is not None
     assert action.category == "parser_records_empty"
-    assert action.target_files == ["crawler.py"]
+    assert action.target_files == ["main.py"]
     assert "parser function returned 0 records" in action.instruction
     assert "dry-run JSON may already contain records" in action.instruction
     assert action.rerun_commands == ["python3 -m unittest discover -s tests"]
@@ -308,7 +321,7 @@ def test_parsed_value_mismatch_repair() -> None:
 
     assert action is not None
     assert action.category == "parsed_value_mismatch"
-    assert action.target_files == ["fixtures/sample.html", "crawler.py"]
+    assert action.target_files == ["main.py"]
     assert "Observed value: `user1/repo1`" in action.instruction
     assert "Expected value: `user/repo`" in action.instruction
     assert "fixture/test consistency" in action.instruction
@@ -367,8 +380,8 @@ def test_fixture_owner_sample_mismatch_targets_fixture_first() -> None:
 
     assert action is not None
     assert action.category == "parsed_value_mismatch"
-    assert action.target_files[0] == "fixtures/sample.html"
-    assert "crawler.py" in action.target_files
+    assert action.target_files == ["main.py"]
+    assert "based on evidence" in action.instruction
 
 
 def test_syntax_error_ignores_stdlib_traceback_target() -> None:
@@ -408,5 +421,5 @@ def test_unittest_missing_tests_directory_requires_test_file_creation() -> None:
     assert action is not None
     assert action.category == "no_tests_ran"
     assert action.reason == "The required test command did not discover importable tests."
-    assert action.target_files == ["tests/test_parser.py", "tests/test_crawler.py"]
+    assert action.target_files == ["tests/test_app.py"]
     assert action.initial_inspection_budget == 0

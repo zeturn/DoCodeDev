@@ -409,7 +409,7 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
                         code="json_github_url_invalid",
                         path=path,
                         message=f"JSON row {index} has invalid GitHub URL: {url}",
-                        repair_hint="Build absolute repository URLs as https://github.com/owner/repo.",
+                        repair_hint="Build absolute URLs for repository records.",
                     )
                 )
             if isinstance(repository, str) and repository:
@@ -419,8 +419,8 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
                             severity="blocker",
                             code="json_repository_invalid_format",
                             path=path,
-                            message=f"JSON row {index} repository must look like owner/repo, got {preview(repository)}",
-                            repair_hint="Derive repository from the GitHub href path /owner/repo.",
+                            message=f"JSON row {index} repository identifier has invalid format, got {preview(repository)}",
+                            repair_hint="Derive the repository identifier from the same source path as the URL.",
                         )
                     )
                 elif isinstance(url, str) and url.startswith("https://github.com/"):
@@ -432,7 +432,7 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
                                 code="json_repository_url_mismatch",
                                 path=path,
                                 message=f"JSON row {index} repository {repository!r} does not match url {url!r}",
-                                repair_hint="Ensure repository and url are derived from the same owner/repo href.",
+                                repair_hint="Ensure repository and url are derived from the same source href.",
                             )
                         )
     return dedupe_issues(issues)

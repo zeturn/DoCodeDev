@@ -81,7 +81,7 @@ INVALID_INT_LITERAL_RE = re.compile(
 FIELD_DEFAULT_HINTS = {
     "language": '""',
     "description": '""',
-    "repository": '"owner/repo"',
+    "repository": '""',
     "url": '"https://..."',
     "stars": "0",
     "forks": "0",
@@ -127,10 +127,7 @@ def plan_unbound_local_error(*, output: str, command: str) -> RepairAction | Non
     if not match:
         return None
     name = match.group("name")
-    target = "crawler.py"
-    file_matches = TRACEBACK_FILE_RE.findall(output)
-    if file_matches:
-        target = normalize_workspace_relative_path(file_matches[-1])
+    target = inferred_source_targets(output, command)[0]
     rerun = command or "python3 -m unittest discover -s tests"
     return RepairAction(
         category="unbound_local_error",
@@ -157,10 +154,7 @@ def plan_invalid_number_literal(*, output: str, command: str) -> RepairAction | 
     if not match:
         return None
     value = match.group("value")
-    target = "crawler.py"
-    file_matches = TRACEBACK_FILE_RE.findall(output)
-    if file_matches:
-        target = normalize_workspace_relative_path(file_matches[-1])
+    target = inferred_source_targets(output, command)[0]
     rerun = command or "python3 -m unittest discover -s tests"
     return RepairAction(
         category="number_parser_invalid_literal",
@@ -173,8 +167,8 @@ def plan_invalid_number_literal(*, output: str, command: str) -> RepairAction | 
             "The test failed because numeric parsing called int() on text that still contains words.\n\n"
             f"Input value: `{value}`\n\n"
             "Required fix:\n"
-            "1. Update `number_from_text` so it extracts the first numeric token from mixed text.\n"
-            "2. Support commas and k/m suffixes, for example `56 stars today` -> 56, `1,234` -> 1234, `1.2k` -> 1200.\n"
+            "1. Update the numeric parser so it extracts the first numeric token from mixed text.\n"
+            "2. Support commas and compact magnitude suffixes such as k/m.\n"
             "3. Do not weaken or delete parser tests.\n"
             f"4. Rerun exactly: `{rerun}`."
         ),
@@ -224,7 +218,7 @@ def plan_parser_records_empty(*, output: str, command: str) -> RepairAction | No
     minimum = int(match.group("minimum"))
     if actual >= minimum:
         return None
-    targets = infer_python_traceback_files(output) or ["crawler.py"]
+    targets = inferred_source_targets(output, command)
     rerun = command or "python3 -m unittest discover -s tests"
     return RepairAction(
         category="parser_records_empty",
@@ -262,9 +256,7 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
     if actual is None or expected is None:
         return None
     field = assertion_field_name(output)
-    targets = infer_python_traceback_files(output) or ["crawler.py"]
-    if fixture_consistency_mismatch(field, actual, expected):
-        targets = ["fixtures/sample.html", *[target for target in targets if target != "fixtures/sample.html"]]
+    targets = unique_preserving_order([*inferred_source_targets(output, command), *infer_named_fixture_files(output, command)])
     rerun = command or "python3 -m unittest discover -s tests"
     field_line = f"Field under test: `{field}`\n" if field else ""
     return RepairAction(
@@ -284,8 +276,8 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
             "The final dry-run JSON may have the right shape, but the failing test checks exact values returned by the parser function. "
             "Fix parser logic or fixture/test consistency so the parser returns the expected value directly.\n\n"
             "Required next action:\n"
-            "1. Edit the parser/record-construction code in the target source file, or fix the generated fixture if it is inconsistent with the test's expected value.\n"
-            "2. Derive values from the same source HTML attributes/text that the test fixture provides.\n"
+            "1. Inspect the failing assertion, the source function, and any fixture file used by the test.\n"
+            "2. Fix source logic or fixture/test consistency based on evidence from those files.\n"
             "3. Do not only patch final JSON serialization.\n"
             "4. Do not weaken or delete the tests.\n"
             "5. Do not call web_search or fetch_url for this repair.\n"
@@ -295,28 +287,6 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
     )
 
 
-def fixture_consistency_mismatch(field: str, actual: str, expected: str) -> bool:
-    if field not in {"owner", "repository", "repository_name", "repo", "name"}:
-        return False
-    normalized_actual = actual.strip().lower()
-    normalized_expected = expected.strip().lower()
-    if not normalized_actual or not normalized_expected:
-        return False
-    if normalized_actual == normalized_expected:
-        return False
-    sample_values = {
-        ("owner1", "owner"),
-        ("repo1", "repo"),
-        ("owner1/repo1", "owner/repo"),
-        ("user1", "user"),
-        ("repo1", "repo"),
-        ("user1/repo1", "user/repo"),
-    }
-    if (normalized_actual, normalized_expected) in sample_values:
-        return True
-    return normalized_actual.replace("1", "") == normalized_expected
-
-
 def plan_name_error_did_you_mean(*, output: str, command: str) -> RepairAction | None:
     match = NAME_ERROR_RE.search(output)
     if not match:
@@ -324,7 +294,7 @@ def plan_name_error_did_you_mean(*, output: str, command: str) -> RepairAction |
     missing = match.group("missing")
     suggestion_match = DID_YOU_MEAN_RE.search(output)
     suggestion = suggestion_match.group("suggestion") if suggestion_match else ""
-    targets = infer_python_traceback_files(output) or ["crawler.py"]
+    targets = inferred_source_targets(output, command)
     rerun = command or "python3 -m unittest discover -s tests"
     if suggestion:
         category = "name_error_did_you_mean"
@@ -379,7 +349,7 @@ def plan_missing_required_field(*, output: str, command: str) -> RepairAction | 
     if not fields:
         return None
 
-    targets = infer_python_traceback_files(output) or ["crawler.py"]
+    targets = inferred_source_targets(output, command)
     rerun = command or "python3 -m unittest discover -s tests"
     field_list = ", ".join(f"`{field}`" for field in fields)
     defaults = default_hint_for_fields(fields)
@@ -496,7 +466,7 @@ def plan_no_tests_ran(*, output: str, command: str) -> RepairAction | None:
         category="no_tests_ran",
         signature=f"no_tests_ran:{rerun}",
         reason="The required test command did not discover importable tests.",
-        target_files=["tests/test_parser.py", "tests/test_crawler.py"],
+        target_files=inferred_test_targets(output, command),
         allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
         forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
         rerun_commands=[rerun],
@@ -551,20 +521,18 @@ def plan_json_semantic_failure(*, output: str, command: str) -> RepairAction | N
         "json_repository_url_mismatch",
         "required field",
         "repository is empty",
-        "repository must look like owner/repo",
+        "repository has invalid format",
         "does not match url",
         "url is empty",
     )
     if not any(marker in lowered for marker in markers):
         return None
-    commands = ["python3 crawler.py --dry-run"]
-    if command and command not in commands:
-        commands.append(command)
+    commands = [command] if command else []
     return RepairAction(
         category="json_semantic_failure",
         signature="json_semantic_failure",
         reason="The output JSON exists but fails semantic quality checks.",
-        target_files=["crawler.py"],
+        target_files=inferred_source_targets(output, command),
         allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
         forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
         rerun_commands=commands,
@@ -573,8 +541,8 @@ def plan_json_semantic_failure(*, output: str, command: str) -> RepairAction | N
             "Required next action:\n"
             "1. Fix the parser/serializer so required fields are meaningful and non-empty.\n"
             "2. Do not weaken the semantic check.\n"
-            "3. For GitHub repositories, derive `repository` from owner/name or href and ensure `url` starts with `https://github.com/`.\n"
-            "4. Rerun the dry-run and the semantic check."
+            "3. Derive related identifier and URL fields from the same source value when both are present.\n"
+            "4. Rerun the failing command and semantic check."
         ),
         initial_inspection_budget=1,
     )
@@ -596,7 +564,7 @@ def plan_dependency_failure(*, output: str, command: str) -> RepairAction | None
         category="dependency_unavailable",
         signature="dependency_unavailable",
         reason="The implementation depends on unavailable or undeclared third-party packages.",
-        target_files=["crawler.py", "requirements.txt", "pyproject.toml"],
+        target_files=unique_preserving_order([*inferred_source_targets(output, command), "requirements.txt", "pyproject.toml"]),
         allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
         forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
         rerun_commands=[command] if command else [],
@@ -617,7 +585,7 @@ def plan_syntax_error(*, output: str, command: str) -> RepairAction | None:
         return None
     paths = infer_python_traceback_files(output, include_tests=True)
     match = SYNTAX_ERROR_FILE_RE.search(output)
-    path = paths[-1] if paths else (normalize_workspace_relative_path(match.group("path")) if match else "crawler.py")
+    path = paths[-1] if paths else (normalize_workspace_relative_path(match.group("path")) if match else inferred_source_targets(output, command)[0])
     rerun = command or "python3 -m py_compile " + path
     return RepairAction(
         category="syntax_error",
@@ -685,6 +653,55 @@ def infer_python_traceback_files(output: str, *, include_tests: bool = False) ->
         if path not in paths:
             paths.append(path)
     return paths
+
+
+def inferred_source_targets(output: str, command: str) -> list[str]:
+    candidates = infer_python_traceback_files(output)
+    if not candidates:
+        candidates = python_files_from_command(command)
+    if not candidates:
+        candidates = ["main.py"]
+    return unique_preserving_order(candidates)
+
+
+def inferred_test_targets(output: str, command: str) -> list[str]:
+    candidates = [path for path in infer_python_traceback_files(output, include_tests=True) if path.startswith("tests/")]
+    if candidates:
+        return unique_preserving_order(candidates)
+    if "discover -s tests" in command or " tests" in f" {command}":
+        return ["tests/test_app.py"]
+    return ["test_app.py"]
+
+
+def infer_named_fixture_files(output: str, command: str) -> list[str]:
+    combined = f"{output}\n{command}"
+    paths: list[str] = []
+    for match in re.finditer(r"\b[\w./-]*(?:fixtures?|samples?)/[\w./-]+\.(?:html|json|csv|txt|xml)\b", combined):
+        path = normalize_workspace_relative_path(match.group(0))
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def python_files_from_command(command: str) -> list[str]:
+    paths: list[str] = []
+    for token in command.split():
+        cleaned = token.strip("'\"")
+        if cleaned.endswith(".py"):
+            path = normalize_workspace_relative_path(cleaned)
+            if path and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def unique_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
 
 
 def default_hint_for_fields(fields: list[str]) -> str:

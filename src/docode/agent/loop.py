@@ -188,21 +188,6 @@ class CodingAgentLoop:
                     )
                     tool_name = "write_file"
                     tool_args = review_retargeted_args
-                retargeted_args = crawler_missing_artifact_file_retarget_args(state, current_workflow, tool_name, tool_args)
-                if retargeted_args is not None:
-                    await self.repository.add_step(
-                        job.id,
-                        "system",
-                        {
-                            "type": "decision_retargeted",
-                            "reason": "crawler_required_artifact_file_missing",
-                            "from_tool": tool_name,
-                            "to_tool": "write_file",
-                            "target": retargeted_args.get("path"),
-                        },
-                    )
-                    tool_name = "write_file"
-                    tool_args = retargeted_args
                 repair_tool_block = repair_mode_tool_block(state, tool_name)
                 if repair_tool_block:
                     await self.record_rejected_decision(
@@ -1010,10 +995,6 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
         repair_path = quality_gate_repair_target(path, code)
         if repair_path and repair_path not in target_files:
             target_files.append(repair_path)
-        if repair_path == "crawler.py":
-            command = quality_gate_rerun_command(path)
-            if command not in rerun_commands:
-                rerun_commands.append(command)
         where = f" ({path})" if path else ""
         lines.append(f"- [{code}] {issue.message}{where}")
         if issue.repair_hint:
@@ -1023,7 +1004,7 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
         return plan_repair_from_tool_result(
             tool="run_command",
             output=issue_text,
-            metadata={"command": "python3 crawler.py --dry-run"},
+            metadata={},
         )
     signature_source = "|".join(f"{issue.code}:{issue.message}:{issue.path}" for issue in blockers)
     return RepairAction(
@@ -1052,16 +1033,9 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
 
 def quality_gate_repair_target(path: str, code: str = "") -> str:
     normalized = normalize_workspace_relative_path(path)
-    if normalized.startswith(("data/", "output/", "outputs/", "artifacts/")) or str(code).startswith("json_"):
-        return "crawler.py"
+    if str(code).startswith("json_") and normalized:
+        return normalized
     return normalized
-
-
-def quality_gate_rerun_command(path: str) -> str:
-    normalized = normalize_workspace_relative_path(path)
-    if normalized == "data/output.json":
-        return "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"
-    return "python3 crawler.py --dry-run"
 
 
 def repair_action_from_review(result: ReviewResult, task_contract: TaskContract | None) -> RepairAction | None:
@@ -1079,10 +1053,7 @@ def repair_action_from_review(result: ReviewResult, task_contract: TaskContract 
     )
     if repair_plan:
         instruction += f"Repair plan:\n{repair_plan}\n"
-    instruction += (
-        "For crawler artifacts, make crawler.py write .araneae/sink/events.jsonl at runtime, "
-        "align parsed records with the declared schema, strengthen fixtures, and update parser tests."
-    )
+    instruction += "Edit the implicated production artifact or source file, then rerun the required verification command."
     return RepairAction(
         category="review_repair",
         signature="review:" + str(abs(hash(issue_text)))[:12],
@@ -1113,37 +1084,17 @@ def review_repair_target_files(task_contract: TaskContract | None, issue_text: s
     if task_contract is not None and task_contract.must_modify_files:
         lower = issue_text.lower()
         preferred: list[str] = []
-        if "tests/test_parser.py" in lower or "test file" in lower or "parser tests" in lower:
-            preferred.append("tests/test_parser.py")
-        if "fixtures/sample.html" in lower or "fixture" in lower:
-            preferred.append("fixtures/sample.html")
-        if (
-            "crawler.py" in lower
-            or "dry-run" in lower
-            or "preflight" in lower
-            or "events.jsonl" in lower
-            or "output format" in lower
-        ):
-            preferred.append("crawler.py")
-        if "schema" in lower:
-            preferred.append("schemas/output.schema.json")
-        preferred.extend(
-            [
-                "crawler.py",
-                "tests/test_parser.py",
-                "fixtures/sample.html",
-                "fixtures/sample.csv",
-                "schemas/output.schema.json",
-                "manifest.json",
-                "sources.json",
-            ]
-        )
         available = set(task_contract.must_modify_files)
+        for path in task_contract.must_modify_files:
+            name = path.rsplit("/", 1)[-1].lower()
+            if path.lower() in lower or name in lower:
+                preferred.append(path)
+        preferred.extend(path for path in task_contract.must_modify_files if not path.startswith(("tests/", "test_")))
+        preferred.extend(task_contract.must_modify_files)
         ordered = []
         for path in preferred:
             if path in available and path not in ordered:
                 ordered.append(path)
-        ordered.extend(path for path in task_contract.must_modify_files if path not in ordered)
         return ordered
     return []
 
@@ -1163,11 +1114,6 @@ def repair_action_contract(action: RepairAction, state: AgentState) -> dict[str,
     if category in CONTEXT_HEAVY_REPAIR_CATEGORIES and inspection_budget != 0:
         inspection_budget = max(inspection_budget, MIN_CONTEXT_REPAIR_INSPECTION_BUDGET)
     must_change_symbols = []
-    for symbol in ("number_from_text", "parse_trending", "parse_repositories", "parse_repos"):
-        if symbol in instruction:
-            must_change_symbols.append(symbol)
-    if payload.get("category") == "missing_required_field" and "crawler.py" in target_files:
-        must_change_symbols.extend(symbol for symbol in ("parse_trending", "number_from_text") if symbol not in must_change_symbols)
     payload.update(
         {
             "phase": "REPAIR_REQUIRED",
@@ -1384,7 +1330,7 @@ def refresh_targeted_repair_phase(state: AgentState) -> None:
     state.targeted_repair_phase = "edit_forced" if observed >= budget else "inspect_allowed"
 
 
-def _repaitargetedr_inspection_budget(state: AgentState) -> int:
+def targeted_repair_inspection_budget(state: AgentState) -> int:
     action = state.active_repair_action or {}
     try:
         raw_budget = action.get("initial_inspection_budget")
@@ -1690,29 +1636,6 @@ def next_targeted_repair_rerun_command(state: AgentState) -> str:
     return ""
 
 
-def crawler_missing_artifact_file_retarget_args(
-    state: AgentState,
-    workflow: Any,
-    tool_name: str,
-    args: dict[str, object],
-) -> dict[str, object] | None:
-    if workflow.phase != WorkflowPhase.TEST_REQUIRED:
-        return None
-    if not is_crawler_instruction(state.job.instruction):
-        return None
-    missing = missing_must_modify_targets(state)
-    if not missing:
-        return None
-    requested = normalize_workspace_relative_path(str(args.get("path") or ""))
-    if tool_name == "write_file" and requested in missing:
-        return None
-    target = missing[0]
-    content = None
-    if content is None:
-        return None
-    return {"path": target, "content": content}
-
-
 def targeted_repair_forced_tool(
     state: AgentState,
     tool_name: str,
@@ -1748,13 +1671,6 @@ def targeted_repair_forced_tool(
         return "run_command", {"command": command}, "active_repair_requires_exact_rerun"
     refresh_targeted_repair_phase(state)
     if state.targeted_repair_phase == "edit_forced" and tool_name not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
-        content = None
-        if content is not None:
-            return (
-                "write_file",
-                {"path": target, "content": content},
-                "active_repair_controller_forced_target_edit",
-            )
         return None
     read_count = targeted_repair_read_count(state)
     if read_count <= 0 and tool_name in {"run_command", "git_status", "git_diff", "search", "list_files"}:
@@ -1764,36 +1680,16 @@ def targeted_repair_forced_tool(
             "active_repair_requires_inspection_or_patch",
         )
     if read_count > 0 and tool_name in {"run_command", "read_file", "search", "list_files"}:
-        content = None
-        if content is not None:
-            return (
-                "write_file",
-                {"path": target, "content": content},
-                "active_repair_requires_target_patch",
-            )
+        return None
     return None
 
 
 def preferred_targeted_repair_target(state: AgentState, targets: list[str]) -> str:
-    action = state.active_repair_action or {}
-    category = str(action.get("category") or "")
-    signature = str(action.get("signature") or "").lower()
-    instruction = str(action.get("instruction") or "").lower()
-    combined = "\n".join([category.lower(), signature, instruction])
-    if category == "parsed_value_mismatch" and any(
-        token in combined
-        for token in (
-            "owner1",
-            "repo1",
-            "fixture inconsistent",
-            "test fixture",
-        )
-    ):
-        for candidate in ("fixtures/sample.html", "tests/test_parser.py"):
-            if candidate in targets:
-                return candidate
-    for candidate in ("crawler.py", "tests/test_parser.py", "fixtures/sample.html"):
-        if candidate in targets:
+    _ = state
+    for candidate in targets:
+        normalized = normalize_workspace_relative_path(candidate)
+        name = normalized.rsplit("/", 1)[-1]
+        if normalized and not normalized.startswith("tests/") and not name.startswith("test_"):
             return candidate
     return targets[0]
 

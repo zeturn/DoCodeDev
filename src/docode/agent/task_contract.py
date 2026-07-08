@@ -22,17 +22,8 @@ def task_contract_from_instruction(instruction: str) -> TaskContract:
         for match in FILE_REF_RE.finditer(instruction or "")
         if (path := normalize_contract_file(match.group(0))) and contract_file_allowed(path)
     )
-    if is_crawler_instruction(instruction):
-        files = unique_preserving_order(["crawler.py", *files])
     explicit_commands = verification_commands_from_instruction(instruction)
     commands = unique_preserving_order([*suggested_commands(files), *explicit_commands])
-    if is_crawler_instruction(instruction) and not explicit_commands:
-        crawler_defaults = [
-            "python3 -m unittest discover -s tests",
-            "python3 crawler.py --preflight",
-            "python3 crawler.py --dry-run",
-        ]
-        commands = unique_preserving_order([*commands, *crawler_defaults])
     forbidden = [
         "Do not call final_candidate until git_status shows at least one modified file.",
         "Do not finish with a clean git status; produce a non-empty git diff first.",
