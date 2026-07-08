@@ -146,6 +146,12 @@ class UnusableDecisionLLM:
         return AgentDecision(type="nonsense")
 
 
+class NoEditToolLoopLLM:
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, tools, context
+        return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo still-clean"})
+
+
 class UnauthorizedLLM:
     async def decide(self, *, system, messages, tools, context):
         _ = system, messages, tools, context
@@ -1922,12 +1928,12 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             tools = FakeTools()
 
             loop = CodingAgentLoop(
-                llm=UnusableDecisionLLM(),
+                llm=NoEditToolLoopLLM(),
                 tools=tools,
                 verifier=CodingVerifier(),
                 repository=repo,
                 exporter=ArtifactExporter(Path(tmp), repo),
-                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60, max_consecutive_failures=20),
+                stop_policy=StopPolicy(max_iterations=INITIAL_NO_DIFF_EXPLORATION_BUDGET + 4, max_runtime_seconds=60, max_consecutive_failures=20),
             )
 
             result = await loop.run(job)

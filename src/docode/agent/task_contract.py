@@ -7,6 +7,19 @@ import re
 
 FILE_REF_RE = re.compile(r"\b[\w./-]+\.(?:py|js|ts|go|rs|md|json|toml|yaml|yml|txt|csv|html)\b")
 NUMBERED_COMMAND_RE = re.compile(r"^\s*\d+[.)]\s+(.+)$")
+EDIT_TARGET_VERBS = {
+    "add",
+    "build",
+    "change",
+    "create",
+    "edit",
+    "fix",
+    "implement",
+    "modify",
+    "refactor",
+    "repair",
+    "update",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,18 +30,81 @@ class TaskContract:
 
 
 def task_contract_from_instruction(instruction: str) -> TaskContract:
-    files = unique_preserving_order(
+    all_files = unique_preserving_order(
         path
         for match in FILE_REF_RE.finditer(instruction or "")
         if (path := normalize_contract_file(match.group(0))) and contract_file_allowed(path)
     )
+    files = target_files_from_instruction(instruction, all_files)
     explicit_commands = verification_commands_from_instruction(instruction)
-    commands = unique_preserving_order([*suggested_commands(files), *explicit_commands])
+    commands = unique_preserving_order([*suggested_commands(all_files), *explicit_commands])
     forbidden = [
         "Do not call final_candidate until git_status shows at least one modified file.",
         "Do not finish with a clean git status; produce a non-empty git diff first.",
     ]
     return TaskContract(must_modify_files=files, must_run_commands=commands, forbidden_finish_conditions=forbidden)
+
+
+def target_files_from_instruction(instruction: str, fallback_files: list[str]) -> list[str]:
+    targets: list[str] = []
+    in_verification_block = False
+    for raw_line in (instruction or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        heading = lowered.lstrip("- ").rstrip(":")
+        if verification_heading(heading):
+            in_verification_block = True
+            continue
+        if in_verification_block:
+            command = normalize_command_line(line)
+            if command and command_like(command):
+                continue
+            if line and line.endswith(":"):
+                in_verification_block = verification_heading(line.lower().lstrip("- ").rstrip(":"))
+                continue
+            if line:
+                in_verification_block = False
+        matches = list(FILE_REF_RE.finditer(line))
+        if not matches:
+            continue
+        if explicit_target_hint(lowered):
+            targets.extend(
+                path
+                for match in matches
+                if (path := normalize_contract_file(match.group(0))) and contract_file_allowed(path)
+            )
+            continue
+        previous_target = False
+        previous_end = 0
+        for match in matches:
+            path = normalize_contract_file(match.group(0))
+            if not path or not contract_file_allowed(path):
+                previous_target = False
+                previous_end = match.end()
+                continue
+            between = line[previous_end : match.start()]
+            if edit_verb_immediately_before(between) or (previous_target and conjunction_only(between)):
+                targets.append(path)
+                previous_target = True
+            else:
+                previous_target = False
+            previous_end = match.end()
+    return unique_preserving_order(targets or fallback_files)
+
+
+def explicit_target_hint(line: str) -> bool:
+    return any(marker in line for marker in ("target file:", "target files:", "edit file:", "edit files:"))
+
+
+def edit_verb_immediately_before(text: str) -> bool:
+    words = re.findall(r"[a-zA-Z_]+", text.lower())
+    return bool(words and words[-1] in EDIT_TARGET_VERBS)
+
+
+def conjunction_only(text: str) -> bool:
+    return bool(re.fullmatch(r"\s*(?:,|and|or|\+)\s*", text, flags=re.IGNORECASE))
 
 
 def normalize_contract_file(value: str) -> str:

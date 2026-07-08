@@ -24,6 +24,28 @@ class ContextManagerTests(TestCase):
         self.assertEqual(contract.must_modify_files, ["module.py"])
         self.assertEqual(contract.must_run_commands, [])
 
+    def test_task_contract_only_requires_explicit_edit_target_for_fixture_parser(self) -> None:
+        contract = task_contract_from_instruction(
+            "Implement crawler.py so it parses fixtures/products.html and writes product records to JSON.\n\n"
+            "Verification commands:\n"
+            "1. python -m unittest discover -s tests\n"
+            "2. python crawler.py fixtures/products.html --output out.json"
+        )
+
+        self.assertEqual(contract.must_modify_files, ["crawler.py"])
+        self.assertEqual(
+            contract.must_run_commands,
+            [
+                "python -m unittest discover -s tests",
+                "python crawler.py fixtures/products.html --output out.json",
+            ],
+        )
+
+    def test_task_contract_keeps_multiple_explicit_edit_targets(self) -> None:
+        contract = task_contract_from_instruction("Update src/a.py and src/b.py to share the new parser behavior.")
+
+        self.assertEqual(contract.must_modify_files, ["src/a.py", "src/b.py"])
+
     def test_context_pack_preserves_task_and_summarizes_long_history(self) -> None:
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="Refactor the payment adapter without losing retries")
         inspection = ProjectInspection(

@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from docode.agent.task_contract import verification_commands_from_instruction
 from docode.agent.workflow import parse_status_line
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
@@ -499,6 +500,7 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
         )
     )
     is_crawler = any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
+    is_local_fixture_crawler = is_crawler and local_fixture_crawler_instruction(lowered)
     is_cli = any(keyword in lowered for keyword in ("cli", "command line", "命令行", "脚本")) or bool(re.search(r"\bscript\b", lowered))
     is_api = is_api_implementation_instruction(lowered)
     is_bugfix = is_bugfix_instruction(lowered)
@@ -523,7 +525,7 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
         require_test_change=is_bugfix and not is_docs and not is_external_source_repair,
         require_entrypoint_run=(is_crawler or is_cli) and not is_bugfix and not is_artifact_export,
         require_no_placeholder=not is_docs,
-        require_external_source_verified=(is_crawler or is_api or is_external_source_repair) and not is_artifact_export,
+        require_external_source_verified=(is_crawler or is_api or is_external_source_repair) and not is_local_fixture_crawler and not is_artifact_export,
         require_declared_python_dependencies=is_crawler,
         require_crawler_artifacts=is_crawler,
         artifact_export=is_artifact_export,
@@ -538,6 +540,12 @@ def is_bugfix_instruction(lowered_instruction: str) -> bool:
     if any(keyword in lowered_instruction for keyword in ("修复", "报错", "失败")):
         return True
     return bool(re.search(r"\b(?:bug|bugfix|fix|regression|hotfix|broken|failing|failure)\b", lowered_instruction))
+
+
+def local_fixture_crawler_instruction(lowered_instruction: str) -> bool:
+    if re.search(r"https?://", lowered_instruction):
+        return False
+    return "fixtures/" in lowered_instruction or "fixture/" in lowered_instruction or "fixture mode" in lowered_instruction
 
 
 def is_api_implementation_instruction(lowered_instruction: str) -> bool:
@@ -556,32 +564,7 @@ def is_api_implementation_instruction(lowered_instruction: str) -> bool:
 
 
 def extracted_verification_commands(instruction: str) -> list[str]:
-    commands: list[str] = []
-    in_verification_block = False
-    for raw_line in (instruction or "").splitlines():
-        line = raw_line.strip()
-        lowered = line.lower()
-        heading = lowered.lstrip("- ").rstrip(":")
-        if heading in {"verification commands", "suggested verification commands"}:
-            in_verification_block = True
-            continue
-        if in_verification_block:
-            if line.startswith("- "):
-                command = line[2:].strip(" `")
-                if command and command_like(command) and command not in commands:
-                    commands.append(command)
-                continue
-            if line and not line.endswith(":"):
-                in_verification_block = False
-        if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
-            continue
-        if lowered.startswith("semantic checks:") or lowered.startswith("- semantic checks:"):
-            continue
-        _, value = line.split(":", 1)
-        command = value.strip(" -`")
-        if command and command_like(command) and command not in commands:
-            commands.append(command)
-    return commands[:5]
+    return verification_commands_from_instruction(instruction)[:5]
 
 
 def extracted_file_contains_checks(instruction: str) -> dict[str, list[str]] | None:
@@ -712,7 +695,7 @@ def diff_file_contains(diff: str, path: str, term: str) -> bool:
 
 
 def diff_contains_placeholder(diff_lowered: str) -> bool:
-    return bool(re.search(r"\b(?:todo|placeholder|stub)\b|not implemented|pass\s+#|pass\n", diff_lowered))
+    return bool(re.search(r"\b(?:todo|placeholder|stub)\b|not implemented|pass\s+#", diff_lowered))
 
 
 def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvidence, diff: str = "") -> bool:
@@ -859,6 +842,8 @@ def duplicate_python_implementation_paths(diff: str) -> list[str]:
 
 def crawler_output_artifact_verified(combined_smoke_text: str) -> bool:
     if "json outputs:" in combined_smoke_text or "csv outputs:" in combined_smoke_text:
+        return True
+    if re.search(r"--output\s+\S+\.(?:json|csv)\b", combined_smoke_text):
         return True
     if "dry-run complete" in combined_smoke_text and re.search(r"\bwrote\b|\bwritten\b|\bsaved\b", combined_smoke_text):
         return True

@@ -14,7 +14,7 @@ from docode.agent.quality_gate import QualityGate, QualityGateResult
 from docode.agent.repair_planner import RepairAction, format_repair_action, plan_repair_from_tool_result
 from docode.agent.reviewer import CodeReviewer, ReviewResult
 from docode.agent.state import AgentState
-from docode.agent.stuck import REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
+from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.task_contract import TaskContract, is_crawler_instruction, task_contract_from_instruction
 from docode.agent.verifier import CodingVerifier, VerificationResult, changed_files_from_diff, verification_evidence_from_steps
@@ -33,7 +33,7 @@ from docode.llm.runtime import AgentDecision, DecisionLLM, LLMUsageMeter, Provid
 from docode.storage.models import CodingJob, JobStatus
 from docode.storage.repository import JobRepository
 
-INITIAL_NO_DIFF_EXPLORATION_BUDGET = 3
+INITIAL_NO_DIFF_EXPLORATION_BUDGET = NO_DIFF_EXPLORATION_BUDGET
 CONTEXT_HEAVY_REPAIR_CATEGORIES = {
     "missing_required_field",
     "parsed_value_mismatch",
@@ -134,7 +134,7 @@ class CodingAgentLoop:
                     await self.record_model_failure(state, "llm_auth_failed", str(exc))
                     return await self.fail(job.id, "llm_auth_failed")
                 current_workflow = workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else "")
-                if current_workflow.phase == WorkflowPhase.FINAL_READY and state.repair_mode is None:
+                if current_workflow.phase == WorkflowPhase.FINAL_READY:
                     finalized = await self.auto_finalize_ready_workflow(
                         state,
                         reason="final_ready_llm_decision_failed",
@@ -243,7 +243,7 @@ class CodingAgentLoop:
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
-                if current_workflow.phase == WorkflowPhase.FINAL_READY and state.repair_mode is None:
+                if current_workflow.phase == WorkflowPhase.FINAL_READY:
                     finalized = await self.auto_finalize_ready_workflow(
                         state,
                         reason="final_ready_tool_auto_finalized",
@@ -358,8 +358,6 @@ class CodingAgentLoop:
 
     async def maybe_auto_finalize_before_stop(self, state: AgentState, stop_reason: str) -> CodingJob | None:
         if stop_reason != "max_iterations_exceeded":
-            return None
-        if state.repair_mode is not None:
             return None
         status = await self.tools.git_status()
         state.latest_git_status = status

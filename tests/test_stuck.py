@@ -3,7 +3,7 @@ from __future__ import annotations
 from unittest import TestCase
 
 from docode.agent.state import AgentState
-from docode.agent.stuck import StuckDetector
+from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, StuckDetector
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob, new_id
 
@@ -11,6 +11,8 @@ from docode.storage.models import CodingJob, new_id
 class StuckDetectorTests(TestCase):
     def test_detects_clean_status_after_many_iterations_without_edit(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="fix calculator.py"), iteration=6)
+        for _ in range(NO_DIFF_EXPLORATION_BUDGET):
+            state.add_tool_result(ToolResult(tool="read_file", output="content", exit_code=0))
 
         signal = StuckDetector().evaluate(state=state, latest_git_status="")
 

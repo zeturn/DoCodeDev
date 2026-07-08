@@ -8,6 +8,7 @@ from docode.agent.state import AgentState
 
 EDIT_TOOLS = {"edit_file", "write_file", "apply_patch", "replace_in_file"}
 REPAIR_ALLOWED_TOOLS = {"read_file", "edit_file", "write_file", "apply_patch", "replace_in_file", "git_status", "git_diff"}
+NO_DIFF_EXPLORATION_BUDGET = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +20,7 @@ class StuckSignal:
 
 class StuckDetector:
     def evaluate(self, *, state: AgentState, latest_git_status: str) -> StuckSignal:
-        if state.iteration >= 4 and git_status_clean(latest_git_status) and not edit_tool_called(state):
+        if no_diff_exploration_count(state) >= NO_DIFF_EXPLORATION_BUDGET and git_status_clean(latest_git_status) and not edit_tool_called(state):
             return StuckSignal(
                 stuck=True,
                 reason="no_diff_after_multiple_iterations",
@@ -49,6 +50,14 @@ def git_status_clean(output: str | None) -> bool:
 
 def edit_tool_called(state: AgentState) -> bool:
     return any(message.get("role") == "tool" and message.get("tool") in EDIT_TOOLS for message in state.messages)
+
+
+def no_diff_exploration_count(state: AgentState) -> int:
+    return sum(
+        1
+        for message in state.messages
+        if message.get("role") == "tool" and message.get("tool") not in EDIT_TOOLS
+    )
 
 
 def strip_ansi(value: str) -> str:
