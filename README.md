@@ -69,11 +69,12 @@ docode eval run .docode/eval-results --report .docode/eval-report.json
 docode eval assert .docode/eval-report.json --min-success-rate 0.8 --max-avg-tool-calls 30 --max-cost 1.00
 ```
 
-Before attempting any GitHub Trends eval, run a minimal generic eval ladder:
+Generic smoke ladder:
 
-1. README edit: update `README.md` with one sentence; the agent must edit the file, produce a non-empty diff, and submit `final_candidate`.
-2. Calculator bugfix: a repo with `calculator.py` and `tests/test_calculator.py`; the instruction explicitly includes the verification command, and the agent must edit source, run that exact command, and submit `final_candidate`.
-3. Generic parser fixture: a repo with `parser.py`, `fixture.html`, and `tests/test_parser.py`; the task must avoid product-specific repository examples and validate reading the fixture/test/source, implementing the parser, and passing tests.
+1. README edit smoke: run `python -m unittest tests.test_smoke_readme_job`; the agent must edit `README.md`, produce a non-empty diff, record loop/tool/verifier steps, and export terminal artifacts.
+2. Calculator bugfix smoke: a repo with `calculator.py` and `tests/test_calculator.py`; the instruction explicitly includes the verification command, and the agent must edit source, run that exact command, and submit `final_candidate`.
+3. Generic parser fixture smoke: a repo with `parser.py`, `fixture.html`, and `tests/test_parser.py`; the task must avoid product-specific repository examples and validate reading the fixture/test/source, implementing the parser, and passing tests.
+4. External GitHub Trends eval: run only after the first three generic cases pass. GitHub Trends is not a production shortcut or embedded runtime capability.
 
 `smoke-check` verifies configured DoBox health, local DoBox backend path, Docker CLI/daemon access, APICred model access, local `gh` availability, database path, and artifact directory. `smoke-run` first runs those checks and then executes a `provider=scripted` end-to-end job when DoBox is reachable. Pass `--start-dobox` to temporarily run `go run ./cmd/server` from the configured local DoBox backend directory for the duration of the smoke check or smoke job.
 `eval scaffold` creates ten small git repositories covering Python bugfix, Python CLI, crawler, API adapter, README-only, JS bugfix, no-test project, bad web source repair, large command output, and GitHub PR artifact export scenarios. `eval jobs` runs manifest cases through DoCode jobs and writes per-case result JSON files. `eval run` aggregates those saved eval results into a report with success rate, iterations, tool calls, token/cost totals, failure reasons, and verification-plan failures. `eval run` and `eval assert` accept `--min-success-rate`, `--max-avg-tool-calls`, and `--max-cost`; when a threshold fails, the report includes `regression`, `thresholds`, and `threshold_failures`, and the command exits non-zero.
