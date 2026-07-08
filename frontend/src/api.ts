@@ -91,13 +91,14 @@ function authHeaders(token: string): HeadersInit {
 }
 
 async function apiRequest<T>(path: string, options: RequestInit & { token?: string } = {}): Promise<T> {
+  const { token = '', headers: optionHeaders, ...requestInit } = options;
   const headers: HeadersInit = {
     Accept: 'application/json',
-    ...authHeaders(options.token ?? ''),
-    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-    ...(options.headers ?? {})
+    ...authHeaders(token),
+    ...(requestInit.body ? { 'Content-Type': 'application/json' } : {}),
+    ...(optionHeaders ?? {})
   };
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const response = await fetch(`${API_BASE}${path}`, { ...requestInit, headers });
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
@@ -217,8 +218,8 @@ function parseSseBlock(block: string): StreamEvent | null {
   }
 }
 
-function removeEmptyValues<T extends Record<string, unknown>>(value: T): Partial<T> {
+function removeEmptyValues(value: object): Record<string, unknown> {
   return Object.fromEntries(
     Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== '')
-  ) as Partial<T>;
+  );
 }
