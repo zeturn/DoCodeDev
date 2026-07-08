@@ -6,8 +6,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/v1': 'http://localhost:8110',
-      '/health': 'http://localhost:8110'
+      '/v1': 'http://127.0.0.1:8111',
+      '/health': 'http://127.0.0.1:8111'
     }
   }
 });

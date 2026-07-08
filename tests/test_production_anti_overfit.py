@@ -14,6 +14,16 @@ FORBIDDEN_PRODUCTION_STRINGS = (
     "owner/repo",
     "Box-row",
     "stars today",
+    "lamp-001",
+    "mug-002",
+    "Desk Lamp",
+    "Travel Mug",
+    "product-card",
+    "data-sku",
+    "generic_crawler_cli",
+    "EXPECTED_PRODUCTS",
+    "fixtures/products.html",
+    "out.json",
 )
 
 

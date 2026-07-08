@@ -501,8 +501,10 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
     )
     is_crawler = any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
     is_local_fixture_crawler = is_crawler and local_fixture_crawler_instruction(lowered)
+    is_public_url_crawler = is_crawler and bool(re.search(r"https?://", lowered))
     is_cli = any(keyword in lowered for keyword in ("cli", "command line", "命令行", "脚本")) or bool(re.search(r"\bscript\b", lowered))
     is_api = is_api_implementation_instruction(lowered)
+    is_external_api = is_api and api_requires_external_source_evidence(lowered)
     is_bugfix = is_bugfix_instruction(lowered)
     is_docs = any(keyword in lowered for keyword in ("readme", "docs", "documentation", "文档"))
     is_artifact_export = "artifact" in lowered and ("pr" in lowered or "pull request" in lowered or "export" in lowered)
@@ -525,7 +527,7 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
         require_test_change=is_bugfix and not is_docs and not is_external_source_repair,
         require_entrypoint_run=(is_crawler or is_cli) and not is_bugfix and not is_artifact_export,
         require_no_placeholder=not is_docs,
-        require_external_source_verified=(is_crawler or is_api or is_external_source_repair) and not is_local_fixture_crawler and not is_artifact_export,
+        require_external_source_verified=(is_external_api or is_external_source_repair or is_public_url_crawler) and not is_local_fixture_crawler and not is_artifact_export,
         require_declared_python_dependencies=is_crawler,
         require_crawler_artifacts=is_crawler,
         artifact_export=is_artifact_export,
@@ -561,6 +563,12 @@ def is_api_implementation_instruction(lowered_instruction: str) -> bool:
             lowered_instruction,
         )
     )
+
+
+def api_requires_external_source_evidence(lowered_instruction: str) -> bool:
+    if re.search(r"https?://", lowered_instruction):
+        return True
+    return any(marker in lowered_instruction for marker in ("external endpoint", "external api", "public api", "api endpoint", "endpoint"))
 
 
 def extracted_verification_commands(instruction: str) -> list[str]:
@@ -699,6 +707,7 @@ def diff_contains_placeholder(diff_lowered: str) -> bool:
 
 
 def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvidence, diff: str = "") -> bool:
+    _ = smoke_result
     if evidence.has_external_source_evidence:
         return True
     diff_lowered = diff.lower()
@@ -708,8 +717,6 @@ def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvi
     if evidence.successful_fetch_urls and "api.example.invalid" in diff_lowered:
         return True
     if "api.example.invalid" in diff_lowered and re.search(r"\+\s*source_url\s*=\s*['\"]https?://", diff_lowered):
-        return True
-    if smoke_result.exit_code == 0 and smoke_result.metadata and smoke_result.metadata.get("detected"):
         return True
     return False
 
@@ -812,13 +819,18 @@ def crawler_artifact_fixes(diff: str, smoke_result: ToolResult, evidence: Verifi
     if evidence is not None:
         command_text = f"{command_text}\n" + "\n".join(evidence.successful_commands or [])
         output_text = f"{output_text}\n" + "\n".join(evidence.successful_command_outputs or [])
-    combined = f"{command_text}\n{output_text}".lower()
-    if "--dry-run" in diff.lower() and "dry-run" not in combined:
+    command_text = command_text.lower()
+    output_text = smoke_command_output_text(output_text).lower()
+    if "--dry-run" in diff.lower() and "dry-run" not in command_text:
         fixes.append("run the crawler dry-run command before final verification")
     diff_lowered = diff.lower()
-    if not crawler_output_artifact_verified(combined) and not crawler_fixture_artifact_present(diff_lowered):
+    if not crawler_output_artifact_verified(output_text) and not crawler_fixture_artifact_present(diff_lowered):
         fixes.append("crawler dry-run must write an output artifact and verification must prove the JSON/CSV file exists and parses")
     return fixes
+
+
+def smoke_command_output_text(text: str) -> str:
+    return "\n".join(line for line in (text or "").splitlines() if not line.startswith("$ "))
 
 
 def duplicate_python_implementation_paths(diff: str) -> list[str]:
@@ -842,8 +854,6 @@ def duplicate_python_implementation_paths(diff: str) -> list[str]:
 
 def crawler_output_artifact_verified(combined_smoke_text: str) -> bool:
     if "json outputs:" in combined_smoke_text or "csv outputs:" in combined_smoke_text:
-        return True
-    if re.search(r"--output\s+\S+\.(?:json|csv)\b", combined_smoke_text):
         return True
     if "dry-run complete" in combined_smoke_text and re.search(r"\bwrote\b|\bwritten\b|\bsaved\b", combined_smoke_text):
         return True
@@ -1057,7 +1067,7 @@ def requires_json_output_check(instruction: str) -> bool:
         "写入 json",
         "保存 json",
     )
-    return any(marker in lowered for marker in output_markers)
+    return any(marker in lowered for marker in output_markers) or bool(re.search(r"\bwrites?\b.{0,80}\bto\s+json\b", lowered))
 
 
 def minimum_required_records(instruction: str) -> int:

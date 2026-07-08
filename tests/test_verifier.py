@@ -12,6 +12,7 @@ from docode.agent.verifier import (
     CodingVerifier,
     VerificationEvidence,
     build_verification_plan,
+    crawler_output_artifact_verified,
     diff_contains_placeholder,
     json_output_check_script,
     requires_json_output_check,
@@ -123,6 +124,10 @@ class NoDetectedPythonVerifierTools(PassingVerifierTools):
     async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
         self.commands.append(command)
         _ = cwd
+        if "*.csv" in command:
+            return ToolResult(tool="run_command", output="CSV outputs: output.csv", exit_code=self.smoke_exit_code, metadata={"command": command})
+        if "JSON outputs:" in command:
+            return ToolResult(tool="run_command", output="JSON outputs: data/output.json\nmin_records=5", exit_code=self.smoke_exit_code, metadata={"command": command})
         return ToolResult(tool="run_command", output="smoke output", exit_code=self.smoke_exit_code, metadata={"command": command})
 
 
@@ -575,9 +580,73 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("dry-run must write an output artifact" in fix for fix in result.required_fixes))
 
+    async def test_local_fixture_crawler_does_not_require_external_source_evidence(self) -> None:
+        diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('JSON outputs: out.json')\n"
+
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=(
+                    "Implement crawler.py so it parses fixtures/products.html and writes product records to JSON.\n\n"
+                    "Verification commands:\n"
+                    "1. python -m unittest discover -s tests\n"
+                    "2. python crawler.py fixtures/products.html --output out.json"
+                ),
+            ),
+            CrawlerPolicyVerifierTools(diff, smoke_output="JSON outputs: out.json\nmin_records=2"),
+        )
+
+        self.assertTrue(result.passed)
+        self.assertFalse(result.verification_plan.require_external_source_verified)
+        self.assertNotIn(
+            "verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run",
+            result.required_fixes,
+        )
+
+    async def test_crawler_with_public_url_requires_external_source_evidence(self) -> None:
+        diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('JSON outputs: out.json')\n"
+
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="Build a crawler for https://example.test/products that writes product records to JSON.",
+            ),
+            CrawlerPolicyVerifierTools(diff, smoke_output="JSON outputs: out.json\nmin_records=2"),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(result.verification_plan.require_external_source_verified)
+        self.assertIn(
+            "verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run",
+            result.required_fixes,
+        )
+
+    async def test_crawler_output_flag_alone_does_not_verify_artifact(self) -> None:
+        diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('done')\n"
+
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=(
+                    "Implement crawler.py so it parses fixtures/products.html and writes product records to JSON.\n\n"
+                    "Verification commands:\n"
+                    "1. python crawler.py fixtures/products.html --output out.json"
+                ),
+            ),
+            CrawlerPolicyVerifierTools(diff, smoke_output="done"),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertFalse(crawler_output_artifact_verified("python crawler.py fixtures/products.html --output out.json"))
+        self.assertTrue(any("dry-run must write an output artifact" in fix for fix in result.required_fixes))
+
     def test_json_api_response_does_not_require_output_file(self) -> None:
         self.assertFalse(requires_json_output_check("Implement client.parse_items_response so it extracts item names from a JSON API response."))
         self.assertTrue(requires_json_output_check("Build a crawler that writes data/output.json with at least 2 records."))
+        self.assertTrue(requires_json_output_check("Build a crawler that writes product records to JSON."))
 
     def test_apicred_literal_text_does_not_require_external_source_verification(self) -> None:
         plan = build_verification_plan("Create DOCODE_DEEPSEEK_RESULT.md containing exactly: DeepSeek via APICred works.")
