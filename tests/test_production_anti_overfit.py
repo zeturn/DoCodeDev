@@ -24,6 +24,11 @@ FORBIDDEN_PRODUCTION_STRINGS = (
     "EXPECTED_PRODUCTS",
     "fixtures/products.html",
     "out.json",
+    "item-101",
+    "item-202",
+    "Trail Bottle",
+    "Canvas Tote",
+    "external_crawler_cli",
 )
 
 
