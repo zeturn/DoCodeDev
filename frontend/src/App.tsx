@@ -1,4 +1,4 @@
-import { type Dispatch, type FormEvent, type SetStateAction, useCallback, useEffect, useMemo, useState } from 'react';
+import { type Dispatch, type FormEvent, type ReactNode, type SetStateAction, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Job,
   JobStatus,
@@ -14,6 +14,8 @@ import {
 
 const STORAGE_TOKEN_KEY = 'docode.authToken';
 const TERMINAL_STATUSES: JobStatus[] = ['succeeded', 'failed', 'stopped'];
+const INLINE_VALUE_MAX_LENGTH = 180;
+const OUTPUT_PREVIEW_MAX_LENGTH = 2400;
 
 interface JobFormState {
   instruction: string;
@@ -472,23 +474,234 @@ function dedupeSteps(items: StepEventPayload[]): StepEventPayload[] {
 }
 
 function renderStepBody(step: StepEventPayload) {
+  const outputPreview = firstTextValue(step, ['output', 'stdout', 'stderr', 'logs', 'git_diff', 'git_status']);
+  const metadata = isRecord(step.metadata) ? step.metadata : undefined;
+
   if (step.type === 'tool_call') {
-    return <pre>{JSON.stringify(step.args ?? {}, null, 2)}</pre>;
-  }
-  if (step.type === 'tool_result') {
     return (
-      <div className="step-grid">
-        <span>tool</span><code>{step.tool}</code>
-        <span>exit</span><code>{step.exit_code ?? 'n/a'}</code>
-        <span>summary</span><p>{String(step.summary ?? '') || 'No summary available.'}</p>
-        {step.truncated !== undefined && <><span>truncated</span><code>{String(step.truncated)}</code></>}
-      </div>
+      <StepCard raw={step}>
+        <p className="step-summary">{toolCallSummary(step)}</p>
+        {renderKeyValueCard('Call details', compactEntries([
+          ['tool', step.tool],
+          ['command', commandFromArgs(step.args)],
+          ['path', valueFromRecord(step.args, ['path', 'file', 'filename'])],
+          ['cwd', valueFromRecord(step.args, ['cwd', 'workdir', 'working_directory'])],
+          ['timeout', valueFromRecord(step.args, ['timeout', 'timeout_seconds'])]
+        ]))}
+        {renderRecordCard('Arguments', step.args, ['command', 'cmd', 'args', 'path', 'file', 'filename', 'cwd', 'workdir', 'working_directory', 'timeout', 'timeout_seconds'])}
+      </StepCard>
     );
   }
-  if (step.reason || step.detail) {
-    return <p>{[step.reason, step.detail].filter(Boolean).join(': ')}</p>;
+
+  if (step.type === 'tool_result') {
+    const exitCode = typeof step.exit_code === 'number' ? step.exit_code : undefined;
+    return (
+      <StepCard raw={step}>
+        <p className={`step-summary ${exitCode && exitCode !== 0 ? 'failed' : ''}`}>{toolResultSummary(step)}</p>
+        {renderKeyValueCard('Result details', compactEntries([
+          ['tool', step.tool],
+          ['exit', step.exit_code ?? 'n/a'],
+          ['truncated', step.truncated],
+          ['status', valueFromRecord(metadata, ['status', 'state'])],
+          ['artifact', valueFromRecord(metadata, ['artifact_id', 'artifact'])]
+        ]))}
+        {outputPreview && renderOutputPreview(outputPreview)}
+        {renderRecordCard('Metadata', metadata)}
+      </StepCard>
+    );
   }
-  return <pre>{JSON.stringify(redactLargeValues(step), null, 2)}</pre>;
+
+  return (
+    <StepCard raw={step}>
+      <p className="step-summary">{genericStepSummary(step)}</p>
+      {renderKeyValueCard('Highlights', compactEntries([
+        ['type', step.type ?? step.kind],
+        ['decision', step.decision_type],
+        ['reason', step.reason],
+        ['detail', step.detail],
+        ['summary', step.summary]
+      ]))}
+      {outputPreview && renderOutputPreview(outputPreview)}
+      {renderRecordCard('Metadata', metadata)}
+    </StepCard>
+  );
+}
+
+function StepCard({ children, raw }: { children: ReactNode; raw: StepEventPayload }) {
+  return (
+    <div className="step-body">
+      {children}
+      <details className="raw-json">
+        <summary>View raw JSON</summary>
+        <pre>{stringifyJson(raw)}</pre>
+      </details>
+    </div>
+  );
+}
+
+function renderKeyValueCard(title: string, entries: Array<[string, unknown]>) {
+  if (entries.length === 0) {
+    return null;
+  }
+  return (
+    <section className="info-card">
+      <h4>{title}</h4>
+      <div className="step-grid">
+        {entries.map(([label, value]) => (
+          <div className="step-grid-row" key={label}>
+            <span>{humanizeKey(label)}</span>
+            {renderInlineValue(value)}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function renderRecordCard(title: string, record?: Record<string, unknown>, omittedKeys: string[] = []) {
+  if (!record) {
+    return null;
+  }
+  const omitted = new Set(omittedKeys);
+  const entries = Object.entries(record).filter(([, value]) => value !== undefined && value !== null && value !== '' && !omitted.has(String(value)));
+  const visibleEntries = Object.entries(record).filter(([key, value]) => !omitted.has(key) && value !== undefined && value !== null && value !== '');
+  if (visibleEntries.length === 0 && entries.length === 0) {
+    return null;
+  }
+  return renderKeyValueCard(title, visibleEntries.slice(0, 8));
+}
+
+function renderOutputPreview(output: string) {
+  const clipped = truncateMiddle(output, OUTPUT_PREVIEW_MAX_LENGTH);
+  return (
+    <section className="info-card output-card">
+      <h4>Output preview</h4>
+      <pre>{clipped}</pre>
+    </section>
+  );
+}
+
+function renderInlineValue(value: unknown) {
+  if (typeof value === 'boolean') {
+    return <code>{value ? 'yes' : 'no'}</code>;
+  }
+  if (typeof value === 'number') {
+    return <code>{value}</code>;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > INLINE_VALUE_MAX_LENGTH ? <p>{truncateMiddle(trimmed, INLINE_VALUE_MAX_LENGTH)}</p> : <code>{trimmed || 'n/a'}</code>;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return <code>[]</code>;
+    }
+    if (value.every((item) => typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean')) {
+      return <p>{value.map(String).join(' ')}</p>;
+    }
+    return <pre>{truncateMiddle(stringifyJson(value), OUTPUT_PREVIEW_MAX_LENGTH)}</pre>;
+  }
+  if (isRecord(value)) {
+    return <pre>{truncateMiddle(stringifyJson(value), OUTPUT_PREVIEW_MAX_LENGTH)}</pre>;
+  }
+  return <code>n/a</code>;
+}
+
+function toolCallSummary(step: StepEventPayload): string {
+  const command = commandFromArgs(step.args);
+  if (command) {
+    return `Running ${step.tool ?? 'tool'}: ${command}`;
+  }
+  const target = valueFromRecord(step.args, ['path', 'file', 'filename', 'query']);
+  if (typeof target === 'string' && target.trim()) {
+    return `Calling ${step.tool ?? 'tool'} for ${target}`;
+  }
+  return `Calling ${step.tool ?? 'tool'} with structured arguments.`;
+}
+
+function toolResultSummary(step: StepEventPayload): string {
+  if (step.summary?.trim()) {
+    return step.summary.trim();
+  }
+  if (typeof step.exit_code === 'number') {
+    return step.exit_code === 0 ? `${step.tool ?? 'Tool'} completed successfully.` : `${step.tool ?? 'Tool'} exited with code ${step.exit_code}.`;
+  }
+  return `${step.tool ?? 'Tool'} returned a result.`;
+}
+
+function genericStepSummary(step: StepEventPayload): string {
+  if (step.summary?.trim()) {
+    return step.summary.trim();
+  }
+  if (step.reason || step.detail) {
+    return [step.reason, step.detail].filter(Boolean).join(': ');
+  }
+  if (step.decision_type) {
+    return `Decision: ${step.decision_type}`;
+  }
+  return `Recorded ${step.type ? step.type.split('_').join(' ') : step.kind}.`;
+}
+
+function commandFromArgs(args?: Record<string, unknown>): string | undefined {
+  if (!args) {
+    return undefined;
+  }
+  const command = valueFromRecord(args, ['command', 'cmd']);
+  if (typeof command === 'string') {
+    return command;
+  }
+  const commandArgs = args.args;
+  if (Array.isArray(commandArgs) && commandArgs.every((item) => typeof item === 'string')) {
+    return commandArgs.join(' ');
+  }
+  return undefined;
+}
+
+function valueFromRecord(record: Record<string, unknown> | undefined, keys: string[]): unknown {
+  if (!record) {
+    return undefined;
+  }
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== undefined && value !== null && value !== '') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function firstTextValue(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function compactEntries(entries: Array<[string, unknown]>): Array<[string, unknown]> {
+  return entries.filter(([, value]) => value !== undefined && value !== null && value !== '');
+}
+
+function humanizeKey(key: string): string {
+  return key.split('_').join(' ');
+}
+
+function truncateMiddle(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  const edge = Math.floor((maxLength - 15) / 2);
+  return `${value.slice(0, edge)}\n... clipped ...\n${value.slice(-edge)}`;
+}
+
+function stringifyJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 function stepTitle(step: StepEventPayload): string {
@@ -539,16 +752,4 @@ function isTerminalStatus(status: JobStatus): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function redactLargeValues(value: Record<string, unknown>): Record<string, unknown> {
-  const copy: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (key === 'output' || key === 'git_diff' || key === 'git_status') {
-      copy[key] = '[redacted]';
-    } else {
-      copy[key] = item;
-    }
-  }
-  return copy;
 }
