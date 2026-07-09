@@ -9,23 +9,32 @@ from docode.agent.repair_planner import (
     TARGETED_REPAIR_FORBIDDEN_TOOLS,
     inferred_source_targets,
 )
-from docode.agent.workflow import commands_equivalent
+from docode.agent.workflow import WorkflowPhase, commands_equivalent, workflow_snapshot
 from docode.dobox.types import ToolResult
+
+UNSAFE_TARGETED_REPAIR_TOOLS = {"web_search", "fetch_url", "preview", "logs"}
+FINAL_READY_REPAIR_CATEGORIES_REQUIRING_EXPLICIT_SATISFACTION = {"quality_gate_repair", "review_repair"}
 
 
 def apply_loop_runtime_fixes(loop_module: Any) -> None:
-    """Install small loop fixes that keep targeted repair advisory, not coercive.
+    """Install narrowly scoped loop fixes for the current branch.
 
-    The connector used for remote edits only supports whole-file replacement.
-    Keeping this small patch module separate avoids risky full rewrites of the
-    large loop module while still fixing the runtime paths exercised by real
-    LLM diagnostics.
+    The long-term goal is still to keep this behavior in production modules, but
+    this compatibility hook is already imported by ``docode.agent.__init__`` on
+    this branch. Keep it small and idempotent.
     """
 
     if getattr(loop_module, "_runtime_fixes_applied", False):
         return
     setattr(loop_module, "_runtime_fixes_applied", True)
 
+    _patch_required_command_fallback(loop_module)
+    _patch_targeted_repair_action_block(loop_module)
+    _patch_maybe_auto_finalize_before_stop(loop_module)
+    _patch_dobox_git_helpers(loop_module)
+
+
+def _patch_required_command_fallback(loop_module: Any) -> None:
     original_plan = loop_module.CodingAgentLoop.plan_targeted_repair_from_failure
 
     async def patched_plan_targeted_repair_from_failure(self, state, result: ToolResult) -> None:
@@ -40,12 +49,56 @@ def apply_loop_runtime_fixes(loop_module: Any) -> None:
 
     loop_module.CodingAgentLoop.plan_targeted_repair_from_failure = patched_plan_targeted_repair_from_failure
 
-    def advisory_targeted_repair_action_block(state, tool_name: str, args: dict[str, object]) -> str:
-        _ = state, tool_name, args
-        return ""
 
-    loop_module.targeted_repair_action_block = advisory_targeted_repair_action_block
-    _patch_dobox_git_helpers(loop_module)
+def _patch_targeted_repair_action_block(loop_module: Any) -> None:
+    original_block = loop_module.targeted_repair_action_block
+
+    def patched_targeted_repair_action_block(state, tool_name: str, args: dict[str, object]) -> str:
+        if getattr(state, "repair_mode", None) == "targeted_repair" and getattr(state, "active_repair_action", None):
+            action = state.active_repair_action or {}
+            forbidden = {str(tool) for tool in action.get("forbidden_tools") or [] if str(tool)}
+            if tool_name in UNSAFE_TARGETED_REPAIR_TOOLS and tool_name in forbidden:
+                return (
+                    f"{tool_name} is blocked by the active targeted repair action. "
+                    "Use local read/edit/run_command/git tools for this repair instead."
+                )
+        return original_block(state, tool_name, args)
+
+    loop_module.targeted_repair_action_block = patched_targeted_repair_action_block
+
+
+def _patch_maybe_auto_finalize_before_stop(loop_module: Any) -> None:
+    async def patched_maybe_auto_finalize_before_stop(self, state, stop_reason: str):
+        if stop_reason != "max_iterations_exceeded":
+            return None
+        status = await self.tools.git_status()
+        state.latest_git_status = status
+        current_workflow = workflow_snapshot(state, status.output)
+        if current_workflow.phase != WorkflowPhase.FINAL_READY:
+            return None
+
+        if state.active_repair_action:
+            active_category = str((state.active_repair_action or {}).get("category") or "")
+            if active_category in FINAL_READY_REPAIR_CATEGORIES_REQUIRING_EXPLICIT_SATISFACTION:
+                if not loop_module.targeted_repair_rerun_satisfied(state):
+                    return None
+            else:
+                state.active_repair_action = None
+                state.active_repair_started_at = 0
+                state.targeted_repair_phase = None
+                state.targeted_repair_inspections = 0
+                state.targeted_repair_edits = 0
+                if state.repair_mode == "targeted_repair":
+                    state.repair_mode = None
+
+        return await self.auto_finalize_ready_workflow(
+            state,
+            reason="final_ready_stop_policy_auto_finalized",
+            detail="max_iterations_exceeded reached after the workspace became FINAL_READY; submitting final_candidate from workflow evidence.",
+            workflow_state=current_workflow.to_dict(),
+        )
+
+    loop_module.CodingAgentLoop.maybe_auto_finalize_before_stop = patched_maybe_auto_finalize_before_stop
 
 
 def _patch_dobox_git_helpers(loop_module: Any) -> None:
