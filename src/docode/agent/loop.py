@@ -237,24 +237,40 @@ class CodingAgentLoop:
                     continue
                 duplicate_read_block = duplicate_read_file_block(state, current_workflow, tool_name, tool_args)
                 if duplicate_read_block:
-                    state.repair_mode = "must_edit"
-                    await self.record_rejected_decision(
-                        state,
-                        reason="duplicate_inspection_after_edit_pressure",
-                        detail=duplicate_read_block,
-                        workflow_state=current_workflow.to_dict(),
-                    )
-                    continue
-                duplicate_pressure_block = duplicate_inspection_pressure_tool_block(state, current_workflow, tool_name)
-                if duplicate_pressure_block:
-                    state.repair_mode = "must_edit"
-                    await self.record_rejected_decision(
-                        state,
-                        reason="duplicate_inspection_after_edit_pressure",
-                        detail=duplicate_pressure_block,
-                        workflow_state=current_workflow.to_dict(),
-                    )
-                    continue
+                    retarget_command = duplicate_inspection_required_command_retarget(state, current_workflow)
+                    if retarget_command:
+                        await self.repository.add_step(
+                            job.id,
+                            "system",
+                            {
+                                "type": "decision_retargeted",
+                                "reason": "inspection_loop_requires_test_evidence",
+                                "from_tool": tool_name,
+                                "to_tool": "run_command",
+                                "command": retarget_command,
+                                "workflow_state": current_workflow.to_dict(),
+                            },
+                        )
+                        tool_name = "run_command"
+                        tool_args = {"command": retarget_command, "cwd": "/workspace"}
+                    else:
+                        result = cached_duplicate_read_result(state, tool_args, duplicate_read_block)
+                        state.add_tool_result(result)
+                        await self.repository.add_step(
+                            job.id,
+                            "tool",
+                            {
+                                "type": "tool_result",
+                                "tool": result.tool,
+                                "exit_code": result.exit_code,
+                                "summary": summarize_output(result.output),
+                                "output": result.output,
+                                "truncated": result.truncated,
+                                "metadata": result.metadata or {},
+                            },
+                        )
+                        state.iteration += 1
+                        continue
                 test_command_block = required_test_tool_block(state, current_workflow, tool_name, tool_args)
                 if test_command_block:
                     if "required target files are still missing" in test_command_block:
@@ -1637,6 +1653,8 @@ def latest_successful_read_index(state: AgentState, path: str) -> int | None:
         if message.get("role") != "tool" or message.get("tool") != "read_file" or int(message.get("exit_code") or 0) != 0:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if metadata.get("cached_duplicate") is True:
+            continue
         seen = normalize_workspace_relative_path(str(metadata.get("path") or ""))
         if seen == normalized:
             return index
@@ -1805,18 +1823,74 @@ def duplicate_read_file_block(state: AgentState, workflow: Any, tool_name: str, 
 
 
 def duplicate_inspection_pressure_tool_block(state: AgentState, workflow: Any, tool_name: str) -> str:
-    if not duplicate_inspection_edit_forced(state, workflow):
+    _ = state, workflow, tool_name
+    return ""
+
+
+def duplicate_inspection_required_command_retarget(state: AgentState, workflow: Any) -> str:
+    if getattr(workflow, "diff_exists", False):
         return ""
-    allowed = EDIT_TOOLS | {"git_status", "git_diff"}
-    if tool_name in allowed:
+    if successful_edit_tool_called(state) or edit_tool_attempted(state):
         return ""
+    contract = state.task_contract
+    commands = list(contract.must_run_commands if contract is not None else [])
+    if not commands:
+        return ""
+    if any(required_command_attempted(state, command) for command in commands):
+        return ""
+    return str(commands[0])
+
+
+def required_command_attempted(state: AgentState, command: str) -> bool:
+    for message in state.messages:
+        if message.get("role") != "tool" or message.get("tool") != "run_command":
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        observed = " ".join(str(metadata.get("command") or "").split())
+        if observed and commands_equivalent(observed, command):
+            return True
+    return False
+
+
+def cached_duplicate_read_result(state: AgentState, args: dict[str, object], detail: str) -> ToolResult:
+    path = normalize_workspace_relative_path(str(args.get("path") or ""))
+    original_index = latest_successful_read_index(state, path) if path else None
+    excerpt = cached_read_excerpt(state, original_index)
     targets = target_candidates_for_edit_pressure(state)
-    target_text = f" Candidate target files: {', '.join(targets[:5])}." if targets else ""
-    return (
-        f"{tool_name} is blocked after repeated duplicate inspection pressure.\n"
-        "The git diff is still empty. Stop inspecting and edit a likely source file now using edit_file/write_file/apply_patch."
+    target_text = f"\nCandidate target files: {', '.join(targets[:5])}." if targets else ""
+    output = (
+        f"You already read {path}, and the file has not changed.\n"
+        "Git diff is still empty.\n"
+        "Do not reread this file again. Edit the most likely target file now using write_file/edit_file/apply_patch."
         f"{target_text}"
     )
+    if excerpt:
+        output += f"\n\nCached excerpt from the previous read:\n{excerpt}"
+    elif detail:
+        output += f"\n\n{detail}"
+    return ToolResult(
+        tool="read_file",
+        output=output,
+        exit_code=0,
+        metadata={
+            "path": path,
+            "cached_duplicate": True,
+            "original_read_index": original_index,
+        },
+    )
+
+
+def cached_read_excerpt(state: AgentState, index: int | None, *, max_lines: int = 80, max_chars: int = 4000) -> str:
+    if index is None or index < 0 or index >= len(state.messages):
+        return ""
+    output = str(state.messages[index].get("output") or "")
+    if not output:
+        return ""
+    lines = output.splitlines()
+    excerpt = "\n".join(lines[:max_lines])
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip() + "\n...[truncated]"
+    return excerpt
 
 
 def duplicate_inspection_edit_forced(state: AgentState, workflow: Any) -> bool:

@@ -12,9 +12,12 @@ from docode.agent.loop import (
     allowed_tools_for_repair_mode_name,
     allowed_tool_definitions_for_state,
     compact_llm_message,
+    cached_duplicate_read_result,
+    duplicate_inspection_required_command_retarget,
     duplicate_inspection_pressure_tool_block,
     duplicate_read_file_block,
     edit_required_tool_block,
+    latest_successful_read_index,
     latest_failed_required_command,
     preferred_targeted_repair_target,
     refine_repair_action_targets,
@@ -277,6 +280,15 @@ class RequiredTestGateLLM:
             )
             return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "echo checked"})
         return AgentDecision(type="final_candidate", summary="Updated README after running required verification.")
+
+
+class RepeatedReadLLM:
+    def __init__(self, path: str = "README.md") -> None:
+        self.path = path
+
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, tools, context
+        return AgentDecision(type="tool_call", tool_name="read_file", args={"path": self.path})
 
 
 class FinalReadyToolLoopLLM:
@@ -1385,7 +1397,78 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(allowed, {"read_file", "edit_file", "write_file", "git_status"})
-        self.assertIn("repeated duplicate inspection pressure", block)
+        self.assertEqual(block, "")
+
+    async def test_duplicate_read_with_required_command_retargets_to_run_command(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="u1",
+                    instruction="Fix README.md.\nVerification commands:\n1. echo checked",
+                    max_iterations=6,
+                )
+            )
+            loop = CodingAgentLoop(
+                llm=RepeatedReadLLM(),
+                tools=FakeTools(),
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=6, max_runtime_seconds=60),
+            )
+
+            await loop.run(job)
+
+        steps = await repo.list_steps(job.id)
+        retargeted = [step for step in steps if step.content.get("type") == "decision_retargeted"]
+        self.assertTrue(retargeted)
+        self.assertEqual(retargeted[0].content["reason"], "inspection_loop_requires_test_evidence")
+        self.assertEqual(retargeted[0].content["from_tool"], "read_file")
+        self.assertEqual(retargeted[0].content["to_tool"], "run_command")
+        self.assertEqual(retargeted[0].content["command"], "echo checked")
+        run_results = [
+            step
+            for step in steps
+            if step.content.get("type") == "tool_result"
+            and step.content.get("tool") == "run_command"
+            and (step.content.get("metadata") or {}).get("command") == "echo checked"
+        ]
+        self.assertTrue(run_results)
+        rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
+        self.assertFalse(any(step.content.get("reason") == "duplicate_inspection_after_edit_pressure" for step in rejected))
+
+    def test_duplicate_read_without_required_command_returns_cached_result_without_failure(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.task_contract = TaskContract(must_modify_files=["app.py"])
+        state.messages.extend(
+            [
+                {
+                    "role": "tool",
+                    "tool": "read_file",
+                    "exit_code": 0,
+                    "output": "def main():\n    return 'old'\n",
+                    "metadata": {"path": "app.py"},
+                },
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "formatter.py"}},
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "tests/test_app.py"}},
+            ]
+        )
+        workflow = SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED, diff_exists=False)
+
+        block = duplicate_read_file_block(state, workflow, "read_file", {"path": "app.py"})
+        self.assertTrue(block)
+        self.assertEqual(duplicate_inspection_required_command_retarget(state, workflow), "")
+        result = cached_duplicate_read_result(state, {"path": "app.py"}, block)
+        state.add_tool_result(result)
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.metadata["cached_duplicate"])
+        self.assertEqual(latest_successful_read_index(state, "app.py"), 0)
+        self.assertEqual(state.consecutive_failures, 0)
+        self.assertIn("You already read app.py", result.output)
+        self.assertIn("Cached excerpt", result.output)
 
     async def test_unavailable_tool_request_records_structured_feedback(self) -> None:
         repo = InMemoryJobRepository()

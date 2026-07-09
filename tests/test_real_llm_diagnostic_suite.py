@@ -361,6 +361,8 @@ def classify_diagnostic_failure(*, job: CodingJob, steps: list[DocodeStep], requ
         return "repair_edit_blocked_by_test_gate"
     if diagnostic_inspection_blocked_by_must_edit(contents):
         return "inspection_blocked_by_must_edit"
+    if runs and any(result.get("exit_code") not in {0, None} for result in runs) and not repairs:
+        return "test_failure_not_repaired"
     if not edits and (duplicate_reads or duplicate_inspection_rejected(contents)):
         return "duplicate_inspection_loop"
     if not tool_calls:
@@ -409,6 +411,8 @@ def repeated_successful_read_paths(tool_results: list[dict[str, object]]) -> set
         if content.get("tool") != "read_file" or content.get("exit_code") != 0:
             continue
         metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+        if metadata.get("cached_duplicate") is True:
+            continue
         path = str(metadata.get("path") or "")
         if not path:
             continue
