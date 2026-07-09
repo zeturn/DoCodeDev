@@ -12,6 +12,8 @@ from docode.agent.loop import (
     allowed_tools_for_repair_mode_name,
     allowed_tool_definitions_for_state,
     compact_llm_message,
+    duplicate_inspection_pressure_tool_block,
+    duplicate_read_file_block,
     edit_required_tool_block,
     latest_failed_required_command,
     preferred_targeted_repair_target,
@@ -31,7 +33,7 @@ from docode.agent.stop_policy import StopPolicy
 from docode.agent.state import AgentState
 from docode.agent.task_contract import TaskContract
 from docode.agent.verifier import CodingVerifier, VerificationResult
-from docode.agent.workflow import WorkflowPhase
+from docode.agent.workflow import WorkflowPhase, final_candidate_gate, workflow_snapshot
 from docode.agent.context import instruction_source_urls
 from docode.agent.inspector import should_skip_important_file_reads
 from docode.artifacts.exporter import ArtifactExporter
@@ -1126,6 +1128,68 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             "",
         )
 
+    def test_failed_required_command_moves_to_repair_required_and_allows_edits(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py"))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["parser.py"], must_run_commands=["python -m unittest discover -s tests"])
+        state.latest_git_status = ToolResult(tool="git_status", output=" M parser.py\n", exit_code=0)
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "edit_file", "exit_code": 0, "metadata": {"path": "parser.py"}},
+                {
+                    "role": "tool",
+                    "tool": "run_command",
+                    "exit_code": 1,
+                    "output": "ImportError: cannot import name 'load_items'",
+                    "metadata": {"command": "python -m unittest discover -s tests"},
+                },
+            ]
+        )
+
+        workflow = workflow_snapshot(state, state.latest_git_status.output)
+
+        self.assertEqual(workflow.phase, WorkflowPhase.REPAIR_REQUIRED)
+        self.assertTrue(workflow.required_tests_attempted)
+        self.assertFalse(workflow.required_tests_passed)
+        self.assertEqual(required_test_tool_block(state, workflow, "edit_file", {"path": "parser.py"}), "")
+        self.assertEqual(required_test_tool_block(state, workflow, "read_file", {"path": "parser.py"}), "")
+        self.assertEqual(required_test_tool_block(state, workflow, "run_command", {"command": "python -m unittest discover -s tests"}), "")
+        self.assertFalse(final_candidate_gate(state, state.latest_git_status.output).allowed)
+
+    def test_test_required_before_first_command_still_requires_run_command(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py"))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["parser.py"], must_run_commands=["python -m unittest discover -s tests"])
+        state.latest_git_status = ToolResult(tool="git_status", output=" M parser.py\n", exit_code=0)
+        state.messages.append({"role": "tool", "tool": "edit_file", "exit_code": 0, "metadata": {"path": "parser.py"}})
+        workflow = workflow_snapshot(state, state.latest_git_status.output)
+
+        self.assertEqual(workflow.phase, WorkflowPhase.TEST_REQUIRED)
+        self.assertIn("Run this exact command", required_test_tool_block(state, workflow, "edit_file", {"path": "parser.py"}))
+
+    def test_active_targeted_repair_with_failed_command_allows_read_and_edit(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py"))
+        state.task_contract = TaskContract(must_modify_files=["parser.py"], must_run_commands=["python -m unittest discover -s tests"])
+        state.repair_mode = "targeted_repair"
+        state.active_repair_action = {"target_files": ["parser.py"], "rerun_commands": ["python -m unittest discover -s tests"]}
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool": "run_command",
+                "exit_code": 1,
+                "metadata": {"command": "python -m unittest discover -s tests"},
+            }
+        )
+        workflow = SimpleNamespace(
+            phase=WorkflowPhase.TEST_REQUIRED,
+            missing_commands=["python -m unittest discover -s tests"],
+            required_tests_attempted=True,
+            required_tests_passed=False,
+        )
+
+        self.assertEqual(required_test_tool_block(state, workflow, "edit_file", {"path": "parser.py"}), "")
+        self.assertEqual(required_test_tool_block(state, workflow, "read_file", {"path": "parser.py"}), "")
+
     async def test_agent_loop_sets_must_edit_when_tests_blocked_by_missing_target_files(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
@@ -1189,7 +1253,14 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIn("repeated inspection without a diff", block)
         self.assertIn("crawler.py", block)
         self.assertEqual(state.repair_mode, "must_edit")
+        self.assertEqual(edit_required_tool_block(state, workflow, "read_file", {"path": "crawler.py"}), "")
         self.assertEqual(edit_required_tool_block(state, workflow, "write_file", {"path": "crawler.py"}), "")
+        from docode.agent.workflow import final_candidate_gate
+
+        gate = final_candidate_gate(state, "")
+
+        self.assertFalse(gate.allowed)
+        self.assertIn("workflow_not_ready", gate.reason)
 
     def test_edit_required_rejects_non_target_file_edits(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -1273,6 +1344,120 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertEqual(edit_required_tool_block(state, workflow, "list_files", {"path": "."}), "")
         self.assertEqual(edit_required_tool_block(state, workflow, "git_status", {}), "")
         self.assertEqual(edit_required_tool_block(state, workflow, "write_file", {"path": "crawler.py"}), "")
+
+    def test_duplicate_read_file_after_edit_pressure_is_rejected(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["app.py"])
+        for path in ("app.py", "formatter.py", "tests/test_app.py"):
+            state.messages.append({"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": path}})
+        workflow = SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED, diff_exists=False)
+
+        block = duplicate_read_file_block(state, workflow, "read_file", {"path": "app.py"})
+
+        self.assertIn("You already read app.py", block)
+        self.assertIn("Edit the most likely target file now", block)
+
+    def test_duplicate_inspection_pressure_forces_edit_toolset(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["app.py"])
+        state.latest_git_status = ToolResult(tool="git_status", output="")
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "app.py"}},
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "formatter.py"}},
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "tests/test_app.py"}},
+                {
+                    "role": "system",
+                    "kind": "feedback",
+                    "content": "duplicate_inspection_after_edit_pressure: You already read tests/test_app.py",
+                },
+            ]
+        )
+        definitions = [NamedTool("read_file"), NamedTool("edit_file"), NamedTool("write_file"), NamedTool("git_status")]
+
+        allowed = {tool.name for tool in allowed_tool_definitions_for_state(definitions, state)}
+        block = duplicate_inspection_pressure_tool_block(
+            state,
+            SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED, diff_exists=False),
+            "read_file",
+        )
+
+        self.assertEqual(allowed, {"edit_file", "write_file", "git_status"})
+        self.assertIn("repeated duplicate inspection pressure", block)
+
+    def test_duplicate_read_file_rejection_escalates_after_first_warning(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py"))
+        state.task_contract = TaskContract(must_modify_files=["parser.py"])
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "parser.py"}},
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "fixtures/items.json"}},
+                {"role": "tool", "tool": "list_files", "exit_code": 0, "metadata": {"path": "."}},
+                {
+                    "role": "system",
+                    "kind": "feedback",
+                    "content": "duplicate_inspection_after_edit_pressure: You already read fixtures/items.json",
+                },
+            ]
+        )
+        workflow = SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED, diff_exists=False)
+
+        block = duplicate_read_file_block(state, workflow, "read_file", {"path": "fixtures/items.json"})
+
+        self.assertIn("read_file tool is not available now", block)
+        self.assertIn("Candidate target files: parser.py", block)
+
+    def test_duplicate_read_file_suppression_allows_new_file_before_threshold_and_after_edit(self) -> None:
+        workflow = SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED, diff_exists=False)
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.task_contract = TaskContract(must_modify_files=["app.py"])
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "app.py"}},
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "formatter.py"}},
+            ]
+        )
+
+        self.assertEqual(duplicate_read_file_block(state, workflow, "read_file", {"path": "app.py"}), "")
+        state.messages.append({"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "tests/test_app.py"}})
+        self.assertEqual(duplicate_read_file_block(state, workflow, "read_file", {"path": "new_file.py"}), "")
+        state.messages.append({"role": "tool", "tool": "edit_file", "exit_code": 0, "metadata": {"path": "app.py"}})
+        state.repair_mode = "targeted_repair"
+        self.assertEqual(duplicate_read_file_block(state, workflow, "read_file", {"path": "app.py"}), "")
+
+    async def test_resolved_required_command_failure_does_not_reactivate_repair_when_later_command_missing(self) -> None:
+        repo = InMemoryJobRepository()
+        job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py"))
+        state = AgentState(job=job)
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(
+            must_modify_files=["crawler.py"],
+            must_run_commands=["python -m unittest discover -s tests", "python crawler.py sample.json --output out.json"],
+        )
+        state.latest_git_status = ToolResult(tool="git_status", output=" M crawler.py\n")
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "edit_file", "exit_code": 0, "metadata": {"path": "crawler.py"}},
+                {"role": "tool", "tool": "run_command", "exit_code": 1, "metadata": {"command": "python -m unittest discover -s tests"}},
+                {"role": "tool", "tool": "run_command", "exit_code": 0, "metadata": {"command": "python -m unittest discover -s tests 2>&1"}},
+            ]
+        )
+        loop = CodingAgentLoop(
+            llm=ScriptedLLM(),
+            tools=FakeTools(),
+            verifier=PassingVerifier(),
+            repository=repo,
+            exporter=ArtifactExporter(Path("/tmp"), repo),
+            stop_policy=StopPolicy(max_iterations=4, max_runtime_seconds=60),
+            quality_gate=PassingQualityGate(),
+        )
+        workflow = workflow_snapshot(state, state.latest_git_status.output)
+
+        self.assertEqual(workflow.phase, WorkflowPhase.TEST_REQUIRED)
+        self.assertEqual(workflow.missing_commands, ["python crawler.py sample.json --output out.json"])
+        self.assertFalse(await loop.maybe_activate_required_command_repair(state, workflow))
 
     def test_edit_required_before_exploration_budget_keeps_search_tools_available(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="crawl github trends from https://github.com/trending"))
@@ -1858,9 +2043,10 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
                 [
                     "python3 -m unittest discover -s tests",
                     "python3 -m unittest discover -s tests",
-                    "python3 -m unittest discover -s tests",
                 ],
             )
+            rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
+            self.assertTrue(any(step.content.get("reason") == "targeted_repair_wrong_action" for step in rejected))
 
     def test_targeted_repair_edit_forced_does_not_generate_or_force_write_content(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix calculator.py."))

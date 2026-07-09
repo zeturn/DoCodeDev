@@ -80,6 +80,7 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
     missing_commands = missing_required_commands(state)
     tests_run = not missing_commands
     required_tests_attempted = required_commands_attempted(state)
+    required_tests_passed = required_commands_passed(state)
     latest_failure_signature = latest_failed_required_command_signature(state)
     if state.inspection is None:
         return WorkflowSnapshot(
@@ -87,7 +88,7 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             diff_exists=diff_exists,
             tests_run=tests_run,
             required_tests_attempted=required_tests_attempted,
-            required_tests_passed=tests_run,
+            required_tests_passed=required_tests_passed,
             final_allowed=False,
             reason="inspection_missing",
             required_action="inspect the repository before planning or editing",
@@ -98,7 +99,7 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             diff_exists=False,
             tests_run=tests_run,
             required_tests_attempted=required_tests_attempted,
-            required_tests_passed=tests_run,
+            required_tests_passed=required_tests_passed,
             final_allowed=False,
             reason="no_diff",
             required_action="modify a target file and confirm git_status shows a change",
@@ -109,7 +110,7 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             diff_exists=True,
             tests_run=tests_run,
             required_tests_attempted=required_tests_attempted,
-            required_tests_passed=tests_run,
+            required_tests_passed=required_tests_passed,
             final_allowed=False,
             reason="repair_mode_requires_edit",
             required_action="make or confirm an edit with an allowed repair tool before final_candidate",
@@ -127,12 +128,26 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             missing_commands=missing_commands,
             latest_test_failure_signature=latest_failure_signature,
         )
+    if required_commands(state.task_contract) and required_tests_attempted and not required_tests_passed:
+        next_command = next_required_command(state)
+        return WorkflowSnapshot(
+            phase=WorkflowPhase.REPAIR_REQUIRED,
+            diff_exists=True,
+            tests_run=True,
+            required_tests_attempted=True,
+            required_tests_passed=False,
+            final_allowed=False,
+            reason="required_tests_failed",
+            required_action=f"repair the failing source file, then rerun the exact verification command: {next_command}",
+            latest_test_failure_signature=latest_failure_signature,
+            rerun_after_patch=next_command or None,
+        )
     return WorkflowSnapshot(
         phase=WorkflowPhase.FINAL_READY,
         diff_exists=True,
         tests_run=tests_run,
         required_tests_attempted=required_tests_attempted,
-        required_tests_passed=tests_run,
+        required_tests_passed=required_tests_passed,
         final_allowed=True,
         reason="ready",
         required_action="submit final_candidate for verifier review",
@@ -196,11 +211,26 @@ def final_candidate_gate(state: AgentState, git_status_output: str) -> FinalGate
 
 
 def required_commands_satisfied(state: AgentState) -> bool:
-    return not missing_required_commands(state)
+    return required_commands_passed(state)
 
 
 def missing_required_commands(state: AgentState) -> list[str]:
-    return [command for command in required_commands(state.task_contract) if not command_was_run(state, command)]
+    return [command for command in required_commands(state.task_contract) if not command_was_attempted(state, command)]
+
+
+def required_commands_passed(state: AgentState) -> bool:
+    commands = required_commands(state.task_contract)
+    return all(command_was_run(state, command) for command in commands)
+
+
+def next_required_command(state: AgentState) -> str:
+    commands = required_commands(state.task_contract)
+    if not commands:
+        return ""
+    for command in commands:
+        if not command_was_run(state, command):
+            return command
+    return commands[0]
 
 
 def required_commands(task_contract: TaskContract | None) -> list[str]:
@@ -211,6 +241,21 @@ def command_was_run(state: AgentState, command: str) -> bool:
     expected = normalize_command(command)
     for message in state.messages:
         if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        observed = normalize_command(str(metadata.get("command") or ""))
+        if observed and commands_equivalent(observed, expected):
+            return True
+        tool = str(message.get("tool") or "")
+        if tool == "run_tests" and ("test" in expected or "pytest" in expected or "unittest" in expected):
+            return True
+    return False
+
+
+def command_was_attempted(state: AgentState, command: str) -> bool:
+    expected = normalize_command(command)
+    for message in state.messages:
+        if message.get("role") != "tool":
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         observed = normalize_command(str(metadata.get("command") or ""))

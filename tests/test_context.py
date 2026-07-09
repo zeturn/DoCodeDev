@@ -127,6 +127,55 @@ class ContextManagerTests(TestCase):
         self.assertEqual(len(pack.recent_messages), 5)
         self.assertNotIn("line\n" * 1000, rendered)
 
+    def test_context_adds_action_summary_for_inspected_clean_diff_candidate_targets(self) -> None:
+        instruction = (
+            "Fix the profile formatting bug across app.py and formatter.py.\n\n"
+            "Target files: app.py, formatter.py\n\n"
+            "Verification commands:\n"
+            "1. python -m unittest discover -s tests"
+        )
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction=instruction)
+        messages = [
+            {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "def build_profile(): ...", "metadata": {"path": "app.py"}},
+            {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "def format_user(): ...", "metadata": {"path": "formatter.py"}},
+            {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "class AppTests: ...", "metadata": {"path": "tests/test_app.py"}},
+        ]
+
+        pack = ContextManager().build_pack(
+            job=job,
+            inspection=ProjectInspection(listing="app.py\nformatter.py\ntests/test_app.py\n"),
+            messages=messages,
+            git_status=ToolResult(tool="git_status", output=""),
+            iteration=4,
+            tool_calls_count=3,
+            llm_tokens_used=0,
+            llm_cost_used=0.0,
+            task_contract=task_contract_from_instruction(instruction),
+        )
+        rendered = pack.render()
+
+        self.assertIn("Already inspected:", rendered)
+        self.assertIn("- app.py", rendered)
+        self.assertIn("- formatter.py", rendered)
+        self.assertIn("- tests/test_app.py", rendered)
+        self.assertIn("Git diff is empty.", rendered)
+        self.assertIn("Choose the most likely source file and edit it now.", rendered)
+        self.assertIn("Repeated inspection warning", rendered)
+        self.assertIn("Candidate target files: app.py, formatter.py", rendered)
+        self.assertNotIn("You must modify app.py", rendered)
+        self.assertNotIn("You must modify formatter.py", rendered)
+
+    def test_context_keeps_strict_wording_for_explicit_modify_file(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="Modify formatter.py so display names are normalized.")
+
+        text = ContextManager().task_contract(
+            job,
+            task_contract=task_contract_from_instruction(job.instruction),
+        )
+
+        self.assertIn("You must modify formatter.py", text)
+        self.assertNotIn("Candidate target files: formatter.py", text)
+
     def test_crawler_context_adds_dependency_and_artifact_contract(self) -> None:
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="Build a GitHub Trending crawler")
 

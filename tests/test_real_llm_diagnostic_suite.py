@@ -15,6 +15,7 @@ from docode.agent.loop import CodingAgentLoop
 from docode.agent.quality_gate import QualityGate
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.verifier import CodingVerifier
+from docode.agent.workflow import commands_equivalent
 from docode.artifacts.exporter import ArtifactExporter
 from docode.dobox.tools import ToolDefinition
 from docode.dobox.types import ToolResult
@@ -313,6 +314,13 @@ def command_successes(steps: list[DocodeStep]) -> set[str]:
     return successful
 
 
+def required_command_succeeded(steps: list[DocodeStep], command: str) -> bool:
+    return any(
+        result.get("exit_code") == 0 and result.get("command") and commands_equivalent(str(result["command"]), command)
+        for result in run_command_results(steps)
+    )
+
+
 def final_candidate_attempted(steps: list[DocodeStep]) -> bool:
     return any(
         (step.content.get("type") == "llm_decision" and step.content.get("decision_type") == "final_candidate")
@@ -330,13 +338,17 @@ def classify_diagnostic_failure(*, job: CodingJob, steps: list[DocodeStep], requ
     edits = [content for content in tool_results if content.get("tool") in {"write_file", "edit_file", "replace_in_file", "apply_patch"} and content.get("exit_code") == 0]
     reads = [content for content in tool_results if content.get("tool") in {"read_file", "read_file_range", "list_files", "search"} and content.get("exit_code") == 0]
     runs = run_command_results(steps)
-    successes = command_successes(steps)
-    missing = [command for command in required_commands if " ".join(command.split()) not in successes]
+    missing = [command for command in required_commands if not required_command_succeeded(steps, command)]
+    duplicate_reads = repeated_successful_read_paths(tool_results)
 
     if job.failure_reason and "artifact" in job.failure_reason:
         return "artifact_export_failure"
+    if repair_edit_blocked_by_test_gate(contents):
+        return "repair_edit_blocked_by_test_gate"
     if diagnostic_inspection_blocked_by_must_edit(contents):
         return "inspection_blocked_by_must_edit"
+    if not edits and (duplicate_reads or duplicate_inspection_rejected(contents)):
+        return "duplicate_inspection_loop"
     if not tool_calls:
         return "planning_failure"
     if edits and any(result.get("exit_code") not in {0, None} for result in runs) and not repairs:
@@ -356,6 +368,44 @@ def classify_diagnostic_failure(*, job: CodingJob, steps: list[DocodeStep], requ
     if job.status != JobStatus.SUCCEEDED:
         return "bad_code_edit"
     return "unknown"
+
+
+def repeated_successful_read_paths(tool_results: list[dict[str, object]]) -> set[str]:
+    counts: dict[str, int] = {}
+    for content in tool_results:
+        if content.get("tool") != "read_file" or content.get("exit_code") != 0:
+            continue
+        metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+        path = str(metadata.get("path") or "")
+        if not path:
+            continue
+        counts[path] = counts.get(path, 0) + 1
+    return {path for path, count in counts.items() if count >= 3}
+
+
+def duplicate_inspection_rejected(contents: list[dict[str, object]]) -> bool:
+    return any(
+        content.get("type") == "decision_rejected"
+        and content.get("reason") == "duplicate_inspection_after_edit_pressure"
+        for content in contents
+    )
+
+
+def repair_edit_blocked_by_test_gate(contents: list[dict[str, object]]) -> bool:
+    failed_required_command = any(
+        content.get("type") == "tool_result"
+        and content.get("tool") == "run_command"
+        and content.get("exit_code") not in {0, None}
+        for content in contents
+    )
+    if not failed_required_command:
+        return False
+    return any(
+        content.get("type") == "decision_rejected"
+        and content.get("reason") == "test_required_tool_forbidden"
+        and "blocked while TEST_REQUIRED" in str(content.get("detail") or "")
+        for content in contents
+    )
 
 
 def diagnostic_inspection_blocked_by_must_edit(contents: list[dict[str, object]]) -> bool:
@@ -392,8 +442,7 @@ async def diagnostic_failure_message(case: DiagnosticCase, job: CodingJob, tools
     status = await tools.git_status()
     diff = await tools.git_diff()
     runs = run_command_results(steps)
-    successes = command_successes(steps)
-    required = {command: " ".join(command.split()) in successes for command in case.required_commands}
+    required = {command: required_command_succeeded(steps, command) for command in case.required_commands}
     repairs = [step for step in steps if step.content.get("type") == "repair_action"]
     rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
     category = classify_diagnostic_failure(job=job, steps=steps, required_commands=case.required_commands)
@@ -464,6 +513,70 @@ class DiagnosticClassifierTests(TestCase):
         category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
 
         self.assertEqual(category, "inspection_blocked_by_must_edit")
+
+    def test_classifier_detects_duplicate_inspection_loop(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="", status=JobStatus.FAILED, failure_reason="max_iterations_exceeded")
+        steps = [
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=index,
+                kind="tool",
+                content={"type": "tool_result", "tool": "read_file", "exit_code": 0, "metadata": {"path": "app.py"}},
+            )
+            for index in range(3)
+        ]
+
+        category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
+
+        self.assertEqual(category, "duplicate_inspection_loop")
+
+    def test_classifier_detects_duplicate_inspection_rejection_loop(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="", status=JobStatus.FAILED, failure_reason="max_consecutive_failures_exceeded")
+        steps = [
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=0,
+                kind="system",
+                content={
+                    "type": "decision_rejected",
+                    "reason": "duplicate_inspection_after_edit_pressure",
+                    "detail": "You already read app.py",
+                },
+            )
+        ]
+
+        category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
+
+        self.assertEqual(category, "duplicate_inspection_loop")
+
+    def test_classifier_detects_test_gate_blocking_repair(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="", status=JobStatus.FAILED, failure_reason="max_iterations_exceeded")
+        steps = [
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=0,
+                kind="tool",
+                content={"type": "tool_result", "tool": "run_command", "exit_code": 1, "metadata": {"command": "python -m unittest discover -s tests"}},
+            ),
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=1,
+                kind="system",
+                content={
+                    "type": "decision_rejected",
+                    "reason": "test_required_tool_forbidden",
+                    "detail": "edit_file is blocked while TEST_REQUIRED. Run this exact command first: python -m unittest discover -s tests",
+                },
+            ),
+        ]
+
+        category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
+
+        self.assertEqual(category, "repair_edit_blocked_by_test_gate")
 
 
 @skipUnless(REAL_LLM_SMOKE_ENABLED, "set DOCODE_REAL_LLM_SMOKE=1 to run optional real LLM diagnostic suite")

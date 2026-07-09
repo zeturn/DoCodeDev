@@ -20,6 +20,7 @@ class ContextPack:
     repo_map: str
     working_memory: str
     file_memory: str
+    action_summary: str
     latest_evidence: str
     recent_messages: list[dict[str, Any]] = field(default_factory=list)
 
@@ -29,6 +30,7 @@ class ContextPack:
             ("Repo Map", self.repo_map),
             ("Working Memory", self.working_memory),
             ("File Memory", self.file_memory),
+            ("Action Summary", self.action_summary),
             ("Latest Evidence", self.latest_evidence),
         ]
         return "\n\n".join(f"## {title}\n{body}".rstrip() for title, body in sections if body)
@@ -78,6 +80,13 @@ class ContextManager:
             llm_cost_used=llm_cost_used,
         )
         file_memory = self.file_memory(inspection, messages, repair_active=repair_active)
+        action_summary = self.action_summary(
+            job=job,
+            messages=messages,
+            git_status=git_status,
+            task_contract=task_contract,
+            repair_mode=repair_mode,
+        )
         latest_evidence = self.latest_evidence(
             git_status,
             messages,
@@ -94,6 +103,7 @@ class ContextManager:
             repo_map=clip_text(repo_map, 700 if compact_mode else section_bytes),
             working_memory=clip_text(working_memory, 900 if compact_mode else section_bytes),
             file_memory=clip_text(file_memory, 700 if compact_mode else (3_000 if repair_active else section_bytes)),
+            action_summary=clip_text(action_summary, 900 if compact_mode else 1_600),
             latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else (8_000 if repair_active else section_bytes)),
             recent_messages=recent_messages,
         )
@@ -119,8 +129,14 @@ class ContextManager:
         ]
         if task_contract is not None:
             mandatory: list[str] = []
-            mandatory.extend(f"You must modify {path}" for path in task_contract.must_modify_files)
-            mandatory.append("You must produce non-empty git diff before final_candidate")
+            strict_targets, candidate_targets = target_file_guidance(job.instruction, task_contract.must_modify_files)
+            mandatory.extend(f"You must modify {path}" for path in strict_targets)
+            if candidate_targets:
+                mandatory.append(f"Candidate target files: {', '.join(candidate_targets)}")
+                mandatory.append("You must produce a non-empty diff in at least one relevant source file before finalization")
+                mandatory.append("Prefer editing the file most directly responsible for the failing behavior")
+            else:
+                mandatory.append("You must produce non-empty git diff before final_candidate")
             mandatory.extend(f"You must run suggested command: {command}" for command in task_contract.must_run_commands)
             mandatory.extend(task_contract.forbidden_finish_conditions)
             if is_crawler_instruction(job.instruction):
@@ -198,6 +214,72 @@ class ContextManager:
             if snippets:
                 parts.append("Repair file snippets already available in context:\n" + snippets)
         return "\n\n".join(parts) if parts else "No file memory yet."
+
+    def action_summary(
+        self,
+        *,
+        job: CodingJob,
+        messages: list[dict[str, Any]],
+        git_status: ToolResult,
+        task_contract: TaskContract | None = None,
+        repair_mode: str | None = None,
+    ) -> str:
+        inspected = sorted(inspected_paths(messages))
+        if not inspected or not git_status_clean(git_status.output) or edit_successful(messages):
+            return ""
+
+        source_paths = [path for path in inspected if not is_test_path(path)]
+        test_paths = [path for path in inspected if is_test_path(path)]
+        if not source_paths and not test_paths:
+            return ""
+
+        strict_targets, candidate_targets = target_file_guidance(job.instruction, (task_contract.must_modify_files if task_contract else []))
+        likely_targets = candidate_targets or strict_targets or source_paths
+        lines = ["Already inspected:"]
+        lines.extend(f"- {path}" for path in inspected[:8])
+        if len(inspected) > 8:
+            lines.append(f"- ... {len(inspected) - 8} more")
+
+        lines.extend(
+            [
+                "",
+                "Current state:",
+                "- Git diff is empty.",
+                "- The task requires a code change before finalization.",
+                "- You have already inspected source and/or test files.",
+            ]
+        )
+        if likely_targets:
+            lines.append(f"- Candidate target files: {', '.join(likely_targets[:6])}.")
+
+        lines.extend(
+            [
+                "",
+                "Next action:",
+                "- Choose the most likely source file and edit it now.",
+                "- Do not repeatedly reread the same files unless you need a specific missing line.",
+                "- After editing, run the explicit verification command.",
+            ]
+        )
+        if repeated_inspection_without_diff(messages):
+            lines.extend(
+                [
+                    "",
+                    "Repeated inspection warning:",
+                    "You have repeatedly inspected files, but no source file has changed yet.",
+                    "The job cannot finish with a clean git diff.",
+                    "Unless you need a specific missing line, stop rereading the same files and edit the most likely target source file now.",
+                ]
+            )
+        if repair_mode == "must_edit":
+            lines.extend(
+                [
+                    "",
+                    "Edit pressure:",
+                    "repair_mode=must_edit is active; the next useful action should modify a relevant source file.",
+                ]
+            )
+        return "\n".join(lines)
 
     def latest_evidence(
         self,
@@ -374,6 +456,129 @@ def touched_paths(messages: list[dict[str, Any]]) -> set[str]:
         if isinstance(metadata, dict) and isinstance(metadata.get("path"), str):
             paths.add(metadata["path"])
     return paths
+
+
+INSPECTION_TOOLS = {"read_file", "read_file_range", "read_symbol", "list_files", "search"}
+EDIT_TOOLS = {"write_file", "edit_file", "replace_in_file", "apply_patch"}
+EDIT_TARGET_VERBS = {"change", "edit", "fix", "implement", "modify", "refactor", "repair", "update"}
+
+
+def inspected_paths(messages: list[dict[str, Any]]) -> set[str]:
+    paths: set[str] = set()
+    for message in messages:
+        if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
+            continue
+        if str(message.get("tool") or "") not in INSPECTION_TOOLS:
+            continue
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("path"), str):
+            path = metadata["path"].strip()
+            if path and path not in {"."}:
+                paths.add(path)
+    return paths
+
+
+def edit_successful(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        message.get("role") == "tool"
+        and str(message.get("tool") or "") in EDIT_TOOLS
+        and int(message.get("exit_code") or 0) == 0
+        for message in messages
+    )
+
+
+def repeated_inspection_without_diff(messages: list[dict[str, Any]]) -> bool:
+    inspection_count = sum(
+        1
+        for message in messages
+        if message.get("role") == "tool"
+        and str(message.get("tool") or "") in INSPECTION_TOOLS
+        and int(message.get("exit_code") or 0) == 0
+    )
+    return inspection_count >= 3 and not edit_successful(messages)
+
+
+def is_test_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    name = normalized.rsplit("/", 1)[-1]
+    return normalized.startswith("tests/") or "/tests/" in normalized or name.startswith("test_") or name.endswith("_test.py")
+
+
+def target_file_guidance(instruction: str, targets: list[str]) -> tuple[list[str], list[str]]:
+    normalized_targets = [target for target in targets if target]
+    if not normalized_targets:
+        return [], []
+    if target_hint_mentions_any(instruction, normalized_targets):
+        return explicit_edit_targets(instruction, normalized_targets), [
+            target for target in normalized_targets if target not in explicit_edit_targets(instruction, normalized_targets)
+        ]
+    strict = explicit_edit_targets(instruction, normalized_targets)
+    missing_from_instruction = [target for target in normalized_targets if target not in instruction]
+    strict = unique_list([*strict, *missing_from_instruction])
+    candidates = [target for target in normalized_targets if target not in strict]
+    return strict, candidates
+
+
+def target_hint_mentions_any(instruction: str, targets: list[str]) -> bool:
+    for raw_line in (instruction or "").splitlines():
+        line = raw_line.lower()
+        if not any(marker in line for marker in ("target file:", "target files:", "edit file:", "edit files:")):
+            continue
+        if any(target.lower() in line for target in targets):
+            return True
+    return False
+
+
+def explicit_edit_targets(instruction: str, targets: list[str]) -> list[str]:
+    strict: list[str] = []
+    target_lookup = {target.lower(): target for target in targets}
+    for raw_line in (instruction or "").splitlines():
+        line = raw_line.strip()
+        if not line or any(marker in line.lower() for marker in ("target file:", "target files:", "edit file:", "edit files:")):
+            continue
+        previous_strict = False
+        previous_end = 0
+        matches = sorted(
+            (
+                (match.start(), match.end(), target)
+                for target in targets
+                for match in re.finditer(re.escape(target), line, flags=re.IGNORECASE)
+            ),
+            key=lambda item: item[0],
+        )
+        for start, end, target in matches:
+            between = line[previous_end:start]
+            if edit_verb_immediately_before(between) or (previous_strict and conjunction_only(between)):
+                strict.append(target)
+                previous_strict = True
+            else:
+                previous_strict = False
+            previous_end = end
+    return unique_list(strict)
+
+
+def edit_verb_immediately_before(text: str) -> bool:
+    words = re.findall(r"[a-zA-Z_]+", text.lower())
+    if not words:
+        return False
+    if words[-1] in EDIT_TARGET_VERBS:
+        return True
+    return len(words) >= 2 and words[-1] in {"file", "files"} and words[-2] in EDIT_TARGET_VERBS
+
+
+def conjunction_only(text: str) -> bool:
+    return bool(re.fullmatch(r"\s*(?:,|and|or|\+)\s*", text, flags=re.IGNORECASE))
+
+
+def unique_list(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def changed_files_from_status(output: str) -> list[str]:

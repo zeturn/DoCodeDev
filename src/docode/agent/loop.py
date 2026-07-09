@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import Any
 from urllib.parse import urlparse
 
-from docode.agent.context import ContextManager, ContextPack
+from docode.agent.context import ContextManager, ContextPack, target_file_guidance
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
@@ -224,6 +224,26 @@ class CodingAgentLoop:
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
+                duplicate_read_block = duplicate_read_file_block(state, current_workflow, tool_name, tool_args)
+                if duplicate_read_block:
+                    state.repair_mode = "must_edit"
+                    await self.record_rejected_decision(
+                        state,
+                        reason="duplicate_inspection_after_edit_pressure",
+                        detail=duplicate_read_block,
+                        workflow_state=current_workflow.to_dict(),
+                    )
+                    continue
+                duplicate_pressure_block = duplicate_inspection_pressure_tool_block(state, current_workflow, tool_name)
+                if duplicate_pressure_block:
+                    state.repair_mode = "must_edit"
+                    await self.record_rejected_decision(
+                        state,
+                        reason="duplicate_inspection_after_edit_pressure",
+                        detail=duplicate_pressure_block,
+                        workflow_state=current_workflow.to_dict(),
+                    )
+                    continue
                 test_command_block = required_test_tool_block(state, current_workflow, tool_name, tool_args)
                 if test_command_block:
                     if "required target files are still missing" in test_command_block:
@@ -245,19 +265,42 @@ class CodingAgentLoop:
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
-                if current_workflow.phase == WorkflowPhase.FINAL_READY and not state.active_repair_action:
-                    finalized = await self.auto_finalize_ready_workflow(
-                        state,
-                        reason="final_ready_tool_auto_finalized",
-                        detail=(
-                            f"{decision.tool_name} was requested after the workflow reached FINAL_READY. "
-                            "The loop is submitting a final_candidate from workflow evidence instead."
-                        ),
-                        workflow_state=current_workflow.to_dict(),
-                    )
-                    if finalized is not None:
-                        return finalized
-                    continue
+                if current_workflow.phase == WorkflowPhase.FINAL_READY:
+                    active_category = str((state.active_repair_action or {}).get("category") or "")
+                    stale_workflow_repair = state.active_repair_action and active_category not in {
+                        "quality_gate_repair",
+                        "review_repair",
+                    }
+                    if stale_workflow_repair:
+                        state.active_repair_action = None
+                        state.active_repair_started_at = 0
+                        state.targeted_repair_phase = None
+                        state.targeted_repair_inspections = 0
+                        state.targeted_repair_edits = 0
+                        if state.repair_mode == "targeted_repair":
+                            state.repair_mode = None
+                        await self.repository.add_step(
+                            job.id,
+                            "system",
+                            {
+                                "type": "repair_action_cleared",
+                                "reason": "workflow_final_ready",
+                                "detail": "Cleared stale targeted repair state because required workflow commands are already satisfied.",
+                            },
+                        )
+                    if not state.active_repair_action:
+                        finalized = await self.auto_finalize_ready_workflow(
+                            state,
+                            reason="final_ready_tool_auto_finalized",
+                            detail=(
+                                f"{decision.tool_name} was requested after the workflow reached FINAL_READY. "
+                                "The loop is submitting a final_candidate from workflow evidence instead."
+                            ),
+                            workflow_state=current_workflow.to_dict(),
+                        )
+                        if finalized is not None:
+                            return finalized
+                        continue
                 cancelled = await self.cancelled_job(job.id)
                 if cancelled is not None:
                     return cancelled
@@ -320,7 +363,7 @@ class CodingAgentLoop:
         await self.activate_targeted_repair(state, action, result=result)
 
     async def maybe_activate_required_command_repair(self, state: AgentState, workflow: Any) -> bool:
-        if workflow.phase != WorkflowPhase.TEST_REQUIRED:
+        if workflow.phase != WorkflowPhase.REPAIR_REQUIRED:
             return False
         failed = latest_failed_required_command(state)
         if failed is None:
@@ -1219,6 +1262,9 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState
     if crawler_source_research_priority_active(state, workflow):
         allowed = initial_crawler_source_tools(state)
         return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
+    if duplicate_inspection_edit_forced(state, workflow):
+        allowed = EDIT_TOOLS | {"git_status", "git_diff"}
+        return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     if (
         workflow.phase == WorkflowPhase.EDIT_REQUIRED
         and not successful_edit_tool_called(state)
@@ -1329,7 +1375,16 @@ def targeted_repair_exploration_block(state: AgentState, tool_name: str) -> str:
 
 
 def targeted_repair_action_block(state: AgentState, tool_name: str, args: dict[str, object]) -> str:
-    _ = state, tool_name, args
+    _ = args
+    if state.repair_mode != "targeted_repair" or not state.active_repair_action:
+        return ""
+    forbidden_until_modified = {str(tool) for tool in state.active_repair_action.get("forbidden_until_modified") or [] if str(tool)}
+    if tool_name in forbidden_until_modified and not targeted_repair_modified_target(state):
+        target = next(iter(sorted(targeted_repair_targets(state))), "the target file")
+        return (
+            f"{tool_name} is blocked by the active targeted repair action until {target} is modified. "
+            "Edit the target file first with edit_file, write_file, replace_in_file, or apply_patch."
+        )
     return ""
 
 
@@ -1514,6 +1569,38 @@ def exploratory_tool_calls(state: AgentState) -> int:
     )
 
 
+def edit_tool_attempted(state: AgentState) -> bool:
+    return any(
+        message.get("role") == "tool" and message.get("tool") in {"write_file", "edit_file", "replace_in_file", "apply_patch"}
+        for message in state.messages
+    )
+
+
+def latest_successful_read_index(state: AgentState, path: str) -> int | None:
+    normalized = normalize_workspace_relative_path(path)
+    for index in range(len(state.messages) - 1, -1, -1):
+        message = state.messages[index]
+        if message.get("role") != "tool" or message.get("tool") != "read_file" or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        seen = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if seen == normalized:
+            return index
+    return None
+
+
+def path_changed_after_message(state: AgentState, path: str, index: int) -> bool:
+    normalized = normalize_workspace_relative_path(path)
+    for message in state.messages[index + 1 :]:
+        if message.get("role") != "tool" or message.get("tool") not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        changed = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if message.get("tool") == "apply_patch" or changed == normalized:
+            return True
+    return False
+
+
 def crawler_source_research_priority_active(state: AgentState, workflow: Any) -> bool:
     if workflow.phase != WorkflowPhase.EDIT_REQUIRED:
         return False
@@ -1601,6 +1688,12 @@ def required_test_tool_block(state: AgentState, workflow: Any, tool_name: str, a
     missing = getattr(workflow, "missing_commands", None) or []
     if not missing:
         return ""
+    if state.repair_mode == "targeted_repair" and state.active_repair_action:
+        if tool_name in EDIT_TOOLS or tool_name in LOCAL_INSPECTION_TOOLS or tool_name in {"run_command", "git_status", "git_diff"}:
+            return ""
+    if getattr(workflow, "required_tests_attempted", False) and not getattr(workflow, "required_tests_passed", False):
+        if tool_name in EDIT_TOOLS or tool_name in LOCAL_INSPECTION_TOOLS or tool_name in {"run_command", "git_status", "git_diff"}:
+            return ""
     missing_targets = missing_must_modify_targets(state)
     if target_edit_allowed_while_tests_missing(state, tool_name, args):
         return ""
@@ -1621,6 +1714,78 @@ def required_test_tool_block(state: AgentState, workflow: Any, tool_name: str, a
     if not commands_equivalent(observed, expected):
         return f"Wrong command for TEST_REQUIRED. Run this exact command first: {next_command}"
     return ""
+
+
+def duplicate_read_file_block(state: AgentState, workflow: Any, tool_name: str, args: dict[str, object]) -> str:
+    if tool_name != "read_file":
+        return ""
+    if workflow.phase != WorkflowPhase.EDIT_REQUIRED or getattr(workflow, "diff_exists", False):
+        return ""
+    if successful_edit_tool_called(state) or edit_tool_attempted(state):
+        return ""
+    if exploratory_tool_calls(state) < 3:
+        return ""
+    path = normalize_workspace_relative_path(str(args.get("path") or ""))
+    if not path:
+        return ""
+    latest_read_index = latest_successful_read_index(state, path)
+    if latest_read_index is None:
+        return ""
+    if path_changed_after_message(state, path, latest_read_index):
+        return ""
+    if duplicate_inspection_rejection_count(state) > 0:
+        targets = target_candidates_for_edit_pressure(state)
+        target_text = f"\nCandidate target files: {', '.join(targets[:5])}." if targets else ""
+        return (
+            f"You already read {path}, and its content is still available in context.\n"
+            "The git diff is still empty.\n"
+            "The read_file tool is not available now. Available next tools: write_file, edit_file, replace_in_file, apply_patch, git_status, git_diff.\n"
+            "Do not call read_file again. Edit the most likely source file now; use write_file if exact replacement text is uncertain."
+            f"{target_text}"
+        )
+    return (
+        f"You already read {path}, and its content is still available in context.\n"
+        "The git diff is still empty.\n"
+        "Do not reread the same file again. Edit the most likely target file now using edit_file/write_file/apply_patch."
+    )
+
+
+def duplicate_inspection_pressure_tool_block(state: AgentState, workflow: Any, tool_name: str) -> str:
+    if not duplicate_inspection_edit_forced(state, workflow):
+        return ""
+    allowed = EDIT_TOOLS | {"git_status", "git_diff"}
+    if tool_name in allowed:
+        return ""
+    targets = target_candidates_for_edit_pressure(state)
+    target_text = f" Candidate target files: {', '.join(targets[:5])}." if targets else ""
+    return (
+        f"{tool_name} is blocked after repeated duplicate inspection pressure.\n"
+        "The git diff is still empty. Stop inspecting and edit a likely source file now using edit_file/write_file/apply_patch."
+        f"{target_text}"
+    )
+
+
+def duplicate_inspection_edit_forced(state: AgentState, workflow: Any) -> bool:
+    if workflow.phase != WorkflowPhase.EDIT_REQUIRED or getattr(workflow, "diff_exists", False):
+        return False
+    return not successful_edit_tool_called(state) and duplicate_inspection_rejection_count(state) > 0
+
+
+def duplicate_inspection_rejection_count(state: AgentState) -> int:
+    return sum(
+        1
+        for message in state.messages
+        if message.get("role") == "system"
+        and message.get("kind") == "feedback"
+        and "duplicate_inspection_after_edit_pressure" in str(message.get("content") or "")
+    )
+
+
+def target_candidates_for_edit_pressure(state: AgentState) -> list[str]:
+    if state.task_contract is None:
+        return []
+    strict_targets, candidate_targets = target_file_guidance(state.job.instruction, state.task_contract.must_modify_files)
+    return candidate_targets or strict_targets
 
 
 def targeted_repair_rerun_command_block(state: AgentState, args: dict[str, object]) -> str:
@@ -1888,7 +2053,11 @@ def latest_failed_required_command(state: AgentState) -> ToolResult | None:
 
 
 def normalize_command(command: str) -> str:
-    return " ".join(command.strip().split())
+    cleaned = " ".join(command.strip().split())
+    for suffix in (" 2>&1", " 1>&2"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+    return cleaned
 
 
 def target_edit_allowed_while_tests_missing(state: AgentState, tool_name: str, args: dict[str, object]) -> bool:
@@ -1907,6 +2076,15 @@ def missing_must_modify_targets(state: AgentState) -> list[str]:
     task_contract = state.task_contract
     if task_contract is None or not task_contract.must_modify_files:
         return []
+    strict_targets, candidate_targets = target_file_guidance(state.job.instruction, task_contract.must_modify_files)
+    candidate_target_set = {normalize_workspace_relative_path(candidate) for candidate in candidate_targets}
+    required_targets = strict_targets or [
+        path
+        for path in task_contract.must_modify_files
+        if normalize_workspace_relative_path(path) not in candidate_target_set
+    ]
+    if not required_targets:
+        return []
     status = state.latest_git_status.output if state.latest_git_status is not None else ""
     changed = {normalize_workspace_relative_path(path) for path in changed_paths_from_status(status)}
     edited_paths: set[str] = set()
@@ -1923,7 +2101,7 @@ def missing_must_modify_targets(state: AgentState) -> list[str]:
             edited_paths.add(path)
     return [
         path
-        for raw_path in task_contract.must_modify_files
+        for raw_path in required_targets
         if (path := normalize_workspace_relative_path(raw_path)) and path not in changed and path not in edited_paths
         and not generated_artifact_target(path)
     ]
