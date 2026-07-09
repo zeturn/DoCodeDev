@@ -38,8 +38,9 @@ from docode.agent.state import AgentState
 from docode.agent.task_contract import TaskContract
 from docode.agent.verifier import CodingVerifier, VerificationResult
 from docode.agent.workflow import WorkflowPhase, final_candidate_gate, workflow_snapshot
-from docode.agent.context import instruction_source_urls
+from docode.agent.context import changed_files_from_status, instruction_source_urls
 from docode.agent.inspector import should_skip_important_file_reads
+from docode.agent.stuck import git_status_clean
 from docode.artifacts.exporter import ArtifactExporter
 from docode.dobox.types import ToolResult
 from docode.llm.runtime import AgentDecision, LLMUsageMeter
@@ -1179,6 +1180,28 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(workflow.phase, WorkflowPhase.TEST_REQUIRED)
         self.assertIn("Run this exact command", required_test_tool_block(state, workflow, "edit_file", {"path": "parser.py"}))
+
+    def test_pycache_only_status_does_not_satisfy_non_empty_diff_requirement(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["app.py"], must_run_commands=["python -m unittest discover -s tests"])
+        state.messages.append({"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "app.py"}})
+        status = " M __pycache__/app.cpython-314.pyc\n?? tests/__pycache__/test_app.cpython-314.pyc\n"
+
+        workflow = workflow_snapshot(state, status)
+        gate = final_candidate_gate(state, status)
+
+        self.assertEqual(workflow.phase, WorkflowPhase.EDIT_REQUIRED)
+        self.assertFalse(workflow.diff_exists)
+        self.assertFalse(gate.allowed)
+        self.assertTrue(git_status_clean(status))
+        self.assertEqual(changed_files_from_status(status), [])
+
+    def test_changed_file_summaries_ignore_pycache_but_keep_real_outputs(self) -> None:
+        status = " M cli.py\n M __pycache__/cli.cpython-314.pyc\n?? tests/__pycache__/test_cli.cpython-314.pyc\n?? out.json\n"
+
+        self.assertEqual(changed_files_from_status(status), ["cli.py", "out.json"])
+        self.assertFalse(git_status_clean(status))
 
     def test_active_targeted_repair_with_failed_command_allows_read_and_edit(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py"))

@@ -114,7 +114,7 @@ class DoBoxClient:
 
     async def git_status(self, project_id: str, agent_session_id: str | None = None) -> CommandResult:
         path = project_path(project_id, "git/status", agent_session_id=agent_session_id)
-        data = await self._request("GET", path)
+        data = await self._request("GET", path, timeout=15)
         return CommandResult(
             output=str(data.get("status", data.get("output", ""))),
             exit_code=int(data.get("exit_code", 0)),
@@ -126,7 +126,7 @@ class DoBoxClient:
 
     async def git_diff_result(self, project_id: str, agent_session_id: str | None = None) -> CommandResult:
         path = project_path(project_id, "git/diff", agent_session_id=agent_session_id)
-        data = await self._request("GET", path)
+        data = await self._request("GET", path, timeout=15)
         return CommandResult(
             output=str(data.get("diff", data.get("output", ""))),
             exit_code=int(data.get("exit_code", 0)),

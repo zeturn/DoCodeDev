@@ -9,8 +9,8 @@ from urllib.parse import urlparse
 from docode.agent.inspector import ProjectInspection
 from docode.agent.stuck import git_status_clean
 from docode.agent.task_contract import TaskContract
-from docode.agent.workflow import parse_status_line
 from docode.dobox.types import ToolResult
+from docode.git_changes import changed_paths_from_status, strip_ansi
 from docode.storage.models import CodingJob
 
 
@@ -582,19 +582,7 @@ def unique_list(values: list[str]) -> list[str]:
 
 
 def changed_files_from_status(output: str) -> list[str]:
-    files: list[str] = []
-    for line in output.splitlines():
-        _, path = parse_status_line(line)
-        if not path:
-            continue
-        if " -> " in path:
-            path = path.rsplit(" -> ", 1)[-1].strip()
-        normalized = path.replace("\\", "/")
-        if normalized in {".docode_probe", ".docode_probe_api"} or normalized.startswith(".docode_probe") or normalized.startswith(".git/"):
-            continue
-        if path and path not in files:
-            files.append(path)
-    return files
+    return changed_paths_from_status(output)
 
 
 def final_candidate_reason(clean: bool, repair_mode: str | None) -> str:
@@ -626,6 +614,3 @@ def clip_text(text: str, limit: int) -> str:
         return text
     return encoded[:limit].decode("utf-8", errors="replace") + "\n<truncated>"
 
-
-def strip_ansi(value: str) -> str:
-    return re.sub(r"\x1b\[[0-9;]*m", "", value)

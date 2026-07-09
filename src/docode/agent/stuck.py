@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 from docode.agent.state import AgentState
+from docode.git_changes import meaningful_change_path, parse_status_line
 
 
 EDIT_TOOLS = {"edit_file", "write_file", "apply_patch", "replace_in_file"}
@@ -35,14 +35,10 @@ class StuckDetector:
 
 def git_status_clean(output: str | None) -> bool:
     for raw_line in (output or "").splitlines():
-        line = strip_ansi(raw_line).rstrip()
-        if len(line) < 4:
-            continue
-        marker = line[:2]
-        path = line[3:].strip().replace("\\", "/")
+        marker, path = parse_status_line(raw_line)
         if not path or not (marker == "??" or marker.strip()):
             continue
-        if path in {".docode_probe", ".docode_probe_api"} or path.startswith(".docode_probe") or path.startswith(".git/"):
+        if not meaningful_change_path(path):
             continue
         return False
     return True
@@ -58,7 +54,3 @@ def no_diff_exploration_count(state: AgentState) -> int:
         for message in state.messages
         if message.get("role") == "tool" and message.get("tool") not in EDIT_TOOLS
     )
-
-
-def strip_ansi(value: str) -> str:
-    return re.sub(r"\x1b\[[0-9;]*m", "", value)

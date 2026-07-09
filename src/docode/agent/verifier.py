@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from docode.agent.task_contract import verification_commands_from_instruction
-from docode.agent.workflow import parse_status_line
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
+from docode.git_changes import changed_paths_from_status, meaningful_change_path, parse_status_line, strip_ansi
 from docode.storage.models import CodingJob
 
 
@@ -967,31 +967,6 @@ def synthetic_diff_from_status(status: str, workspace_result: ToolResult | None)
     return "\n".join(f"diff --git a/{path} b/{path}\nnew file mode 100644" for path in files) + "\n"
 
 
-def changed_paths_from_status(status: str) -> list[str]:
-    paths: list[str] = []
-    for raw_line in status.splitlines():
-        marker, path = parse_status_line(raw_line)
-        if not path:
-            continue
-        if (marker == "??" or marker.strip()) and meaningful_change_path(path):
-            paths.append(path)
-    return paths
-
-
-def meaningful_change_path(path: str) -> bool:
-    normalized = strip_ansi(path).strip().replace("\\", "/")
-    if not normalized:
-        return False
-    parts = normalized.split("/")
-    return not (
-        normalized in {".docode_probe", ".docode_probe_api"}
-        or normalized.startswith(".docode_probe")
-        or "__pycache__" in parts
-        or normalized.endswith((".pyc", ".pyo"))
-        or normalized.startswith(".git/")
-    )
-
-
 def workspace_file_names(listing: str) -> set[str]:
     files: set[str] = set()
     for raw_line in listing.splitlines():
@@ -1003,13 +978,6 @@ def workspace_file_names(listing: str) -> set[str]:
         if name not in {".", ".."}:
             files.add(name)
     return files
-
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def strip_ansi(value: str) -> str:
-    return ANSI_RE.sub("", value)
 
 
 def runnable_python_files(instruction: str, python_files: list[str]) -> list[str]:

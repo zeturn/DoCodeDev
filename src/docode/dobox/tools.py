@@ -10,9 +10,24 @@ from typing import Any
 from .client import DoBoxClient
 from .file_readers import read_line_range, read_python_symbol
 from .types import FileResult, ToolResult
+from docode.git_changes import filter_diff_output, filter_status_output
 
 
 WORKSPACE_ROOT = "/workspace"
+GIT_DIFF_FALLBACK_COMMAND = (
+    "git --no-pager diff --no-color -- . "
+    "':(exclude)__pycache__' "
+    "':(exclude)*/__pycache__/*' "
+    "':(exclude)*.pyc' "
+    "':(exclude)*.pyo'"
+)
+GIT_STATUS_FALLBACK_COMMAND = (
+    "git status --porcelain --untracked-files=all -- . "
+    "':(exclude)__pycache__' "
+    "':(exclude)*/__pycache__/*' "
+    "':(exclude)*.pyc' "
+    "':(exclude)*.pyo'"
+)
 ToolCallable = Callable[..., Awaitable[ToolResult]]
 
 
@@ -282,18 +297,42 @@ class DoBoxTools:
         try:
             result = await self.client.git_status(self.project_id, agent_session_id=self.agent_session_id)
         except Exception as exc:
-            return runtime_safe_git_fallback("git_status", exc)
-        return self._compress("git_status", result.output, result.exit_code, truncated=result.truncated)
+            return await self.git_status_command_fallback(exc)
+        return self._compress("git_status", filter_status_output(result.output), result.exit_code, truncated=result.truncated)
 
     async def git_diff(self) -> ToolResult:
         try:
             if hasattr(self.client, "git_diff_result"):
                 result = await self.client.git_diff_result(self.project_id, agent_session_id=self.agent_session_id)
-                return self._compress("git_diff", result.output, result.exit_code, truncated=result.truncated)
+                return self._compress("git_diff", filter_diff_output(result.output), result.exit_code, truncated=result.truncated)
             diff = await self.client.git_diff(self.project_id, agent_session_id=self.agent_session_id)
         except Exception as exc:
+            return await self.git_diff_command_fallback(exc)
+        return self._compress("git_diff", filter_diff_output(diff), 0)
+
+    async def git_status_command_fallback(self, endpoint_exc: Exception) -> ToolResult:
+        try:
+            result = await self.run_command(GIT_STATUS_FALLBACK_COMMAND, "/workspace")
+        except Exception as exc:
+            return runtime_safe_git_fallback("git_status", exc)
+        metadata = {
+            "runtime_command_fallback": True,
+            "command": GIT_STATUS_FALLBACK_COMMAND,
+            "endpoint_error_type": type(endpoint_exc).__name__,
+        }
+        return self._compress("git_status", filter_status_output(result.output), result.exit_code, metadata, truncated=result.truncated)
+
+    async def git_diff_command_fallback(self, endpoint_exc: Exception) -> ToolResult:
+        try:
+            result = await self.run_command(GIT_DIFF_FALLBACK_COMMAND, "/workspace")
+        except Exception as exc:
             return runtime_safe_git_fallback("git_diff", exc)
-        return self._compress("git_diff", diff, 0)
+        metadata = {
+            "runtime_command_fallback": True,
+            "command": GIT_DIFF_FALLBACK_COMMAND,
+            "endpoint_error_type": type(endpoint_exc).__name__,
+        }
+        return self._compress("git_diff", filter_diff_output(result.output), result.exit_code, metadata, truncated=result.truncated)
 
     async def git_commit(self, message: str) -> ToolResult:
         result = await self.client.git_commit(self.project_id, message, agent_session_id=self.agent_session_id)

@@ -191,33 +191,93 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertIn("+change", result.output)
         self.assertTrue(result.truncated)
 
-    async def test_git_diff_result_exception_returns_runtime_safe_fallback(self) -> None:
+    async def test_git_diff_result_exception_uses_command_fallback(self) -> None:
         class RaisingDiffClient(FakeDoBoxClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.commands: list[str] = []
+
             async def git_diff_result(self, project_id, agent_session_id=None):
                 self.agent_session_ids.append(agent_session_id)
                 raise TimeoutError("diff timed out")
+
+            async def run_command(self, project_id, command, cwd="/workspace", timeout_sec=120, output_limit=1_000_000, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                command_text = " ".join(command) if isinstance(command, list) else str(command)
+                self.commands.append(command_text)
+                if "git --no-pager diff" in command_text:
+                    return CommandResult(
+                        "diff --git a/app.py b/app.py\n+change\n"
+                        "diff --git a/__pycache__/app.cpython-314.pyc b/__pycache__/app.cpython-314.pyc\n+cache\n",
+                        0,
+                    )
+                return await super().run_command(project_id, command, cwd, timeout_sec, output_limit, agent_session_id)
 
         tools = DoBoxTools(RaisingDiffClient(), "project-123")
 
         result = await tools.git_diff()
 
-        self.assertEqual(result.exit_code, 124)
-        self.assertIn("git_diff unavailable: TimeoutError: diff timed out", result.output)
-        self.assertEqual(result.metadata, {"runtime_safe_fallback": True, "error_type": "TimeoutError"})
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("diff --git a/app.py b/app.py", result.output)
+        self.assertNotIn("__pycache__", result.output)
+        self.assertTrue(result.metadata["runtime_command_fallback"])
+        self.assertEqual(result.metadata["endpoint_error_type"], "TimeoutError")
 
-    async def test_git_status_exception_returns_runtime_safe_fallback(self) -> None:
+    async def test_git_diff_result_and_command_fallback_exception_returns_runtime_safe_fallback(self) -> None:
+        class RaisingDiffAndCommandClient(FakeDoBoxClient):
+            async def git_diff_result(self, project_id, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                raise TimeoutError("diff timed out")
+
+            async def run_command(self, project_id, command, cwd="/workspace", timeout_sec=120, output_limit=1_000_000, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                raise RuntimeError("exec unavailable")
+
+        tools = DoBoxTools(RaisingDiffAndCommandClient(), "project-123")
+
+        result = await tools.git_diff()
+
+        self.assertEqual(result.exit_code, 124)
+        self.assertIn("git_diff unavailable: RuntimeError: exec unavailable", result.output)
+        self.assertEqual(result.metadata, {"runtime_safe_fallback": True, "error_type": "RuntimeError"})
+
+    async def test_git_status_exception_uses_command_fallback_and_strips_ansi(self) -> None:
         class RaisingStatusClient(FakeDoBoxClient):
             async def git_status(self, project_id, agent_session_id=None):
                 self.agent_session_ids.append(agent_session_id)
                 raise RuntimeError("status unavailable")
 
+            async def run_command(self, project_id, command, cwd="/workspace", timeout_sec=120, output_limit=1_000_000, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                command_text = " ".join(command) if isinstance(command, list) else str(command)
+                if "git status --porcelain" in command_text:
+                    return CommandResult("\x1b[31m M app.py\x1b[0m\n M __pycache__/app.cpython-314.pyc\n", 0)
+                return await super().run_command(project_id, command, cwd, timeout_sec, output_limit, agent_session_id)
+
         tools = DoBoxTools(RaisingStatusClient(), "project-123")
 
         result = await tools.git_status()
 
-        self.assertEqual(result.exit_code, 124)
-        self.assertIn("git_status unavailable: RuntimeError: status unavailable", result.output)
-        self.assertEqual(result.metadata, {"runtime_safe_fallback": True, "error_type": "RuntimeError"})
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.output, " M app.py\n")
+        self.assertNotIn("\x1b[", result.output)
+        self.assertNotIn("__pycache__", result.output)
+        self.assertTrue(result.metadata["runtime_command_fallback"])
+        self.assertEqual(result.metadata["endpoint_error_type"], "RuntimeError")
+
+    async def test_git_status_endpoint_output_strips_ansi_and_pycache_noise(self) -> None:
+        class NoisyStatusClient(FakeDoBoxClient):
+            async def git_status(self, project_id, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                return CommandResult("\x1b[32m M app.py\x1b[0m\n?? tests/__pycache__/test_app.cpython-314.pyc\n", 0)
+
+        tools = DoBoxTools(NoisyStatusClient(), "project-123")
+
+        result = await tools.git_status()
+
+        self.assertEqual(result.output, " M app.py\n")
+        self.assertNotIn("\x1b[", result.output)
+        self.assertNotIn(".pyc", result.output)
 
     async def test_git_helpers_preserve_normal_command_failures(self) -> None:
         class FailingGitClient(FakeDoBoxClient):

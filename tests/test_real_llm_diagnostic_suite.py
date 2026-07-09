@@ -25,6 +25,7 @@ from docode.dobox.client import DoBoxClient
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.tools import ToolDefinition
 from docode.dobox.types import ToolResult
+from docode.git_changes import changed_paths_from_status
 from docode.runtime.smoke import check_http_health, ensure_dobox_smoke_token
 from docode.storage.models import CodingJob, DocodeStep, JobStatus, new_id
 
@@ -502,15 +503,7 @@ async def diagnostic_failure_message(case: DiagnosticCase, job: CodingJob, tools
 
 
 def changed_files_from_status(status: str) -> list[str]:
-    files: list[str] = []
-    for line in status.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        parts = stripped.split(maxsplit=1)
-        if len(parts) == 2:
-            files.append(parts[1].strip())
-    return files
+    return changed_paths_from_status(status)
 
 
 def diagnostic_trace_dir() -> Path:
