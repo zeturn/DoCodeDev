@@ -17,6 +17,7 @@ from docode.agent.loop import (
     preferred_targeted_repair_target,
     refine_repair_action_targets,
     required_test_tool_block,
+    repair_mode_tool_block,
     task_contract_source_targets,
     targeted_repair_action_block,
     targeted_repair_exploration_block,
@@ -535,6 +536,18 @@ class PassingVerifier:
         return VerificationResult(passed=True, confidence=0.9, reason="ok", required_fixes=[], git_diff="diff --git a/crawler.py b/crawler.py\n+ok\n")
 
 
+class FailingVerifier:
+    async def verify(self, job, tools, evidence=None):
+        _ = job, tools, evidence
+        return VerificationResult(
+            passed=False,
+            confidence=0.9,
+            reason="verifier failed",
+            required_fixes=["fix verifier blocker"],
+            git_diff="diff --git a/README.md b/README.md\n+done\n",
+        )
+
+
 class BlockingThenPassingReviewer:
     def __init__(self) -> None:
         self.calls = 0
@@ -981,6 +994,31 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             workflow_steps = [step for step in steps if step.content.get("type") == "workflow_state"]
             self.assertTrue(any(step.content.get("phase") == "TEST_REQUIRED" for step in workflow_steps))
 
+    async def test_agent_loop_does_not_succeed_when_verifier_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update README.md"))
+            tools = FakeTools()
+
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=tools,
+                verifier=FailingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=3, max_runtime_seconds=60),
+                quality_gate=PassingQualityGate(),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.FAILED)
+            self.assertNotEqual(result.status, JobStatus.SUCCEEDED)
+            steps = await repo.list_steps(job.id)
+            verifier_steps = [step for step in steps if step.kind == "verifier"]
+            self.assertTrue(verifier_steps)
+            self.assertFalse(verifier_steps[-1].content["passed"])
+
     def test_test_required_allows_missing_target_file_edit(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.task_contract = TaskContract(
@@ -1250,7 +1288,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertNotIn("edit_file", names)
         self.assertNotIn("replace_in_file", names)
 
-    def test_targeted_repair_tool_list_drops_read_after_exploration_limit(self) -> None:
+    def test_targeted_repair_guidance_does_not_block_edits_after_prior_edit(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.repair_mode = "targeted_repair"
         state.active_repair_action = {
@@ -1265,17 +1303,26 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
                 {"role": "tool", "tool": "run_command", "exit_code": 0, "metadata": {"command": "cat crawler.py"}},
             ]
         )
-        definitions = [NamedTool("read_file"), NamedTool("write_file"), NamedTool("run_command"), NamedTool("git_status")]
+        definitions = [
+            NamedTool("read_file"),
+            NamedTool("read_file_range"),
+            NamedTool("write_file"),
+            NamedTool("edit_file"),
+            NamedTool("apply_patch"),
+            NamedTool("run_command"),
+            NamedTool("git_status"),
+            NamedTool("git_diff"),
+        ]
 
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+        forced = targeted_repair_forced_tool(state, "edit_file", {"path": "crawler.py", "old": "x", "new": "y"})
 
-        self.assertEqual(state.targeted_repair_phase, "edit_forced")
-        self.assertNotIn("read_file", names)
-        self.assertIn("write_file", names)
-        self.assertNotIn("run_command", names)
-        self.assertNotIn("git_status", names)
+        self.assertEqual(set(names), {tool.name for tool in definitions})
+        self.assertIsNone(forced)
+        self.assertEqual(targeted_repair_action_block(state, "edit_file", {"path": "crawler.py"}), "")
+        self.assertEqual(targeted_repair_exploration_block(state, "read_file"), "")
 
-    def test_targeted_repair_inspect_phase_exposes_read_file(self) -> None:
+    def test_targeted_repair_inspect_phase_exposes_normal_local_tools(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.repair_mode = "targeted_repair"
         state.active_repair_action = {
@@ -1289,12 +1336,12 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(state.targeted_repair_phase, "inspect_allowed")
         self.assertIn("read_file", names)
-        self.assertNotIn("search", names)
-        self.assertNotIn("web_search", names)
+        self.assertIn("search", names)
+        self.assertIn("web_search", names)
         self.assertIn("write_file", names)
-        self.assertNotIn("run_command", names)
+        self.assertIn("run_command", names)
 
-    def test_targeted_repair_wrong_target_edit_is_rejected(self) -> None:
+    def test_targeted_repair_wrong_target_edit_is_guidance_not_rejected(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.repair_mode = "targeted_repair"
         state.active_repair_action = {
@@ -1305,10 +1352,9 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         block = targeted_repair_action_block(state, "write_file", {"path": "README.md"})
 
-        self.assertIn("crawler.py", block)
-        self.assertIn("README.md", block)
+        self.assertEqual(block, "")
         self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "/workspace/crawler.py"}), "")
-        self.assertIn("before running commands", targeted_repair_action_block(state, "run_command", {"command": "python3 -m unittest discover -s tests"}))
+        self.assertEqual(targeted_repair_action_block(state, "run_command", {"command": "python3 -m unittest discover -s tests"}), "")
 
     def test_targeted_repair_accepts_equivalent_normalized_target_path(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -1345,7 +1391,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertIsNone(forced)
         block = targeted_repair_exploration_block(state, "read_file")
-        self.assertIn("Modify", block)
+        self.assertEqual(block, "")
 
     def test_parsed_value_numeric_mismatch_prefers_crawler_target(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Create crawler.py tests/test_parser.py fixtures/sample.html"))
@@ -1411,7 +1457,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertEqual(forced[1], {"command": "python3 crawler.py --preflight"})
         self.assertEqual(forced[2], "test_required_requires_exact_command")
 
-    def test_targeted_repair_modified_target_forces_exact_rerun_command(self) -> None:
+    def test_targeted_repair_modified_target_does_not_force_exact_rerun_command(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Create GitHub trends crawler."))
         state.repair_mode = "targeted_repair"
         state.active_repair_started_at = 0
@@ -1436,13 +1482,9 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             {"command": "python3 crawler.py --source fixtures/sample.html --output data/output.json --dry-run"},
         )
 
-        self.assertIsNotNone(forced)
-        assert forced is not None
-        self.assertEqual(forced[0], "run_command")
-        self.assertEqual(forced[1], {"command": "python3 -m unittest discover -s tests"})
-        self.assertEqual(forced[2], "active_repair_requires_exact_rerun")
+        self.assertIsNone(forced)
 
-    def test_targeted_repair_edit_forced_tool_list_keeps_only_repair_tools(self) -> None:
+    def test_targeted_repair_edit_forced_tool_list_keeps_normal_tools_except_explicit_unsafe_forbidden(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.repair_mode = "targeted_repair"
         state.active_repair_action = {
@@ -1459,6 +1501,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
                 "git_status",
                 "git_diff",
             ],
+            "forbidden_tools": ["web_search", "fetch_url", "preview", "logs"],
             "initial_inspection_budget": 0,
         }
         definitions = [
@@ -1477,7 +1520,38 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
 
         self.assertEqual(state.targeted_repair_phase, "edit_forced")
-        self.assertEqual(set(names), {"write_file", "apply_patch"})
+        self.assertEqual(set(names), {"read_file", "search", "list_files", "write_file", "apply_patch", "run_command", "git_status", "git_diff"})
+
+    def test_targeted_repair_explicit_unsafe_forbidden_tools_are_blocked(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_action = {
+            "target_files": ["crawler.py"],
+            "forbidden_tools": ["web_search", "fetch_url", "run_command"],
+            "initial_inspection_budget": 0,
+        }
+        definitions = [
+            NamedTool("web_search"),
+            NamedTool("fetch_url"),
+            NamedTool("read_file"),
+            NamedTool("write_file"),
+            NamedTool("apply_patch"),
+            NamedTool("run_command"),
+            NamedTool("git_status"),
+            NamedTool("git_diff"),
+        ]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+
+        self.assertNotIn("web_search", names)
+        self.assertNotIn("fetch_url", names)
+        self.assertIn("run_command", names)
+        self.assertIn("write_file", names)
+        self.assertIn("apply_patch", names)
+        self.assertIn("git_status", names)
+        self.assertIn("git_diff", names)
+        self.assertIn("blocked by the active targeted repair action", repair_mode_tool_block(state, "fetch_url"))
+        self.assertEqual(repair_mode_tool_block(state, "run_command"), "")
 
     def test_latest_failed_required_command_finds_classifiable_failure(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -1619,7 +1693,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             result = await loop.run(job)
 
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
-            self.assertEqual(result.result_summary, "Updated README after independent review.")
+            self.assertIn("README", result.result_summary or "")
             self.assertEqual(tools.files["README.md"], "substantive\n")
             self.assertEqual(reviewer.calls, 2)
             self.assertTrue(reviewer.seen_tool_results)
@@ -1630,7 +1704,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             verifier_steps = [step for step in steps if step.kind == "verifier"]
             self.assertEqual(len(verifier_steps), 2)
 
-    async def test_agent_loop_targeted_repair_blocks_search_and_requires_rerun(self) -> None:
+    async def test_agent_loop_targeted_repair_blocks_explicitly_forbidden_unsafe_tool_only(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
             job = await repo.create_job(
@@ -1663,10 +1737,6 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(repair_steps[0].content["repair_action"]["category"], "import_error_missing_symbol")
             rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
             self.assertTrue(any(step.content["reason"] == "targeted_repair_tool_forbidden" for step in rejected))
-            self.assertTrue(
-                llm.observed_rerun_feedback
-                or any(step.content["reason"] == "targeted_repair_rerun_missing" for step in rejected)
-            )
 
     async def test_agent_loop_generic_calculator_repair_reads_edits_reruns_and_finalizes(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1703,9 +1773,16 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
                 for step in steps
                 if step.content.get("type") == "tool_call" and step.content.get("tool") == "run_command"
             ]
-            self.assertEqual(commands, ["python3 -m unittest discover -s tests", "python3 -m unittest discover -s tests"])
+            self.assertEqual(
+                commands,
+                [
+                    "python3 -m unittest discover -s tests",
+                    "python3 -m unittest discover -s tests",
+                    "python3 -m unittest discover -s tests",
+                ],
+            )
 
-    def test_targeted_repair_edit_forced_does_not_generate_write_content(self) -> None:
+    def test_targeted_repair_edit_forced_does_not_generate_or_force_write_content(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix calculator.py."))
         state.repair_mode = "targeted_repair"
         state.active_repair_started_at = 0
@@ -1720,7 +1797,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         block = targeted_repair_action_block(state, "run_command", {"command": "python3 -m unittest discover -s tests"})
 
         self.assertIsNone(forced)
-        self.assertIn("requires modifying calculator.py before running commands", block)
+        self.assertEqual(block, "")
 
     def test_parsed_value_mismatch_prefers_contract_source_targets(self) -> None:
         action = RepairAction(
@@ -1775,7 +1852,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             steps = await repo.list_steps(job.id)
             self.assertEqual(steps[-1].content["type"], "repair_action")
 
-    def test_same_targeted_repair_edit_forces_rerun_before_more_exploration(self) -> None:
+    def test_same_targeted_repair_edit_allows_more_editing_and_rerun(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py."))
         state.repair_mode = "targeted_repair"
         state.active_repair_started_at = 0
@@ -1792,11 +1869,8 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
         forced = targeted_repair_forced_tool(state, "read_file", {"path": "crawler.py"})
 
-        self.assertEqual(set(names), {"run_command", "git_status"})
-        self.assertIsNotNone(forced)
-        assert forced is not None
-        self.assertEqual(forced[0], "run_command")
-        self.assertEqual(forced[1], {"command": "python -m unittest discover -s tests"})
+        self.assertEqual(set(names), {"read_file", "write_file", "run_command", "git_status"})
+        self.assertIsNone(forced)
 
     def test_failed_repair_rerun_allows_same_target_edit_again(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py."))
@@ -1828,7 +1902,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertIn("read_file", names)
         self.assertIn("write_file", names)
-        self.assertNotIn("run_command", names)
+        self.assertIn("run_command", names)
         self.assertIsNone(forced)
         self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "crawler.py"}), "")
 
@@ -1882,12 +1956,12 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(state.active_repair_started_at, 2)
             self.assertIn("read_file", names)
             self.assertIn("write_file", names)
-            self.assertNotIn("run_command", names)
+            self.assertIn("run_command", names)
             self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "crawler.py"}), "")
             forced = targeted_repair_forced_tool(state, "write_file", {"path": "crawler.py", "content": "fixed"})
             self.assertIsNone(forced)
 
-    async def test_new_repair_action_different_target_blocks_old_target_edit(self) -> None:
+    async def test_new_repair_action_different_target_still_allows_model_to_choose_edit(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
             job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py."))
@@ -1934,8 +2008,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(state.active_repair_started_at, 2)
             self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "parser.py"}), "")
             block = targeted_repair_action_block(state, "write_file", {"path": "crawler.py"})
-            self.assertIn("parser.py", block)
-            self.assertIn("crawler.py", block)
+            self.assertEqual(block, "")
 
     async def test_agent_loop_recovers_from_transient_tool_error(self) -> None:
         with TemporaryDirectory() as tmp:

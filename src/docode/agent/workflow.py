@@ -81,30 +81,6 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
     tests_run = not missing_commands
     required_tests_attempted = required_commands_attempted(state)
     latest_failure_signature = latest_failed_required_command_signature(state)
-    if state.repair_mode == "targeted_repair" and state.active_repair_action:
-        action = state.active_repair_action
-        target_files = [str(path) for path in action.get("target_files") or [] if str(path)]
-        rerun_commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
-        target_file = target_files[0] if target_files else None
-        modified = target_file_modified_after_repair_start(state)
-        allowed_next_tools = targeted_repair_workflow_allowed_tools(state, modified)
-        return WorkflowSnapshot(
-            phase=WorkflowPhase.REPAIR_REQUIRED,
-            diff_exists=diff_exists,
-            tests_run=tests_run,
-            required_tests_attempted=required_tests_attempted,
-            required_tests_passed=tests_run,
-            final_allowed=False,
-            reason="active_targeted_repair",
-            required_action=targeted_repair_required_action(state, target_file, modified, rerun_commands),
-            missing_commands=missing_commands,
-            active_repair_required=True,
-            latest_test_failure_signature=latest_failure_signature,
-            allowed_next_tools=allowed_next_tools,
-            rerun_after_patch=rerun_commands[0] if rerun_commands else None,
-            target_file=target_file,
-            target_file_modified_after_repair=modified,
-        )
     if state.inspection is None:
         return WorkflowSnapshot(
             phase=WorkflowPhase.INSPECT,

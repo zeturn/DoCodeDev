@@ -139,19 +139,19 @@ class ContextManager:
         if repair_mode:
             parts.append(
                 "Repair Mode:\n"
-                "- The next action must follow the workflow phase and allowed tools.\n"
-                "- final_candidate and unrelated run_command are blocked until the repair target is modified."
+                "- Use the active repair details as structured guidance for the next fix.\n"
+                "- You may inspect, edit, and rerun as needed, but final_candidate still requires passing workflow evidence."
             )
         if active_repair_action:
             phase = targeted_repair_phase or "inspect_allowed"
             targets = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "the target file"
-            next_action = f"modify {targets} now using edit_file/apply_patch/write_file" if phase == "edit_forced" else f"inspect {targets} briefly, then modify it"
+            next_action = f"inspect or modify {targets}, then rerun the relevant command when useful"
             parts.append(
                 "Active Targeted Repair:\n"
                 + json.dumps(active_repair_action, ensure_ascii=False, indent=2)
                 + "\n\n"
                 + f"Targeted repair phase: {phase}\n"
-                + f"Next required action: {next_action}"
+                + f"Suggested next action: {next_action}"
             )
         return "\n\n".join(parts)
 
@@ -226,7 +226,7 @@ class ContextManager:
                 f"- phase: {targeted_repair_phase or 'inspect_allowed'}\n"
                 f"- target_files: {target_files}\n"
                 f"- rerun: {rerun}\n"
-                f"- next_required_action: {'modify ' + target_files + ' now using edit_file/apply_patch/write_file' if targeted_repair_phase == 'edit_forced' else 'inspect briefly, then modify target file'}"
+                "- suggested_next_action: inspect, edit, or rerun based on the latest failure output"
                 + ("\n\nRepair file snippets:\n" + snippets if snippets else "")
             )
         return (

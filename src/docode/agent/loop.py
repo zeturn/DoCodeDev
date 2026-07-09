@@ -134,7 +134,7 @@ class CodingAgentLoop:
                     await self.record_model_failure(state, "llm_auth_failed", str(exc))
                     return await self.fail(job.id, "llm_auth_failed")
                 current_workflow = workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else "")
-                if current_workflow.phase == WorkflowPhase.FINAL_READY:
+                if current_workflow.phase == WorkflowPhase.FINAL_READY and not state.active_repair_action:
                     finalized = await self.auto_finalize_ready_workflow(
                         state,
                         reason="final_ready_llm_decision_failed",
@@ -243,7 +243,7 @@ class CodingAgentLoop:
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
-                if current_workflow.phase == WorkflowPhase.FINAL_READY:
+                if current_workflow.phase == WorkflowPhase.FINAL_READY and not state.active_repair_action:
                     finalized = await self.auto_finalize_ready_workflow(
                         state,
                         reason="final_ready_tool_auto_finalized",
@@ -362,7 +362,7 @@ class CodingAgentLoop:
         status = await self.tools.git_status()
         state.latest_git_status = status
         current_workflow = workflow_snapshot(state, status.output)
-        if current_workflow.phase != WorkflowPhase.FINAL_READY:
+        if current_workflow.phase != WorkflowPhase.FINAL_READY or state.active_repair_action:
             return None
         return await self.auto_finalize_ready_workflow(
             state,
@@ -404,13 +404,6 @@ class CodingAgentLoop:
                     "detail": "Cleared stale targeted repair state because required workflow commands are already satisfied.",
                 },
             )
-        if state.active_repair_action and not targeted_repair_rerun_satisfied(state):
-            await self.record_rejected_decision(
-                state,
-                reason="targeted_repair_rerun_missing",
-                detail=targeted_rerun_missing_detail(state),
-            )
-            return None
         if not gate.allowed:
             if gate.repair_mode:
                 state.repair_mode = gate.repair_mode
@@ -770,11 +763,10 @@ class CodingAgentLoop:
             compact = (
                 "Active repair:\n"
                 f"- target file: {target}\n"
-                f"- next required tool: edit_file/apply_patch/write_file {target}\n"
-                f"- do not run tests again until {target} changes\n"
+                "- suggested tools: read_file/read_file_range/edit_file/apply_patch/write_file/run_command/git_status/git_diff\n"
             )
             if commands:
-                compact += f"- rerun after patch: {commands[0]}\n"
+                compact += f"- relevant rerun command: {commands[0]}\n"
             state.add_feedback(f"{compact}\n{reason}: {truncate_text(detail, 600)}")
         else:
             state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}{next_command}")
@@ -1209,7 +1201,7 @@ def repair_action_start_index(state: AgentState, result: ToolResult | None = Non
 
 
 def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) -> list[Any]:
-    if repair_mode not in {"must_edit", "quality_repair", "targeted_repair"}:
+    if repair_mode not in {"must_edit", "quality_repair"}:
         return definitions
     allowed = allowed_tools_for_repair_mode_name(repair_mode)
     return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
@@ -1218,8 +1210,8 @@ def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) ->
 def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState) -> list[Any]:
     refresh_targeted_repair_phase(state)
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
-        allowed = targeted_repair_allowed_tools_for_phase(state)
-        return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
+        forbidden = targeted_repair_hard_forbidden_tools(state)
+        return [definition for definition in definitions if getattr(definition, "name", None) not in forbidden]
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     workflow = workflow_snapshot(state, status_output)
     if crawler_source_research_priority_active(state, workflow):
@@ -1240,6 +1232,10 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState
 
 def repair_mode_tool_block(state: AgentState, tool_name: str) -> str:
     refresh_targeted_repair_phase(state)
+    if state.repair_mode == "targeted_repair" and state.active_repair_action:
+        if tool_name in targeted_repair_hard_forbidden_tools(state):
+            return repair_mode_forbidden_detail(state, tool_name)
+        return ""
     if state.repair_mode not in {"must_edit", "quality_repair", "targeted_repair"}:
         return ""
     allowed = allowed_tools_for_repair_mode(state)
@@ -1250,8 +1246,15 @@ def repair_mode_tool_block(state: AgentState, tool_name: str) -> str:
 
 def allowed_tools_for_repair_mode(state: AgentState) -> set[str]:
     if state.repair_mode == "targeted_repair":
-        return targeted_repair_allowed_tools_for_phase(state)
+        return allowed_tools_for_repair_mode_name(state.repair_mode) - targeted_repair_hard_forbidden_tools(state)
     return allowed_tools_for_repair_mode_name(state.repair_mode)
+
+
+def targeted_repair_hard_forbidden_tools(state: AgentState) -> set[str]:
+    action = state.active_repair_action or {}
+    explicitly_forbidden = {str(tool) for tool in action.get("forbidden_tools") or [] if str(tool)}
+    unsafe_forbidden = {"web_search", "fetch_url", "preview", "logs"}
+    return explicitly_forbidden & unsafe_forbidden
 
 
 def targeted_repair_allowed_tools_for_phase(state: AgentState) -> set[str]:
@@ -1307,8 +1310,8 @@ def repair_mode_forbidden_detail(state: AgentState, tool_name: str) -> str:
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         instruction = str(state.active_repair_action.get("instruction") or "")
         return (
-            f"{tool_name} is blocked while repair_mode=targeted_repair.\n"
-            f"You must follow the active repair action:\n{instruction}"
+            f"{tool_name} is blocked by the active targeted repair action.\n"
+            f"Use local read/edit/run_command/git tools for this repair instead.\n{instruction}"
         )
     if state.repair_mode == "must_edit":
         return (
@@ -1319,46 +1322,12 @@ def repair_mode_forbidden_detail(state: AgentState, tool_name: str) -> str:
 
 
 def targeted_repair_exploration_block(state: AgentState, tool_name: str) -> str:
-    refresh_targeted_repair_phase(state)
-    if state.repair_mode != "targeted_repair" or not state.active_repair_action:
-        return ""
-    if targeted_repair_modified_target(state):
-        return ""
-    if state.targeted_repair_phase != "edit_forced":
-        return ""
-    if tool_name in {"read_file", "read_file_range", "read_symbol", "search", "list_files", "run_command", "web_search", "fetch_url"}:
-        targets = state.active_repair_action.get("target_files") or []
-        target_text = ", ".join(str(target) for target in targets) or "the target file"
-        return f"You have already inspected enough context for the active targeted repair. Modify {target_text} now."
+    _ = state, tool_name
     return ""
 
 
 def targeted_repair_action_block(state: AgentState, tool_name: str, args: dict[str, object]) -> str:
-    refresh_targeted_repair_phase(state)
-    if state.repair_mode != "targeted_repair" or not state.active_repair_action:
-        return ""
-    targets = targeted_repair_targets(state)
-    if not targets:
-        return ""
-    target_text = ", ".join(sorted(targets))
-    if targeted_repair_modified_target(state):
-        if tool_name == "run_command":
-            return targeted_repair_rerun_command_block(state, args)
-        return ""
-    if tool_name in {"git_status", "git_diff"}:
-        return ""
-    if tool_name == "run_command":
-        return f"Active targeted repair requires modifying {target_text} before running commands."
-    if tool_name in {"write_file", "edit_file", "replace_in_file"}:
-        path = normalize_workspace_relative_path(str(args.get("path") or ""))
-        if path and path_matches_any_target(path, targets):
-            return ""
-        return f"Active targeted repair requires modifying {target_text}; attempted edit target was {path or '<missing>'}."
-    if tool_name == "apply_patch":
-        patch = str(args.get("patch") or "")
-        if patch_touches_any_target(patch, targets):
-            return ""
-        return f"Active targeted repair patch must touch {target_text}."
+    _ = state, tool_name, args
     return ""
 
 
@@ -1705,46 +1674,23 @@ def targeted_repair_forced_tool(
     tool_name: str,
     args: dict[str, object] | None = None,
 ) -> tuple[str, dict[str, object], str] | None:
-    if state.repair_mode != "targeted_repair" or not state.active_repair_action:
-        status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
-        workflow = workflow_snapshot(state, status_output)
-        if workflow.phase != WorkflowPhase.TEST_REQUIRED:
-            return None
-        if missing_must_modify_targets(state):
-            return None
-        missing = list(getattr(workflow, "missing_commands", None) or [])
-        if not missing:
-            return None
-        command = str(missing[0])
-        observed = " ".join(str((args or {}).get("command") or "").split()) if tool_name == "run_command" else ""
-        if tool_name == "run_command" and commands_equivalent(observed, command):
-            return None
-        return "run_command", {"command": command}, "test_required_requires_exact_command"
+    if state.repair_mode == "targeted_repair" and state.active_repair_action:
+        return None
 
-    targets = sorted(targeted_repair_targets(state))
-    if not targets:
+    status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
+    workflow = workflow_snapshot(state, status_output)
+    if workflow.phase != WorkflowPhase.TEST_REQUIRED:
         return None
-    target = preferred_targeted_repair_target(state, targets)
-    if targeted_repair_modified_target(state):
-        command = next_targeted_repair_rerun_command(state)
-        if not command:
-            return None
-        observed = " ".join(str((args or {}).get("command") or "").split()) if tool_name == "run_command" else ""
-        if tool_name == "run_command" and commands_equivalent(observed, command):
-            return None
-        return "run_command", {"command": command}, "active_repair_requires_exact_rerun"
-    refresh_targeted_repair_phase(state)
-    if state.targeted_repair_phase == "edit_forced" and tool_name not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
+    if missing_must_modify_targets(state):
         return None
-    read_count = targeted_repair_read_count(state)
-    if read_count <= 0 and tool_name in {"run_command", "git_status", "git_diff", "search", "list_files"}:
-        return (
-            "read_file",
-            {"path": target},
-            "active_repair_requires_inspection_or_patch",
-        )
-    if read_count > 0 and tool_name in {"run_command", "read_file", "search", "list_files"}:
+    missing = list(getattr(workflow, "missing_commands", None) or [])
+    if not missing:
         return None
+    command = str(missing[0])
+    observed = " ".join(str((args or {}).get("command") or "").split()) if tool_name == "run_command" else ""
+    if tool_name == "run_command" and commands_equivalent(observed, command):
+        return None
+    return "run_command", {"command": command}, "test_required_requires_exact_command"
     return None
 
 
