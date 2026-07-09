@@ -1,0 +1,21 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: DoCodeDev/Dockerfile
+    volumes:
+      - ./.docode:/app/.docode
+      - ./.docode_artifacts:/app/.docode_artifacts
+    ports:
+      - "8110:8110"
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: DoCodeDev/frontend/Dockerfile
+    environment:
+      DOCODE_API_PROXY_TARGET: http://backend:8110
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"

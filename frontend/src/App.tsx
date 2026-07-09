@@ -92,11 +92,15 @@ function App() {
   }, [refreshJobs]);
 
   useEffect(() => {
-    if (!selectedJobId) {
+    const selectedJob = selectedJobId;
+
+    if (!selectedJob) {
       setSelectedJob(null);
       setSteps([]);
       return;
     }
+
+    const jobId: string = selectedJob;
 
     const controller = new AbortController();
     setSelectedJob(null);
@@ -106,7 +110,7 @@ function App() {
 
     async function loadAndStream() {
       try {
-        const [job, existingSteps] = await Promise.all([getJob(selectedJobId, authToken), getSteps(selectedJobId, authToken)]);
+        const [job, existingSteps] = await Promise.all([getJob(jobId, authToken), getSteps(jobId, authToken)]);
         if (!controller.signal.aborted) {
           setSelectedJob(job);
           setSteps(dedupeSteps(existingSteps));
@@ -122,13 +126,13 @@ function App() {
 
       try {
         await streamJobEvents(
-          selectedJobId,
+          jobId,
           authToken,
           ({ event, data }) => {
             if (event === 'status' && isRecord(data)) {
               const nextStatus = data.status;
               if (typeof nextStatus === 'string') {
-                patchJobStatus(selectedJobId, nextStatus as JobStatus);
+                patchJobStatus(jobId, nextStatus as JobStatus);
               }
             }
             if (event === 'step' && isRecord(data)) {
@@ -137,10 +141,10 @@ function App() {
             if (event === 'done' && isRecord(data)) {
               const nextStatus = typeof data.status === 'string' ? (data.status as JobStatus) : undefined;
               if (nextStatus) {
-                patchJobStatus(selectedJobId, nextStatus);
+                patchJobStatus(jobId, nextStatus);
               }
               setStreaming(false);
-              void getJob(selectedJobId, authToken).then((job) => {
+              void getJob(jobId, authToken).then((job) => {
                 if (!controller.signal.aborted) {
                   setSelectedJob(job);
                   upsertJob(setJobs, job);
@@ -495,7 +499,7 @@ function stepTitle(step: StepEventPayload): string {
     return `Tool result: ${step.tool ?? 'unknown'}`;
   }
   if (step.type) {
-    return step.type.replaceAll('_', ' ');
+    return step.type.split('_').join(' ');
   }
   return step.kind;
 }

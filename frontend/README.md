@@ -28,6 +28,16 @@ npm run dev
 
 Vite proxies `/v1` and `/health` to `http://localhost:8110`, so the app can call the API without extra CORS configuration.
 
+## Docker development
+
+From the DoCodeDev root, start both services together:
+
+```bash
+docker compose up --build
+```
+
+The frontend container listens on `http://localhost:5173` and proxies API calls to the backend container.
+
 ## Production build
 
 ```bash

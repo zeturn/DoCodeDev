@@ -29,7 +29,6 @@ RUN pip install \
     hatchling \
     editables
 
-COPY WeavInt/packages/weav-core /src/weav-core
 COPY weav-ai-core /src/weav-ai-core
 COPY weav-ai-providers /src/weav-ai-providers
 COPY weav-ai-runtime /src/weav-ai-runtime
@@ -37,7 +36,6 @@ COPY DoCodeDev /src/DoCodeDev
 COPY --from=frontend-builder /app/frontend/dist /src/DoCodeDev/frontend/dist
 
 RUN pip install --no-deps --no-build-isolation \
-    -e /src/weav-core \
     -e /src/weav-ai-core \
     -e /src/weav-ai-providers \
     -e /src/weav-ai-runtime \

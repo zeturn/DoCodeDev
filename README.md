@@ -35,6 +35,16 @@ python -m pip install -e ".[dev]"
 uvicorn docode.main:app --reload --port 8110
 ```
 
+## Docker Development
+
+Run the backend and frontend together:
+
+```bash
+docker compose up --build
+```
+
+Open the backend at `http://localhost:8110` and the frontend dev server at `http://localhost:5173`.
+
 Recommended deterministic test command:
 
 ```bash

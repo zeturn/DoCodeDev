@@ -244,6 +244,8 @@ async def require_owned_job(repository: JobRepository, job_id: str, user: UserCo
     job = await repository.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if user.user_id == "local":
+        return job
     if job.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="job not found")
     return job

@@ -52,7 +52,9 @@ def make_jobs_router(repository: JobRepository, queue: AsyncJobQueue, config: Do
                 allowed = ", ".join(status.value for status in JobStatus)
                 raise HTTPException(status_code=400, detail=f"unsupported job status '{status}', expected one of: {allowed}") from exc
 
-        jobs = [job for job in await repository.list_jobs(status_filter) if job.user_id == user.user_id]
+        jobs = await repository.list_jobs(status_filter)
+        if user.user_id != "local":
+            jobs = [job for job in jobs if job.user_id == user.user_id]
         jobs.sort(key=lambda job: job.created_at, reverse=True)
         return jsonable_encoder([public_job_dict(job) for job in jobs])
 
