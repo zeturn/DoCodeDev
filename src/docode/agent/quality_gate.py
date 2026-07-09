@@ -173,7 +173,12 @@ def detect_duplicate_python_implementations(diff: str) -> list[QualityIssue]:
     for path, text in split_diff_by_file(diff).items():
         if not path.endswith(".py"):
             continue
-        main_count = text.count('if __name__ == "__main__"') + text.count("if __name__ == '__main__'")
+        added_lines = [line[1:] for line in text.splitlines() if line.startswith("+") and not line.startswith("+++")]
+        main_count = sum(
+            1
+            for line in added_lines
+            if 'if __name__ == "__main__"' in line or "if __name__ == '__main__'" in line
+        )
         if main_count > 1:
             issues.append(
                 QualityIssue(

@@ -154,15 +154,22 @@ class DoBoxTools:
         cwd_error = workspace_path_error(cwd, label="cwd")
         if cwd_error:
             return rejected_tool_result("run_command", cwd_error, {"command": command, "cwd": cwd})
+        executable_command = python_portable_command(command)
         result = await self.client.run_command(
             self.project_id,
-            ["bash", "-lc", command],
+            ["bash", "-lc", executable_command],
             cwd=cwd,
             timeout_sec=self.command_timeout_seconds,
             output_limit=self.output_limit_bytes,
             agent_session_id=self.agent_session_id,
         )
-        return self._compress("run_command", result.output, result.exit_code, {"command": command, "cwd": cwd}, truncated=result.truncated)
+        return self._compress(
+            "run_command",
+            result.output,
+            result.exit_code,
+            {"command": command, "cwd": cwd, "executed_command": executable_command},
+            truncated=result.truncated,
+        )
 
     async def read_file(self, path: str) -> ToolResult:
         path_error = workspace_path_error(path)
@@ -631,6 +638,14 @@ def package_script_exists_command(script: str) -> str:
         "node -e \"const p=require('./package.json'); "
         f"process.exit(p.scripts && p.scripts['{script}'] ? 0 : 1)\""
     )
+
+
+def python_portable_command(command: str) -> str:
+    prefix = (
+        "if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; "
+        "then python() { python3 \"$@\"; }; export -f python; fi; "
+    )
+    return prefix + command
 
 
 def preview_output(data: dict[str, Any]) -> str:

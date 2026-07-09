@@ -13,10 +13,12 @@ class FakeDoBoxClient:
         self.agent_session_ids: list[str | None] = []
         self.files: dict[str, str] = {"README.md": "hello\nworld\n"}
         self.written_files: list[tuple[str, str]] = []
+        self.commands: list[str] = []
 
     async def run_command(self, project_id, command, cwd="/workspace", timeout_sec=120, output_limit=1_000_000, agent_session_id=None):
         self.agent_session_ids.append(agent_session_id)
         command_text = " ".join(command) if isinstance(command, list) else str(command)
+        self.commands.append(command_text)
         if "p.scripts && p.scripts['test']" in command_text:
             return CommandResult("yes", 0 if "test" in self.package_scripts else 1)
         if "p.scripts && p.scripts['build']" in command_text:
@@ -71,6 +73,16 @@ class FakeDoBoxClient:
 
 
 class DoBoxToolsTests(IsolatedAsyncioTestCase):
+    async def test_run_command_adds_python3_fallback_but_preserves_original_metadata(self) -> None:
+        client = FakeDoBoxClient()
+        tools = DoBoxTools(client, "p1")
+
+        result = await tools.run_command("python crawler.py --dry-run")
+
+        self.assertIn("python() { python3", client.commands[-1])
+        self.assertEqual(result.metadata["command"], "python crawler.py --dry-run")
+        self.assertIn("python crawler.py --dry-run", result.metadata["executed_command"])
+
     async def test_detects_go_test_command(self) -> None:
         tools = DoBoxTools(FakeDoBoxClient(), "p1")
         self.assertEqual(await tools.detect_test_command(), "go test ./...")

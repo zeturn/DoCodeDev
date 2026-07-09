@@ -157,7 +157,7 @@ class CodingAgentLoop:
                     await self.record_model_failure(state, "llm_auth_failed", str(exc))
                     return await self.fail(job.id, "llm_auth_failed")
                 current_workflow = workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else "")
-                if current_workflow.phase == WorkflowPhase.FINAL_READY and not state.active_repair_action:
+                if current_workflow.phase == WorkflowPhase.FINAL_READY and not state.active_repair_action and state.repair_mode is None:
                     finalized = await self.auto_finalize_ready_workflow(
                         state,
                         reason="final_ready_llm_decision_failed",
@@ -336,7 +336,7 @@ class CodingAgentLoop:
                                 "detail": "Cleared stale targeted repair state because required workflow commands are already satisfied.",
                             },
                         )
-                    if not state.active_repair_action:
+                    if state.repair_mode is None and not state.active_repair_action:
                         finalized = await self.auto_finalize_ready_workflow(
                             state,
                             reason="final_ready_tool_auto_finalized",
@@ -457,7 +457,9 @@ class CodingAgentLoop:
         status = await self.tools.git_status()
         state.latest_git_status = status
         current_workflow = workflow_snapshot(state, status.output)
-        if current_workflow.phase != WorkflowPhase.FINAL_READY or state.active_repair_action:
+        if current_workflow.phase != WorkflowPhase.FINAL_READY:
+            return None
+        if state.active_repair_action and not targeted_repair_rerun_satisfied(state):
             return None
         return await self.auto_finalize_ready_workflow(
             state,
@@ -1257,6 +1259,8 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
     blockers = list(result.blockers())
     if not blockers:
         return None
+    if all(issue.code == "json_artifact_missing" for issue in blockers):
+        return None
     target_files: list[str] = []
     rerun_commands: list[str] = []
     lines = ["Quality gate blocked finalization. Modify the listed target file(s) before running commands again."]
@@ -1689,7 +1693,7 @@ def targeted_repair_rerun_satisfied(state: AgentState) -> bool:
     action = state.active_repair_action or {}
     commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
     if not commands:
-        return bool(action) and targeted_repair_modified_target(state)
+        return bool(action) and (targeted_repair_modified_target(state) or targeted_repair_target_changed_in_status(state))
     if not targeted_repair_modified_target(state):
         return False
     for message in reversed(state.messages[state.active_repair_started_at :]):
@@ -1707,6 +1711,22 @@ def targeted_repair_rerun_satisfied(state: AgentState) -> bool:
             if commands_equivalent(observed, expected):
                 return True
     return False
+
+
+def targeted_repair_target_changed_in_status(state: AgentState) -> bool:
+    targets = targeted_repair_targets(state)
+    if not targets or state.latest_git_status is None:
+        return False
+    changed = changed_paths_from_status(state.latest_git_status.output)
+    return any(status_change_covers_target(path, target) for path in changed for target in targets)
+
+
+def status_change_covers_target(path: str, target: str) -> bool:
+    changed = normalize_workspace_relative_path(path).rstrip("/")
+    wanted = normalize_workspace_relative_path(target).rstrip("/")
+    if not changed or not wanted:
+        return False
+    return changed == wanted or wanted.startswith(f"{changed}/") or changed.startswith(f"{wanted}/")
 
 
 def targeted_rerun_missing_detail(state: AgentState) -> str:

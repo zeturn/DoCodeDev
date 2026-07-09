@@ -22,15 +22,17 @@ from docode.agent.loop import (
     latest_failed_required_command,
     preferred_targeted_repair_target,
     refine_repair_action_targets,
+    repair_action_from_quality_gate,
     required_test_tool_block,
     repair_mode_tool_block,
     task_contract_source_targets,
     targeted_repair_action_block,
     targeted_repair_exploration_block,
     targeted_repair_forced_tool,
+    targeted_repair_rerun_satisfied,
     verification_repair_feedback,
 )
-from docode.agent.quality_gate import QualityGateResult
+from docode.agent.quality_gate import QualityGateResult, QualityIssue
 from docode.agent.repair_planner import RepairAction
 from docode.agent.reviewer import ReviewResult
 from docode.agent.stop_policy import StopPolicy
@@ -907,6 +909,43 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
             self.assertEqual(result.result_summary, "Completed the requested changes in README.md.")
+            steps = await repo.list_steps(job.id)
+            auto = [step for step in steps if step.content.get("type") == "auto_final_candidate"]
+            self.assertEqual(auto[0].content["reason"], "final_ready_stop_policy_auto_finalized")
+
+    async def test_agent_loop_auto_finalizes_after_satisfied_no_rerun_repair_at_iteration_budget(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update readme"))
+            tools = FakeTools()
+            tools.files["README.md"] = "done\n"
+            state = AgentState(job=job)
+            state.inspection = SimpleNamespace()
+            state.task_contract = TaskContract(must_modify_files=["README.md"])
+            state.repair_mode = "targeted_repair"
+            state.active_repair_started_at = 0
+            state.active_repair_action = {
+                "category": "quality_gate_repair",
+                "signature": "quality:missing_artifact",
+                "target_files": ["README.md"],
+                "rerun_commands": [],
+            }
+            state.messages.append({"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "README.md"}})
+
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=tools,
+                verifier=PassingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=3, max_runtime_seconds=60),
+                quality_gate=PassingQualityGate(),
+            )
+
+            result = await loop.maybe_auto_finalize_before_stop(state, "max_iterations_exceeded")
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
             steps = await repo.list_steps(job.id)
             auto = [step for step in steps if step.content.get("type") == "auto_final_candidate"]
             self.assertEqual(auto[0].content["reason"], "final_ready_stop_policy_auto_finalized")
@@ -2382,6 +2421,47 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(set(names), {"read_file", "write_file", "run_command", "git_status"})
         self.assertIsNone(forced)
+
+    def test_no_rerun_artifact_repair_is_satisfied_by_target_in_git_status(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Build crawler.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {
+            "category": "quality_gate_repair",
+            "signature": "quality:json_artifact_missing",
+            "target_files": ["data/output.json"],
+            "rerun_commands": [],
+        }
+        state.latest_git_status = ToolResult(tool="git_status", output=" M crawler.py\n?? data/\n", exit_code=0)
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "edit_file", "exit_code": 0, "metadata": {"path": "crawler.py"}},
+                {
+                    "role": "tool",
+                    "tool": "run_command",
+                    "exit_code": 0,
+                    "output": "Wrote 15 records to data/output.json\n",
+                    "metadata": {"command": "python3 crawler.py --url https://github.com/trending --output data/output.json --dry-run"},
+                },
+            ]
+        )
+
+        self.assertTrue(targeted_repair_rerun_satisfied(state))
+
+    def test_json_artifact_missing_uses_quality_repair_not_targeted_repair(self) -> None:
+        result = QualityGateResult(
+            passed=False,
+            issues=[
+                QualityIssue(
+                    severity="blocker",
+                    code="json_artifact_missing",
+                    path="data/output.json",
+                    message="Requested JSON artifact is missing or unreadable: data/output.json",
+                )
+            ],
+        )
+
+        self.assertIsNone(repair_action_from_quality_gate(result))
 
     def test_failed_repair_rerun_allows_same_target_edit_again(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py."))

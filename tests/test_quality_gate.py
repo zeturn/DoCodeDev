@@ -5,6 +5,7 @@ from unittest import IsolatedAsyncioTestCase
 
 from docode.agent.quality_gate import QualityGate
 from docode.agent.quality_gate import detect_empty_markdown_sections
+from docode.agent.quality_gate import detect_duplicate_python_implementations
 from docode.agent.task_contract import TaskContract
 from docode.dobox.types import ToolResult
 
@@ -219,3 +220,25 @@ class QualityGateTests(IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(any(issue.code == "markdown_section_empty" and issue.path == "README.md" for issue in issues))
+
+    def test_duplicate_entrypoint_ignores_unchanged_diff_context(self) -> None:
+        issues = detect_duplicate_python_implementations(
+            "diff --git a/crawler.py b/crawler.py\n"
+            "@@\n"
+            " if __name__ == \"__main__\":\n"
+            "-    old_main()\n"
+            "+    main()\n"
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_duplicate_entrypoint_blocks_multiple_added_entrypoints(self) -> None:
+        issues = detect_duplicate_python_implementations(
+            "diff --git a/crawler.py b/crawler.py\n"
+            "+if __name__ == \"__main__\":\n"
+            "+    main()\n"
+            "+if __name__ == \"__main__\":\n"
+            "+    other_main()\n"
+        )
+
+        self.assertTrue(any(issue.code == "duplicate_python_entrypoint" for issue in issues))
