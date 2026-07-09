@@ -99,19 +99,21 @@ Real LLM with real DoBox README and calculator:
 PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_smoke
 ```
 
-Generic local crawler CLI smoke with real LLM and real DoBox:
+Generic local crawler CLI smoke with real LLM and real DoBox. This is the currently validated crawler capability:
 
 ```bash
 PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_crawler_smoke
 ```
 
-Neutral external-source crawler CLI smoke with real LLM and real DoBox:
+Diagnostic neutral external-source crawler CLI smoke with real LLM and real DoBox:
 
 ```bash
 DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_external_crawler_smoke
 ```
 
-The real LLM smoke exchanges the BasaltPass subject token for an APICred token and selects a `deepseek` model from the APICred model catalog by default when that configuration is present. Set `DOCODE_REAL_LLM_PROVIDER` or `DOCODE_REAL_LLM_MODEL` to override the selected catalog entry. The real DoBox smoke uses local fixtures; the combined real LLM + real DoBox tests use the same credential settings as `tests.test_real_llm_smoke`. The external-source crawler smoke uses a test-harness mock HTTP source and may need `DOCODE_EXTERNAL_CRAWLER_SOURCE_HOST` when the default host route is not reachable from the DoBox sandbox.
+The real LLM smoke exchanges the BasaltPass subject token for an APICred token and selects a `deepseek` model from the APICred model catalog by default when that configuration is present. Set `DOCODE_REAL_LLM_PROVIDER` or `DOCODE_REAL_LLM_MODEL` to override the selected catalog entry. The real DoBox smoke uses local fixtures; the combined real LLM + real DoBox tests use the same credential settings as `tests.test_real_llm_smoke`. The external-source crawler smoke uses a test-harness mock HTTP source and may need `DOCODE_EXTERNAL_CRAWLER_SOURCE_HOST` when the default host route is not reachable from the DoBox sandbox. It is a diagnostic frontier eval, not a release gate, and may fail due to real LLM repair behavior even when the default deterministic tests and the generic local crawler CLI smoke pass.
+
+Default deterministic discovery remains the release gate for this MVP. The local crawler CLI smoke is the validated crawler path; external-source crawling is implemented as the next diagnostic frontier.
 
 Integration matrix:
 

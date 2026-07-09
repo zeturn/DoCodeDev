@@ -63,6 +63,14 @@ FORBIDDEN_STRINGS = (
 
 @skipUnless(os.getenv("DOCODE_REAL_DOBOX_SMOKE") == "1", "set DOCODE_REAL_DOBOX_SMOKE=1 to run the real DoBox external crawler smoke")
 class RealDoBoxExternalCrawlerSmokeTests(IsolatedAsyncioTestCase):
+    """Diagnostic frontier eval for real external-source crawler repair traces.
+
+    This optional smoke intentionally keeps strict source-evidence and command
+    assertions, but it is not expected to pass deterministically across real
+    models. Use failures to inspect source reachability, fetch_url evidence,
+    and multi-stage repair-loop behavior; do not treat it as a release gate.
+    """
+
     async def test_real_llm_real_dobox_external_crawler_cli_smoke(self) -> None:
         if not REAL_LLM_SMOKE_ENABLED:
             self.skipTest("set DOCODE_REAL_LLM_SMOKE=1 with DOCODE_REAL_DOBOX_SMOKE=1 to run the real LLM + real DoBox external crawler smoke")

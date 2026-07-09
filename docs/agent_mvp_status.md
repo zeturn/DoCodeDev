@@ -20,11 +20,20 @@ This document captures the current validated agent MVP before adding more crawle
 ## Added Optional Evals
 
 - Neutral external-source crawler CLI smoke: `tests.test_real_dobox_external_crawler_smoke`.
-  - Skipped by default.
+  - Implemented, but currently unstable and diagnostic only.
+  - Skipped by default and not a release gate.
   - Uses a test-harness mock HTTP source with neutral product records.
   - Requires both real LLM and real DoBox flags.
   - The harness first verifies that the mock source URL is reachable from both host-side `fetch_url` and the DoBox sandbox. If the host-to-sandbox route is unavailable, the test skips with a reachability diagnostic.
-  - This eval is not listed as a validated capability until it passes in the integration environment.
+  - Current observed integration behavior:
+    - source URL selection works;
+    - host fetch works;
+    - DoBox sandbox fetch works;
+    - `fetch_url` evidence works with HTTP 200;
+    - `crawler.py` is modified;
+    - `out.json` may be produced;
+    - remaining failures are model repair quality, incomplete CLI `--output` handling, and multi-stage repair-loop behavior.
+  - This eval is useful for collecting real repair-loop traces, but it is not listed as a validated capability until it passes consistently in the integration environment.
 
 ## Non-Goals
 
@@ -38,6 +47,7 @@ This document captures the current validated agent MVP before adding more crawle
 - Optional integration tests require a reachable DoBox backend and configured LLM credentials.
 - DoBox sandbox setup may need a `python` to `python3` alias for smoke commands that intentionally use `python`.
 - The external-source crawler smoke may need `DOCODE_EXTERNAL_CRAWLER_SOURCE_HOST` when `host.docker.internal` or the host LAN address is not reachable from the DoBox sandbox.
+- The neutral external-source crawler eval is a diagnostic frontier eval. It is expected to expose real model behavior variance and may fail with `max_iterations_exceeded` even when the release-gate deterministic suite and validated local crawler CLI smoke pass.
 - Production still has old suggested command hints such as `python3` entrypoint hints for calculator.py and cli.py style tasks.
 - Crawler/source policy is still partly embedded in verifier and loop code. It should eventually move into a clearer policy/plugin boundary.
 - Optional real LLM tests are intentionally skipped by default and may fail for model-behavior reasons even when the deterministic suite passes.
@@ -83,10 +93,12 @@ Real LLM with real DoBox generic local crawler CLI:
 PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_crawler_smoke
 ```
 
-Optional neutral external-source crawler CLI:
+Optional diagnostic neutral external-source crawler CLI:
 
 ```bash
 DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_dobox_external_crawler_smoke
 ```
+
+This command is diagnostic only. It is not part of the default release gate; the currently validated crawler capability is the generic local crawler CLI smoke.
 
 The real LLM commands use the existing provider configuration. By default the optional real LLM helper resolves a DeepSeek model through BasaltPass/APICred when those environment variables are configured; direct OpenAI use requires the existing explicit direct OpenAI environment switches.
