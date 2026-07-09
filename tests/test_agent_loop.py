@@ -1358,7 +1358,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIn("You already read app.py", block)
         self.assertIn("Edit the most likely target file now", block)
 
-    def test_duplicate_inspection_pressure_forces_edit_toolset(self) -> None:
+    def test_duplicate_inspection_pressure_keeps_read_file_available_with_targeted_feedback(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
         state.inspection = SimpleNamespace()
         state.task_contract = TaskContract(must_modify_files=["app.py"])
@@ -1384,8 +1384,52 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             "read_file",
         )
 
-        self.assertEqual(allowed, {"edit_file", "write_file", "git_status"})
+        self.assertEqual(allowed, {"read_file", "edit_file", "write_file", "git_status"})
         self.assertIn("repeated duplicate inspection pressure", block)
+
+    async def test_unavailable_tool_request_records_structured_feedback(self) -> None:
+        repo = InMemoryJobRepository()
+        job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py"))
+        state = AgentState(job=job)
+        state.inspection = SimpleNamespace()
+        state.task_contract = TaskContract(must_modify_files=["parser.py"])
+        state.latest_git_status = ToolResult(tool="git_status", output="")
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "parser.py"}},
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "fixtures/items.json"}},
+                {
+                    "role": "system",
+                    "kind": "feedback",
+                    "content": "duplicate_inspection_after_edit_pressure: You already read fixtures/items.json",
+                },
+            ]
+        )
+        with TemporaryDirectory() as tmp:
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=FakeTools(),
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            await loop.record_unavailable_tool_requested(
+                state,
+                requested_tool="read_file",
+                requested_args={"path": "fixtures/items.json"},
+                available_tools=["write_file", "edit_file", "replace_in_file", "apply_patch"],
+                workflow_state={"phase": "EDIT_REQUIRED"},
+            )
+
+        steps = await repo.list_steps(job.id)
+        self.assertEqual(steps[-1].content["type"], "unavailable_tool_requested")
+        self.assertEqual(steps[-1].content["requested_tool"], "read_file")
+        self.assertIn("write_file", steps[-1].content["available_tools"])
+        self.assertIn("unavailable_tool_requested", state.messages[-1]["content"])
+        self.assertIn("You must edit parser.py now", state.messages[-1]["content"])
+        self.assertEqual(state.consecutive_failures, 0)
 
     def test_duplicate_read_file_rejection_escalates_after_first_warning(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py"))
@@ -1406,7 +1450,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         block = duplicate_read_file_block(state, workflow, "read_file", {"path": "fixtures/items.json"})
 
-        self.assertIn("read_file tool is not available now", block)
+        self.assertIn("Another read_file call is not useful now", block)
         self.assertIn("Candidate target files: parser.py", block)
 
     def test_duplicate_read_file_suppression_allows_new_file_before_threshold_and_after_edit(self) -> None:

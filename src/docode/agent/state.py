@@ -100,6 +100,7 @@ def feedback_counts_as_consecutive_failure(content: str) -> bool:
         "test_required_tool_forbidden",
         "run this exact verification command before final_candidate",
         "run_command now with exactly",
+        "unavailable_tool_requested",
     )
     if any(marker in text for marker in required_command_markers):
         return False

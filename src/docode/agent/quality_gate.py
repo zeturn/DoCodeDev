@@ -314,6 +314,16 @@ def inferred_json_artifact_paths(instruction: str, task_contract: TaskContract |
 async def inspect_json_artifact(tools: DoBoxTools, path: str, instruction: str) -> tuple[list[QualityIssue], ArtifactSample | None]:
     result = await safe_optional_tool_call("read_file", tools, path)
     if result.exit_code != 0:
+        if json_path_explicitly_requested(path, instruction):
+            return [
+                QualityIssue(
+                    severity="blocker",
+                    code="json_artifact_missing",
+                    path=path,
+                    message=f"Requested JSON artifact is missing or unreadable: {path}",
+                    repair_hint="Create the requested output JSON file before final verification.",
+                )
+            ], None
         return [], None
     try:
         data = json.loads(result.output)
@@ -440,11 +450,23 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
 
 def inferred_required_json_fields(instruction: str) -> list[str]:
     lowered = instruction.lower()
-    if "github" in lowered and ("trending" in lowered or "repository" in lowered or "repo" in lowered):
+    if github_repository_json_task(lowered):
         return ["__github_repository__", "url"]
-    if "crawler" in lowered or "scraper" in lowered or "爬虫" in lowered:
-        return ["url"]
     return []
+
+
+def github_repository_json_task(lowered_instruction: str) -> bool:
+    return "github" in lowered_instruction and any(
+        keyword in lowered_instruction for keyword in ("trending", "repository", "repositories", "repo")
+    )
+
+
+def json_path_explicitly_requested(path: str, instruction: str) -> bool:
+    normalized = path.strip("./").replace("\\", "/").lower()
+    for match in re.findall(r"\b[\w./-]+\.json\b", instruction or ""):
+        if match.strip("./").replace("\\", "/").lower() == normalized:
+            return True
+    return False
 
 
 def github_repository_value(row: dict[str, Any]) -> Any:

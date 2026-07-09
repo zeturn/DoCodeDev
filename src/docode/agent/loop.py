@@ -191,6 +191,17 @@ class CodingAgentLoop:
                     )
                     tool_name = "write_file"
                     tool_args = review_retargeted_args
+                current_tools = allowed_tool_definitions_for_state(self.tools.definitions(), state)
+                current_tool_names = {str(getattr(definition, "name", "")) for definition in current_tools}
+                if current_tool_names and tool_name not in current_tool_names:
+                    await self.record_unavailable_tool_requested(
+                        state,
+                        requested_tool=tool_name,
+                        requested_args=tool_args,
+                        available_tools=sorted(current_tool_names),
+                        workflow_state=current_workflow.to_dict(),
+                    )
+                    continue
                 repair_tool_block = repair_mode_tool_block(state, tool_name)
                 if repair_tool_block:
                     await self.record_rejected_decision(
@@ -817,6 +828,49 @@ class CodingAgentLoop:
             state.add_feedback(f"{reason}: {truncate_text(detail, 1000)}{next_command}")
         state.iteration += 1
 
+    async def record_unavailable_tool_requested(
+        self,
+        state: AgentState,
+        *,
+        requested_tool: str,
+        requested_args: dict[str, object],
+        available_tools: list[str],
+        workflow_state: dict[str, object] | None = None,
+    ) -> None:
+        self.sync_llm_usage(state)
+        edit_pressure = duplicate_inspection_edit_forced(
+            state,
+            workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else ""),
+        )
+        reason = "tool_not_in_current_schema"
+        payload: dict[str, object] = {
+            "type": "unavailable_tool_requested",
+            "requested_tool": requested_tool,
+            "available_tools": available_tools,
+            "requested_args": sanitize_tool_args(requested_args),
+            "reason": reason,
+        }
+        if workflow_state is not None:
+            payload["workflow_state"] = workflow_state
+        await self.repository.add_step(state.job.id, "system", payload)
+
+        if requested_tool in LOCAL_INSPECTION_TOOLS and edit_pressure:
+            edit_tools = ", ".join(tool for tool in ("write_file", "edit_file", "replace_in_file", "apply_patch") if tool in available_tools)
+            target_files = target_candidates_for_edit_pressure(state)
+            target = target_files[0] if target_files else "the most likely target file"
+            feedback = (
+                f"unavailable_tool_requested: The requested tool `{requested_tool}` is not available in this turn.\n"
+                f"The available editing tools are: {edit_tools or ', '.join(available_tools)}.\n"
+                f"You already inspected the relevant files. You must edit {target} now."
+            )
+        else:
+            feedback = (
+                f"unavailable_tool_requested: The requested tool `{requested_tool}` is not present in the current tool schema.\n"
+                f"Available tools: {', '.join(available_tools)}."
+            )
+        state.add_feedback(feedback)
+        state.iteration += 1
+
     def sync_llm_usage(self, state: AgentState) -> None:
         if self.usage_meter is not None:
             state.llm_tokens_used = self.usage_meter.total_tokens
@@ -1263,7 +1317,7 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState
         allowed = initial_crawler_source_tools(state)
         return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     if duplicate_inspection_edit_forced(state, workflow):
-        allowed = EDIT_TOOLS | {"git_status", "git_diff"}
+        allowed = EDIT_TOOLS | LOCAL_INSPECTION_TOOLS
         return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     if (
         workflow.phase == WorkflowPhase.EDIT_REQUIRED
@@ -1739,7 +1793,7 @@ def duplicate_read_file_block(state: AgentState, workflow: Any, tool_name: str, 
         return (
             f"You already read {path}, and its content is still available in context.\n"
             "The git diff is still empty.\n"
-            "The read_file tool is not available now. Available next tools: write_file, edit_file, replace_in_file, apply_patch, git_status, git_diff.\n"
+            "Another read_file call is not useful now. Available next tools: write_file, edit_file, replace_in_file, apply_patch, git_status, git_diff.\n"
             "Do not call read_file again. Edit the most likely source file now; use write_file if exact replacement text is uncertain."
             f"{target_text}"
         )

@@ -323,7 +323,7 @@ def commands_equivalent(observed: str, expected: str) -> bool:
     if observed == expected:
         return True
     if is_compound_shell_command(observed):
-        return False
+        return compound_command_contains_success_segment(observed, expected)
     if observed.endswith(" -v") and observed[: -3] == expected:
         return True
     if expected.endswith(" -v") and expected[: -3] == observed:
@@ -337,6 +337,14 @@ def commands_equivalent(observed: str, expected: str) -> bool:
 
 def is_compound_shell_command(command: str) -> bool:
     return any(token in command for token in (";", "&&", "||", "|", "`", "$("))
+
+
+def compound_command_contains_success_segment(observed: str, expected: str) -> bool:
+    if any(token in observed for token in (";", "||", "|", "`", "$(")):
+        return False
+    if "&&" not in observed:
+        return False
+    return any(commands_equivalent(segment.strip(), expected) for segment in observed.split("&&") if segment.strip())
 
 
 def target_file_modified_after_repair_start(state: AgentState) -> bool:

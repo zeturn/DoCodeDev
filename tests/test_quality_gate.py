@@ -10,11 +10,12 @@ from docode.dobox.types import ToolResult
 
 
 class QualityGateTools:
-    def __init__(self, *, artifact: object, diff: str | None = None) -> None:
+    def __init__(self, *, artifact: object, diff: str | None = None, artifact_path: str = "data/github_trending.json") -> None:
         self.artifact = artifact
+        self.artifact_path = artifact_path
         self.diff = diff or (
             "diff --git a/crawler.py b/crawler.py\n+print('crawler')\n"
-            "diff --git a/data/github_trending.json b/data/github_trending.json\n+[]\n"
+            f"diff --git a/{artifact_path} b/{artifact_path}\n+[]\n"
         )
 
     async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
@@ -22,14 +23,15 @@ class QualityGateTools:
         return ToolResult(tool="run_command", output="ok")
 
     async def git_status(self) -> ToolResult:
-        return ToolResult(tool="git_status", output=" A crawler.py\n A data/github_trending.json\n")
+        return ToolResult(tool="git_status", output=f" A crawler.py\n A {self.artifact_path}\n")
 
     async def git_diff(self) -> ToolResult:
         return ToolResult(tool="git_diff", output=self.diff)
 
     async def read_file(self, path: str) -> ToolResult:
-        if path == "data/github_trending.json":
-            return ToolResult(tool="read_file", output=json.dumps(self.artifact), metadata={"path": path})
+        if path == self.artifact_path:
+            output = self.artifact if isinstance(self.artifact, str) else json.dumps(self.artifact)
+            return ToolResult(tool="read_file", output=output, metadata={"path": path})
         return ToolResult(tool="read_file", output="", exit_code=1, metadata={"path": path})
 
 
@@ -105,6 +107,63 @@ class QualityGateTests(IsolatedAsyncioTestCase):
 
         self.assertTrue(result.passed)
         self.assertEqual(result.blockers(), [])
+
+    async def test_generic_json_records_do_not_require_github_fields(self) -> None:
+        result = await QualityGate().run(
+            tools=QualityGateTools(
+                artifact=[{"id": 1, "name": "Ada"}, {"id": 2, "name": "Grace"}],
+                artifact_path="out.json",
+                diff="diff --git a/crawler.py b/crawler.py\n+print('crawler')\n"
+                "diff --git a/out.json b/out.json\n+[{\"id\": 1, \"name\": \"Ada\"}]\n",
+            ),
+            task_contract=TaskContract(must_modify_files=["crawler.py"]),
+            instruction="Fix crawler.py so it parses records and the CLI writes JSON to --output out.json.",
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.blockers(), [])
+
+    async def test_github_crawler_still_requires_repository_fields(self) -> None:
+        result = await QualityGate().run(
+            tools=QualityGateTools(
+                artifact=[{"id": 1, "name": "Ada"}],
+                artifact_path="data/github_trending.json",
+            ),
+            task_contract=TaskContract(must_modify_files=["crawler.py", "data/github_trending.json"]),
+            instruction="Build a GitHub Trending repository crawler that writes data/github_trending.json",
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any(issue.code == "json_required_field_empty" for issue in result.issues))
+
+    async def test_missing_requested_json_artifact_fails(self) -> None:
+        result = await QualityGate().run(
+            tools=QualityGateTools(
+                artifact=[{"id": 1, "name": "Ada"}],
+                artifact_path="other.json",
+                diff="diff --git a/crawler.py b/crawler.py\n+print('crawler')\n",
+            ),
+            task_contract=TaskContract(must_modify_files=["crawler.py"]),
+            instruction="Fix crawler.py so it writes JSON to --output out.json.",
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any(issue.code == "json_artifact_missing" and issue.path == "out.json" for issue in result.issues))
+
+    async def test_invalid_requested_json_artifact_fails(self) -> None:
+        result = await QualityGate().run(
+            tools=QualityGateTools(
+                artifact="{not valid json",
+                artifact_path="out.json",
+                diff="diff --git a/crawler.py b/crawler.py\n+print('crawler')\n"
+                "diff --git a/out.json b/out.json\n+{not valid json\n",
+            ),
+            task_contract=TaskContract(must_modify_files=["crawler.py"]),
+            instruction="Fix crawler.py so it writes JSON to --output out.json.",
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any(issue.code == "json_artifact_invalid" for issue in result.issues))
 
     async def test_blocks_undeclared_third_party_dependency(self) -> None:
         result = await QualityGate().run(

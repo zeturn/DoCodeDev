@@ -343,6 +343,12 @@ def classify_diagnostic_failure(*, job: CodingJob, steps: list[DocodeStep], requ
 
     if job.failure_reason and "artifact" in job.failure_reason:
         return "artifact_export_failure"
+    if unavailable_tool_requested(contents):
+        return "unavailable_tool_call_loop"
+    if not missing and final_candidate_attempted(steps) and edits and job.status != JobStatus.SUCCEEDED:
+        if quality_gate_schema_field_block(contents):
+            return "quality_gate_overconstrained"
+        return "final_acceptance_blocked_after_success"
     if repair_edit_blocked_by_test_gate(contents):
         return "repair_edit_blocked_by_test_gate"
     if diagnostic_inspection_blocked_by_must_edit(contents):
@@ -368,6 +374,25 @@ def classify_diagnostic_failure(*, job: CodingJob, steps: list[DocodeStep], requ
     if job.status != JobStatus.SUCCEEDED:
         return "bad_code_edit"
     return "unknown"
+
+
+def unavailable_tool_requested(contents: list[dict[str, object]]) -> bool:
+    return any(content.get("type") == "unavailable_tool_requested" for content in contents)
+
+
+def quality_gate_schema_field_block(contents: list[dict[str, object]]) -> bool:
+    for content in contents:
+        if content.get("type") != "quality_gate" or content.get("passed") is not False:
+            continue
+        issues = content.get("issues")
+        if not isinstance(issues, list):
+            continue
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            if str(issue.get("code") or "") in {"json_required_field_empty", "json_required_field_dirty", "json_repository_invalid_format", "json_github_url_invalid"}:
+                return True
+    return False
 
 
 def repeated_successful_read_paths(tool_results: list[dict[str, object]]) -> set[str]:
@@ -550,6 +575,68 @@ class DiagnosticClassifierTests(TestCase):
         category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
 
         self.assertEqual(category, "duplicate_inspection_loop")
+
+    def test_classifier_detects_unavailable_tool_call_loop_before_duplicate_inspection(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="", status=JobStatus.FAILED, failure_reason="max_consecutive_failures_exceeded")
+        steps = [
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=0,
+                kind="system",
+                content={
+                    "type": "unavailable_tool_requested",
+                    "requested_tool": "read_file",
+                    "available_tools": ["write_file", "edit_file", "apply_patch"],
+                    "requested_args": {"path": "fixtures/items.json"},
+                    "reason": "tool_not_in_current_schema",
+                },
+            ),
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=1,
+                kind="system",
+                content={
+                    "type": "decision_rejected",
+                    "reason": "duplicate_inspection_after_edit_pressure",
+                    "detail": "You already read fixtures/items.json",
+                },
+            ),
+        ]
+
+        category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
+
+        self.assertEqual(category, "unavailable_tool_call_loop")
+
+    def test_classifier_detects_quality_gate_overconstrained_after_successful_commands(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="", status=JobStatus.FAILED, failure_reason="max_iterations_exceeded")
+        steps = [
+            DocodeStep(id=new_id("step"), job_id=job.id, step_index=0, kind="tool", content={"type": "tool_result", "tool": "write_file", "exit_code": 0}),
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=1,
+                kind="tool",
+                content={"type": "tool_result", "tool": "run_command", "exit_code": 0, "metadata": {"command": "python -m unittest discover -s tests"}},
+            ),
+            DocodeStep(id=new_id("step"), job_id=job.id, step_index=2, kind="llm", content={"type": "llm_decision", "decision_type": "final_candidate"}),
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=3,
+                kind="system",
+                content={
+                    "type": "quality_gate",
+                    "passed": False,
+                    "issues": [{"code": "json_required_field_empty", "path": "out.json", "message": "url missing"}],
+                },
+            ),
+        ]
+
+        category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
+
+        self.assertEqual(category, "quality_gate_overconstrained")
 
     def test_classifier_detects_test_gate_blocking_repair(self) -> None:
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="", status=JobStatus.FAILED, failure_reason="max_iterations_exceeded")
