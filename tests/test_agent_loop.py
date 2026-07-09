@@ -1775,6 +1775,168 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             steps = await repo.list_steps(job.id)
             self.assertEqual(steps[-1].content["type"], "repair_action")
 
+    def test_same_targeted_repair_edit_forces_rerun_before_more_exploration(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {
+            "category": "dependency_unavailable",
+            "signature": "dependency_unavailable",
+            "target_files": ["crawler.py"],
+            "rerun_commands": ["python -m unittest discover -s tests"],
+            "initial_inspection_budget": 1,
+        }
+        state.messages.append({"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "crawler.py"}})
+        definitions = [NamedTool("read_file"), NamedTool("write_file"), NamedTool("run_command"), NamedTool("git_status")]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+        forced = targeted_repair_forced_tool(state, "read_file", {"path": "crawler.py"})
+
+        self.assertEqual(set(names), {"run_command", "git_status"})
+        self.assertIsNotNone(forced)
+        assert forced is not None
+        self.assertEqual(forced[0], "run_command")
+        self.assertEqual(forced[1], {"command": "python -m unittest discover -s tests"})
+
+    def test_failed_repair_rerun_allows_same_target_edit_again(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {
+            "category": "dependency_unavailable",
+            "signature": "dependency_unavailable",
+            "target_files": ["crawler.py"],
+            "rerun_commands": ["python -m unittest discover -s tests"],
+            "initial_inspection_budget": 1,
+        }
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "crawler.py"}},
+                {
+                    "role": "tool",
+                    "tool": "run_command",
+                    "exit_code": 1,
+                    "output": "FileNotFoundError: out.json",
+                    "metadata": {"command": "python -m unittest discover -s tests"},
+                },
+            ]
+        )
+        definitions = [NamedTool("read_file"), NamedTool("write_file"), NamedTool("run_command"), NamedTool("git_status")]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+        forced = targeted_repair_forced_tool(state, "write_file", {"path": "crawler.py", "content": "fixed"})
+
+        self.assertIn("read_file", names)
+        self.assertIn("write_file", names)
+        self.assertNotIn("run_command", names)
+        self.assertIsNone(forced)
+        self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "crawler.py"}), "")
+
+    async def test_new_repair_action_same_target_allows_another_edit_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py."))
+            state = AgentState(job=job)
+            state.messages.extend(
+                [
+                    {"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "crawler.py"}},
+                    {
+                        "role": "tool",
+                        "tool": "run_command",
+                        "exit_code": 1,
+                        "output": "AssertionError: {'products': []} != []",
+                        "metadata": {"command": "python -m unittest discover -s tests"},
+                    },
+                ]
+            )
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=FakeTools(),
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            await loop.activate_targeted_repair(
+                state,
+                RepairAction(
+                    category="parsed_value_mismatch",
+                    signature="parsed_value_mismatch:products:dict:list",
+                    reason="Parser returned wrapper object instead of product list.",
+                    target_files=["crawler.py"],
+                    rerun_commands=["python -m unittest discover -s tests"],
+                    instruction="Edit crawler.py so fetch_and_parse returns the product list.",
+                ),
+                result=ToolResult(
+                    tool="run_command",
+                    output="AssertionError: {'products': []} != []",
+                    exit_code=1,
+                    metadata={"command": "python -m unittest discover -s tests"},
+                ),
+            )
+
+            definitions = [NamedTool("read_file"), NamedTool("write_file"), NamedTool("run_command"), NamedTool("git_status")]
+            names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+
+            self.assertEqual(state.active_repair_started_at, 2)
+            self.assertIn("read_file", names)
+            self.assertIn("write_file", names)
+            self.assertNotIn("run_command", names)
+            self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "crawler.py"}), "")
+            forced = targeted_repair_forced_tool(state, "write_file", {"path": "crawler.py", "content": "fixed"})
+            self.assertIsNone(forced)
+
+    async def test_new_repair_action_different_target_blocks_old_target_edit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Fix parser.py."))
+            state = AgentState(job=job)
+            state.messages.extend(
+                [
+                    {"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "crawler.py"}},
+                    {
+                        "role": "tool",
+                        "tool": "run_command",
+                        "exit_code": 1,
+                        "output": "AssertionError: 'name' not found in {}",
+                        "metadata": {"command": "python -m unittest discover -s tests"},
+                    },
+                ]
+            )
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=FakeTools(),
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            await loop.activate_targeted_repair(
+                state,
+                RepairAction(
+                    category="missing_required_field",
+                    signature="missing_required_field:name",
+                    reason="Parser records are missing name.",
+                    target_files=["parser.py"],
+                    rerun_commands=["python -m unittest discover -s tests"],
+                    instruction="Edit parser.py so records include name.",
+                ),
+                result=ToolResult(
+                    tool="run_command",
+                    output="AssertionError: 'name' not found in {}",
+                    exit_code=1,
+                    metadata={"command": "python -m unittest discover -s tests"},
+                ),
+            )
+
+            self.assertEqual(state.active_repair_started_at, 2)
+            self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "parser.py"}), "")
+            block = targeted_repair_action_block(state, "write_file", {"path": "crawler.py"})
+            self.assertIn("parser.py", block)
+            self.assertIn("crawler.py", block)
+
     async def test_agent_loop_recovers_from_transient_tool_error(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()

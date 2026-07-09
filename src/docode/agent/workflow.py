@@ -321,12 +321,18 @@ def is_compound_shell_command(command: str) -> bool:
 def target_file_modified_after_repair_start(state: AgentState) -> bool:
     action = state.active_repair_action or {}
     targets = {str(path).replace("\\", "/").strip().removeprefix("/workspace/") for path in action.get("target_files") or [] if str(path)}
+    rerun_commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
     if not targets:
         return successful_edit_tool_called(state)
     for message in reversed(state.messages[state.active_repair_started_at :]):
         if message.get("role") != "tool":
             continue
         tool = str(message.get("tool") or "")
+        if tool == "run_command" and int(message.get("exit_code") or 0) != 0 and rerun_commands:
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            observed = str(metadata.get("command") or "")
+            if any(commands_equivalent(observed, command) for command in rerun_commands):
+                return False
         if tool not in EDIT_TOOLS or int(message.get("exit_code") or 0) != 0:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}

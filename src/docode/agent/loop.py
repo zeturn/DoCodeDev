@@ -530,7 +530,7 @@ class CodingAgentLoop:
         state.repair_action_attempts = count
         action_payload = repair_action_contract(action, state)
         state.active_repair_action = action_payload
-        state.active_repair_started_at = len(state.messages)
+        state.active_repair_started_at = repair_action_start_index(state, result)
         state.targeted_repair_phase = "inspect_allowed"
         state.targeted_repair_inspections = 0
         state.targeted_repair_edits = 0
@@ -1189,6 +1189,25 @@ def task_specific_repair_hints(paths: list[str]) -> list[str]:
     return hints
 
 
+def repair_action_start_index(state: AgentState, result: ToolResult | None = None) -> int:
+    if result is None:
+        return len(state.messages)
+    for index in range(len(state.messages) - 1, -1, -1):
+        message = state.messages[index]
+        if message.get("role") != "tool":
+            continue
+        if str(message.get("tool") or "") != result.tool:
+            continue
+        if int(message.get("exit_code") or 0) != result.exit_code:
+            continue
+        if str(message.get("output") or "") != str(result.output or ""):
+            continue
+        message_metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if dict(message_metadata) == dict(result.metadata or {}):
+            return index + 1
+    return len(state.messages)
+
+
 def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) -> list[Any]:
     if repair_mode not in {"must_edit", "quality_repair", "targeted_repair"}:
         return definitions
@@ -1426,12 +1445,18 @@ def targeted_repair_read_count(state: AgentState) -> int:
 def targeted_repair_modified_target(state: AgentState) -> bool:
     action = state.active_repair_action or {}
     targets = targeted_repair_targets(state)
+    rerun_commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
     if not targets:
         return successful_edit_tool_called(state)
     for message in reversed(state.messages[state.active_repair_started_at :]):
         if message.get("role") != "tool":
             continue
         tool = str(message.get("tool") or "")
+        if tool == "run_command" and int(message.get("exit_code") or 0) != 0 and rerun_commands:
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            observed = " ".join(str(metadata.get("command") or "").split())
+            if any(commands_equivalent(observed, command) for command in rerun_commands):
+                return False
         if tool not in {"write_file", "edit_file", "replace_in_file", "apply_patch"} or int(message.get("exit_code") or 0) != 0:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
