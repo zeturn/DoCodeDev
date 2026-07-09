@@ -1,0 +1,5 @@
+[
+  {"name": "Notebook", "price": 12.5, "availability": true, "category": "stationery"},
+  {"name": "Pencil", "price": "$1.25", "availability": "in stock"},
+  {"name": "Desk", "price": "$120.00", "availability": "out of stock", "category": "furniture"}
+]

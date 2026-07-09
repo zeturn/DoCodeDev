@@ -297,16 +297,26 @@ async def build_real_llm_or_skip(testcase: IsolatedAsyncioTestCase, job: CodingJ
             api_key=config.openai_api_key,
             base_url=config.openai_base_url,
         )
+    deepseek_api_key = os.getenv("DOCODE_DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+    if requested_provider == "deepseek" and deepseek_api_key:
+        local_credentials["deepseek"] = ProviderCredential(
+            provider="deepseek",
+            model=os.getenv("DOCODE_REAL_LLM_MODEL") or os.getenv("DOCODE_DEEPSEEK_MODEL") or "deepseek-chat",
+            api_key=deepseek_api_key,
+            base_url=os.getenv("DOCODE_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+        )
     apicred_token = await apicred_token_from_basaltpass_or_skip(testcase, config)
     if not apicred_token:
         apicred_token = config.apicred_token
     if not apicred_token and not local_credentials:
         testcase.skipTest(
-            f"DOCODE_REAL_LLM_SMOKE=1 is set for provider {requested_provider!r}, but no BasaltPass/APICred token is configured. "
-            "Set DOCODE_REAL_LLM_PROVIDER=openai to explicitly use direct OpenAI credentials instead."
+            f"DOCODE_REAL_LLM_SMOKE=1 is set for provider {requested_provider!r}, but no usable LLM credentials were configured. "
+            "Checked DOCODE_BASALTPASS_SUBJECT_TOKEN, BASALTPASS_ACCESS_TOKEN, DOCODE_APICRED_TOKEN, "
+            "DOCODE_DIRECT_OPENAI_ENABLED with DOCODE_OPENAI_API_KEY/OPENAI_API_KEY, and "
+            "DOCODE_DEEPSEEK_API_KEY/DEEPSEEK_API_KEY."
         )
     if not apicred_token and local_credentials:
-        requested_provider = os.getenv("DOCODE_REAL_LLM_PROVIDER") or "openai"
+        requested_provider = os.getenv("DOCODE_REAL_LLM_PROVIDER") or next(iter(local_credentials))
         credential = local_credentials.get(requested_provider)
         if credential is None:
             testcase.skipTest(
@@ -328,8 +338,9 @@ async def build_real_llm_or_skip(testcase: IsolatedAsyncioTestCase, job: CodingJ
         job.provider = provider
         job.model = model
     elif local_credentials:
-        job.provider = "openai"
-        job.model = os.getenv("DOCODE_REAL_LLM_MODEL") or config.default_model
+        credential = local_credentials[requested_provider]
+        job.provider = credential.provider
+        job.model = os.getenv("DOCODE_REAL_LLM_MODEL") or credential.model
     try:
         return await build_docode_llm(job, resolver)
     except Exception as exc:

@@ -19,6 +19,12 @@ This document captures the current validated agent MVP before adding more crawle
 
 ## Added Optional Evals
 
+- Real LLM diagnostic suite: `tests.test_real_llm_diagnostic_suite`.
+  - Optional and skipped by default unless `DOCODE_REAL_LLM_SMOKE=1` is set.
+  - Uses a real LLM with local fixture-backed tools that perform real file IO and subprocess command execution in temporary workspaces.
+  - Does not use real DoBox; this isolates loop, context, repair, command-selection, final-gate, verifier, and artifact-export behavior from sandbox availability.
+  - Designed to diagnose real model/loop failure modes, not to serve as a release gate.
+  - Run this suite before changing loop or repair-control logic so failures have comparable structured diagnostics.
 - Neutral external-source crawler CLI smoke: `tests.test_real_dobox_external_crawler_smoke`.
   - Implemented, but currently unstable and diagnostic only.
   - Skipped by default and not a release gate.
@@ -100,5 +106,13 @@ DOCODE_REAL_LLM_SMOKE=1 DOCODE_REAL_DOBOX_SMOKE=1 PATH=/Users/henryzhao/Desktop/
 ```
 
 This command is diagnostic only. It is not part of the default release gate; the currently validated crawler capability is the generic local crawler CLI smoke.
+
+Optional real LLM diagnostic suite with local fixture-backed tools:
+
+```bash
+DOCODE_REAL_LLM_SMOKE=1 PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH PYTHONPATH=src ../.venv/bin/python -m unittest -v tests.test_real_llm_diagnostic_suite
+```
+
+This suite is diagnostic only. It is intended to collect structured failure evidence across bounded realistic tasks before changing loop or repair behavior.
 
 The real LLM commands use the existing provider configuration. By default the optional real LLM helper resolves a DeepSeek model through BasaltPass/APICred when those environment variables are configured; direct OpenAI use requires the existing explicit direct OpenAI environment switches.
