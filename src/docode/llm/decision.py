@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from docode.dobox.tools import ToolDefinition
@@ -42,6 +42,8 @@ class AgentDecision:
     verification: str | None = None
     no_test_reason: str | None = None
     remaining_risks: list[str] | None = None
+    reasoning: str | None = None
+    reasoning_records: list[dict[str, object]] | None = None
 
 
 class DecisionLLM(Protocol):
@@ -59,7 +61,14 @@ class DoCodeDecisionAdapter:
         result = await call_provider(self.provider_client, prompt, self.model)
         if self.usage_meter is not None:
             self.usage_meter.record_provider_call(prompt=prompt, result=result)
-        return parse_decision(result.text)
+        decision = parse_decision(result.text)
+        if result.reasoning or result.reasoning_records:
+            return replace(
+                decision,
+                reasoning=result.reasoning,
+                reasoning_records=list(result.reasoning_records or []),
+            )
+        return decision
 
     def _format_prompt(self, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> str:
         tool_specs = [
@@ -85,8 +94,15 @@ WeavDecisionLLM = DoCodeDecisionAdapter
 def parse_decision(raw: str) -> AgentDecision:
     data = parse_json_object(raw)
     decision_type = str(data.get("type") or data.get("action") or "").strip()
+    reasoning, reasoning_records = parse_decision_reasoning(data)
     if decision_type == "tool_call":
-        return AgentDecision(type="tool_call", tool_name=str(data["tool_name"]), args=dict(data.get("args") or {}))
+        return AgentDecision(
+            type="tool_call",
+            tool_name=str(data["tool_name"]),
+            args=dict(data.get("args") or {}),
+            reasoning=reasoning,
+            reasoning_records=reasoning_records,
+        )
     if decision_type == "final_candidate":
         risks = data.get("remaining_risks") or []
         if not isinstance(risks, list):
@@ -98,31 +114,87 @@ def parse_decision(raw: str) -> AgentDecision:
             verification=str(data.get("verification") or ""),
             no_test_reason=str(no_test_reason) if no_test_reason else None,
             remaining_risks=[str(risk) for risk in risks if str(risk)],
+            reasoning=reasoning,
+            reasoning_records=reasoning_records,
         )
     if decision_type == "tool":
         tool = data.get("tool")
         if isinstance(tool, dict):
             tool_name = str(tool.get("tool_name") or tool.get("name") or "")
             if tool_name:
-                return AgentDecision(type="tool_call", tool_name=tool_name, args=dict(tool.get("input") or tool.get("args") or {}))
+                return AgentDecision(
+                    type="tool_call",
+                    tool_name=tool_name,
+                    args=dict(tool.get("input") or tool.get("args") or {}),
+                    reasoning=reasoning,
+                    reasoning_records=reasoning_records,
+                )
         tool_name = str(data.get("tool_name") or data.get("name") or "")
         if tool_name:
-            return AgentDecision(type="tool_call", tool_name=tool_name, args=dict(data.get("input") or data.get("args") or {}))
+            return AgentDecision(
+                type="tool_call",
+                tool_name=tool_name,
+                args=dict(data.get("input") or data.get("args") or {}),
+                reasoning=reasoning,
+                reasoning_records=reasoning_records,
+            )
     if decision_type and isinstance(data.get("args"), dict):
-        return AgentDecision(type="tool_call", tool_name=decision_type, args=dict(data.get("args") or {}))
+        return AgentDecision(
+            type="tool_call",
+            tool_name=decision_type,
+            args=dict(data.get("args") or {}),
+            reasoning=reasoning,
+            reasoning_records=reasoning_records,
+        )
     if decision_type in TOOL_DECISION_TYPES:
         args = {
             key: value
             for key, value in data.items()
-            if key not in {"type", "action", "tool", "tool_name", "name"}
+            if key
+            not in {
+                "type",
+                "action",
+                "tool",
+                "tool_name",
+                "name",
+                "reasoning_summary",
+                "reasoning",
+                "thinking_summary",
+                "thinking",
+                "thought_summary",
+                "thoughts",
+            }
         }
-        return AgentDecision(type="tool_call", tool_name=decision_type, args=args)
+        return AgentDecision(type="tool_call", tool_name=decision_type, args=args, reasoning=reasoning, reasoning_records=reasoning_records)
     if isinstance(data.get("tool"), dict):
         tool = data["tool"]
         tool_name = str(tool.get("tool_name") or tool.get("name") or "")
         if tool_name:
-            return AgentDecision(type="tool_call", tool_name=tool_name, args=dict(tool.get("input") or tool.get("args") or {}))
+            return AgentDecision(
+                type="tool_call",
+                tool_name=tool_name,
+                args=dict(tool.get("input") or tool.get("args") or {}),
+                reasoning=reasoning,
+                reasoning_records=reasoning_records,
+            )
     raise ValueError(f"unsupported decision type: {decision_type}")
+
+
+def parse_decision_reasoning(data: dict[str, Any]) -> tuple[str | None, list[dict[str, object]] | None]:
+    records: list[dict[str, object]] = []
+    for key in ("reasoning_summary", "reasoning", "thinking_summary", "thinking", "thought_summary", "thoughts"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            records.append({"type": key, "text": value.strip()[:4000], "source": "decision_json"})
+        elif isinstance(value, list):
+            for item in value:
+                text = str(item.get("text") or item.get("summary") or "") if isinstance(item, dict) else str(item)
+                if text.strip():
+                    records.append({"type": key, "text": text.strip()[:4000], "source": "decision_json"})
+    if not records:
+        return None, None
+    text = "\n\n".join(str(record["text"]) for record in records)
+    return text, records
 
 
 def parse_json_object(raw: str) -> dict[str, Any]:

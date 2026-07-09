@@ -15,7 +15,14 @@ services:
       dockerfile: DoCodeDev/frontend/Dockerfile
     environment:
       DOCODE_API_PROXY_TARGET: http://backend:8110
+      CHOKIDAR_USEPOLLING: "true"
     depends_on:
       - backend
     ports:
       - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+      - frontend_node_modules:/app/frontend/node_modules
+
+volumes:
+  frontend_node_modules:

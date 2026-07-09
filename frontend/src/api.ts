@@ -71,6 +71,8 @@ export interface StepEventPayload {
   metadata?: Record<string, unknown>;
   reason?: string;
   detail?: string;
+  reasoning?: string;
+  reasoning_records?: Array<Record<string, unknown>>;
   decision_type?: string;
   [key: string]: unknown;
 }

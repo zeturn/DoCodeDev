@@ -34,6 +34,8 @@ class ProviderCallResult:
     total_tokens: int | None = None
     cost: float | None = None
     tool_calls: list[Any] = field(default_factory=list)
+    reasoning: str | None = None
+    reasoning_records: list[dict[str, object]] = field(default_factory=list)
     raw: Any = None
 
 
@@ -244,6 +246,8 @@ def provider_call_result(response: Any) -> ProviderCallResult:
         completion_tokens=int_or_none(usage.get("completion_tokens")),
         total_tokens=int_or_none(usage.get("total_tokens")),
         cost=float_or_none(usage.get("cost")),
+        reasoning=extract_reasoning_text(response),
+        reasoning_records=extract_reasoning_records(response),
         raw=response,
     )
 
@@ -258,6 +262,7 @@ def normalize_provider_response(response: Any) -> Any | None:
 
 def provider_result_from_runtime_result(response: Any) -> ProviderCallResult:
     usage = getattr(response, "usage", None)
+    raw = getattr(response, "raw", response)
     return ProviderCallResult(
         text=str(getattr(response, "text")),
         prompt_tokens=int_or_none(get_field(usage, "prompt_tokens")),
@@ -265,8 +270,86 @@ def provider_result_from_runtime_result(response: Any) -> ProviderCallResult:
         total_tokens=int_or_none(get_field(usage, "tokens") or get_field(usage, "total_tokens")),
         cost=float_or_none(get_field(usage, "cost")),
         tool_calls=list(getattr(response, "tool_calls", []) or []),
-        raw=getattr(response, "raw", response),
+        reasoning=extract_reasoning_text(response) or extract_reasoning_text(raw),
+        reasoning_records=extract_reasoning_records(response) or extract_reasoning_records(raw),
+        raw=raw,
     )
+
+
+def extract_reasoning_text(value: Any) -> str | None:
+    records = extract_reasoning_records(value)
+    text = "\n\n".join(str(record.get("text") or "").strip() for record in records if str(record.get("text") or "").strip())
+    return text or None
+
+
+def extract_reasoning_records(value: Any) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def add_record(kind: str, text: str, *, source: str | None = None) -> None:
+        cleaned = " ".join(text.split()) if "\n" not in text else text.strip()
+        if not cleaned:
+            return
+        cleaned = cleaned[:4000]
+        key = f"{kind}:{source or ''}:{cleaned}"
+        if key in seen:
+            return
+        seen.add(key)
+        record: dict[str, object] = {"type": kind, "text": cleaned}
+        if source:
+            record["source"] = source
+        records.append(record)
+
+    def visit(item: Any, source: str | None = None) -> None:
+        if item is None:
+            return
+        if isinstance(item, str):
+            return
+        if isinstance(item, list):
+            for child in item:
+                visit(child, source)
+            return
+        if isinstance(item, dict):
+            item_type = str(item.get("type") or "").lower()
+            if item_type in {"reasoning", "thinking", "thought", "thoughts", "reasoning_summary", "summary_text"}:
+                text = reasoning_item_text(item)
+                if text:
+                    add_record(item_type, text, source=source)
+            for key in ("reasoning_summary", "reasoning_text", "thinking_summary", "thought_summary"):
+                text = content_to_text(item.get(key))
+                if text:
+                    add_record(key, text, source=source)
+            for key in ("reasoning", "thinking", "thought", "thoughts"):
+                nested = item.get(key)
+                if isinstance(nested, str):
+                    add_record(key, nested, source=source)
+                else:
+                    visit(nested, key)
+            for key in ("summary", "content", "output", "data", "choices", "message"):
+                if key in item:
+                    visit(item.get(key), source)
+            return
+        for key in ("reasoning_summary", "reasoning_text", "thinking_summary", "thought_summary", "reasoning", "thinking", "thoughts"):
+            if hasattr(item, key):
+                attr = getattr(item, key)
+                if isinstance(attr, str):
+                    add_record(key, attr, source=source)
+                else:
+                    visit(attr, key)
+        for key in ("output", "content", "choices", "message"):
+            if hasattr(item, key):
+                visit(getattr(item, key), source)
+
+    visit(value)
+    return records
+
+
+def reasoning_item_text(item: dict[str, Any]) -> str | None:
+    for key in ("text", "summary_text", "content", "value", "summary"):
+        text = content_to_text(item.get(key))
+        if text:
+            return text
+    return None
 
 
 def create_llm_router() -> Any:
@@ -314,7 +397,7 @@ def extract_text(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        direct = first_present(value, "output_text", "text", "content")
+        direct = first_present(value, "output_text", "summary_text", "text", "content")
         if direct is not None:
             return content_to_text(direct)
         choices = value.get("choices")
@@ -331,7 +414,7 @@ def extract_text(value: Any) -> str | None:
             return content_to_text(output)
         return None
 
-    for attr in ("output_text", "text", "content"):
+    for attr in ("output_text", "summary_text", "text", "content"):
         if hasattr(value, attr):
             return content_to_text(getattr(value, attr))
     if hasattr(value, "choices"):
@@ -356,7 +439,7 @@ def content_to_text(value: Any) -> str | None:
                 parts.append(text)
         return "\n".join(parts) if parts else None
     if isinstance(value, dict):
-        direct = first_present(value, "text", "content", "value")
+        direct = first_present(value, "summary_text", "text", "content", "value")
         return content_to_text(direct) if direct is not None else None
     return str(value)
 

@@ -44,6 +44,7 @@ docker compose up --build
 ```
 
 Open the backend at `http://localhost:8110` and the frontend dev server at `http://localhost:5173`.
+The frontend service mounts `./frontend` into the container, so local edits reload without rebuilding the image.
 
 Recommended deterministic test command:
 

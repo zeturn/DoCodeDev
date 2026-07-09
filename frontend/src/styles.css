@@ -491,6 +491,27 @@ code {
   max-height: 22rem;
 }
 
+.thinking-card pre {
+  max-height: 18rem;
+}
+
+.thinking-records {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.thinking-record {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.thinking-record span {
+  color: #93c5fd;
+  font-size: 0.76rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
 .raw-json {
   border-top: 1px solid rgba(148, 163, 184, 0.12);
   padding-top: 0.7rem;

@@ -36,7 +36,7 @@ From the DoCodeDev root, start both services together:
 docker compose up --build
 ```
 
-The frontend container listens on `http://localhost:5173` and proxies API calls to the backend container.
+The frontend container listens on `http://localhost:5173`, proxies API calls to the backend container, and mounts the local `frontend` folder for live reload.
 
 ## Production build
 

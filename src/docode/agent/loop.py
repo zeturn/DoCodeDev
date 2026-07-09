@@ -1973,6 +1973,18 @@ def decision_to_step(decision, usage_meter: LLMUsageMeter | None = None) -> dict
         payload["no_test_reason"] = truncate_text(decision.no_test_reason, 1000)
     if getattr(decision, "remaining_risks", None):
         payload["remaining_risks"] = [truncate_text(str(risk), 500) for risk in decision.remaining_risks or []]
+    if getattr(decision, "reasoning", None):
+        payload["reasoning"] = truncate_text(str(decision.reasoning), 4000)
+    if getattr(decision, "reasoning_records", None):
+        payload["reasoning_records"] = [
+            {
+                key: truncate_text(str(value), 4000) if isinstance(value, str) else value
+                for key, value in dict(record).items()
+                if value is not None and value != ""
+            }
+            for record in decision.reasoning_records or []
+            if isinstance(record, dict)
+        ][:10]
     if usage_meter is not None:
         payload["usage"] = usage_meter.snapshot()
     return payload

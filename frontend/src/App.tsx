@@ -514,6 +514,7 @@ function renderStepBody(step: StepEventPayload) {
   return (
     <StepCard raw={step}>
       <p className="step-summary">{genericStepSummary(step)}</p>
+      {renderThinkingCard(step)}
       {renderKeyValueCard('Highlights', compactEntries([
         ['type', step.type ?? step.kind],
         ['decision', step.decision_type],
@@ -524,6 +525,37 @@ function renderStepBody(step: StepEventPayload) {
       {outputPreview && renderOutputPreview(outputPreview)}
       {renderRecordCard('Metadata', metadata)}
     </StepCard>
+  );
+}
+
+function renderThinkingCard(step: StepEventPayload) {
+  const reasoningRecords = Array.isArray(step.reasoning_records)
+    ? step.reasoning_records.filter(isRecord)
+    : [];
+  const reasoningText = typeof step.reasoning === 'string' ? step.reasoning.trim() : '';
+  if (!reasoningText && reasoningRecords.length === 0) {
+    return null;
+  }
+
+  return (
+    <section className="info-card thinking-card">
+      <h4>Thinking</h4>
+      {reasoningText && <pre>{truncateMiddle(reasoningText, OUTPUT_PREVIEW_MAX_LENGTH)}</pre>}
+      {reasoningRecords.length > 0 && (
+        <div className="thinking-records">
+          {reasoningRecords.slice(0, 6).map((record, index) => {
+            const text = typeof record.text === 'string' ? record.text : stringifyJson(record);
+            const label = [record.type, record.source].filter((value) => typeof value === 'string' && value.trim()).join(' / ');
+            return (
+              <article className="thinking-record" key={`${index}-${label || 'record'}`}>
+                {label && <span>{label}</span>}
+                <pre>{truncateMiddle(text, OUTPUT_PREVIEW_MAX_LENGTH)}</pre>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 

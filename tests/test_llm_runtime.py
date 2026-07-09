@@ -256,6 +256,44 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         self.assertEqual(usage.completion_tokens, 7)
         self.assertFalse(usage.estimated)
 
+    async def test_weav_decision_llm_preserves_reasoning_records(self) -> None:
+        class Provider:
+            def chat(self, *, messages, model):
+                _ = messages, model
+                return {
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "Inspected the failing test and chose a small edit."}],
+                        },
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": '{"type": "tool_call", "tool_name": "read_file", "args": {"path": "README.md"}}'}],
+                        },
+                    ],
+                    "output_text": '{"type": "tool_call", "tool_name": "read_file", "args": {"path": "README.md"}}',
+                }
+
+        decision = await WeavDecisionLLM(Provider(), "gpt-test").decide(system="system", messages=[], tools=[], context="context")
+
+        self.assertEqual(decision.type, "tool_call")
+        self.assertEqual(decision.tool_name, "read_file")
+        self.assertIn("Inspected the failing test", decision.reasoning or "")
+        self.assertEqual(decision.reasoning_records[0]["type"], "reasoning")
+
+    async def test_provider_result_from_runtime_result_preserves_reasoning_summary(self) -> None:
+        runtime_result = types.SimpleNamespace(
+            text='{"type": "final_candidate", "summary": "done"}',
+            usage=None,
+            tool_calls=[],
+            reasoning_summary="Checked the diff and verified the requested behavior.",
+        )
+
+        result = runtime_surface.provider_result_from_runtime_result(runtime_result)
+
+        self.assertEqual(result.reasoning, "Checked the diff and verified the requested behavior.")
+        self.assertEqual(result.reasoning_records[0]["type"], "reasoning_summary")
+
     async def test_call_provider_falls_back_when_runtime_uses_incompatible_config_shape(self) -> None:
         runtime = types.ModuleType("weav_ai_runtime")
 
