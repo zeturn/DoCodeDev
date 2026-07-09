@@ -239,6 +239,16 @@ THIRD_PARTY_IMPORTS = {
 
 
 GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+JSON_PRODUCER_ISSUE_CODES = {
+    "json_artifact_unexpected_shape",
+    "json_records_empty",
+    "json_record_not_object",
+    "json_required_field_empty",
+    "json_required_field_dirty",
+    "json_github_url_invalid",
+    "json_repository_invalid_format",
+    "json_repository_url_mismatch",
+}
 
 
 def detect_undeclared_python_dependencies(diff: str) -> list[QualityIssue]:
@@ -287,8 +297,9 @@ async def inspect_common_artifacts(
     issues: list[QualityIssue] = []
     samples: list[ArtifactSample] = []
     json_paths = inferred_json_artifact_paths(instruction, task_contract, status)
+    producer_path = json_producer_source_path(task_contract)
     for path in json_paths[:5]:
-        artifact_issues, sample = await inspect_json_artifact(tools, path, instruction)
+        artifact_issues, sample = await inspect_json_artifact(tools, path, instruction, producer_path=producer_path)
         issues.extend(artifact_issues)
         if sample is not None:
             samples.append(sample)
@@ -316,7 +327,23 @@ def inferred_json_artifact_paths(instruction: str, task_contract: TaskContract |
     return unique_paths(candidates)
 
 
-async def inspect_json_artifact(tools: DoBoxTools, path: str, instruction: str) -> tuple[list[QualityIssue], ArtifactSample | None]:
+def json_producer_source_path(task_contract: TaskContract | None) -> str | None:
+    if task_contract is None:
+        return None
+    for path in task_contract.must_modify_files:
+        normalized = path.strip("./").replace("\\", "/")
+        if normalized and not normalized.endswith(".json"):
+            return normalized
+    return None
+
+
+async def inspect_json_artifact(
+    tools: DoBoxTools,
+    path: str,
+    instruction: str,
+    *,
+    producer_path: str | None = None,
+) -> tuple[list[QualityIssue], ArtifactSample | None]:
     result = await safe_optional_tool_call("read_file", tools, path)
     if result.exit_code != 0:
         if json_path_explicitly_requested(path, instruction):
@@ -343,37 +370,37 @@ async def inspect_json_artifact(tools: DoBoxTools, path: str, instruction: str) 
             )
         ], None
 
-    issues = inspect_json_data(data, path, instruction)
+    issues = inspect_json_data(data, path, instruction, producer_path=producer_path)
     sample_data = data[:3] if isinstance(data, list) else data
     summary = json_sample_summary(data)
     return issues, ArtifactSample(path=path, kind="json", summary=summary, data=sample_data)
 
 
-def inspect_json_data(data: Any, path: str, instruction: str) -> list[QualityIssue]:
+def inspect_json_data(data: Any, path: str, instruction: str, *, producer_path: str | None = None) -> list[QualityIssue]:
     if isinstance(data, list):
-        return inspect_json_records(data, path, instruction)
+        return inspect_json_records(data, path, instruction, producer_path=producer_path)
     if isinstance(data, dict):
         return []
     return [
-        QualityIssue(
-            severity="blocker",
+        json_producer_issue(
             code="json_artifact_unexpected_shape",
-            path=path,
-            message="JSON artifact must be an object or a list of objects.",
-            repair_hint="Write stable structured JSON rather than a scalar value.",
+            artifact_path=path,
+            producer_path=producer_path,
+            message=f"JSON artifact {path} must be an object or a list of objects.",
+            repair_hint="Do not hand-edit the JSON output. Fix the source code that generates it so it writes stable structured JSON, then rerun the command that writes the artifact.",
         )
     ]
 
 
-def inspect_json_records(records: list[Any], path: str, instruction: str) -> list[QualityIssue]:
+def inspect_json_records(records: list[Any], path: str, instruction: str, *, producer_path: str | None = None) -> list[QualityIssue]:
     if not records:
         return [
-            QualityIssue(
-                severity="blocker",
+            json_producer_issue(
                 code="json_records_empty",
-                path=path,
-                message="JSON artifact is an empty list.",
-                repair_hint="Write at least one meaningful record.",
+                artifact_path=path,
+                producer_path=producer_path,
+                message=f"JSON artifact {path} is an empty list.",
+                repair_hint="The JSON artifact is empty. Do not hand-edit the output JSON. Fix the parser/fetcher in the source file that generates it, then rerun the command that writes the artifact.",
             )
         ]
     issues: list[QualityIssue] = []
@@ -381,12 +408,12 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
     for index, row in enumerate(records[:10]):
         if not isinstance(row, dict):
             issues.append(
-                QualityIssue(
-                    severity="blocker",
+                json_producer_issue(
                     code="json_record_not_object",
-                    path=path,
-                    message=f"JSON row {index} is not an object.",
-                    repair_hint="Output a list of JSON objects with stable fields.",
+                    artifact_path=path,
+                    producer_path=producer_path,
+                    message=f"JSON artifact {path} row {index} is not an object.",
+                    repair_hint="Do not hand-edit the JSON output. Fix the serializer/parser so it outputs a list of JSON objects with stable fields, then rerun the command that writes the artifact.",
                 )
             )
             continue
@@ -395,23 +422,23 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
             if value is None or value == "":
                 label = "repository_name/repository/name" if field == "__github_repository__" else field
                 issues.append(
-                    QualityIssue(
-                        severity="blocker",
+                    json_producer_issue(
                         code="json_required_field_empty",
-                        path=path,
-                        message=f"JSON row {index} has empty required field: {label}",
-                        repair_hint=f"Populate {label} with a meaningful non-empty value for every record.",
+                        artifact_path=path,
+                        producer_path=producer_path,
+                        message=f"JSON artifact {path} row {index} has empty required field: {label}",
+                        repair_hint=f"Do not hand-edit the JSON output. Fix the parser/fetcher so every generated record populates {label} with a meaningful non-empty value, then rerun the command that writes the artifact.",
                     )
                 )
             elif isinstance(value, str) and dirty_required_value(value):
                 label = "repository_name/repository/name" if field == "__github_repository__" else field
                 issues.append(
-                    QualityIssue(
-                        severity="blocker",
+                    json_producer_issue(
                         code="json_required_field_dirty",
-                        path=path,
-                        message=f"JSON row {index} has dirty required field {label}: {preview(value)}",
-                        repair_hint=f"Normalize {label}; derive stable identifiers from URLs or structured attributes instead of raw text.",
+                        artifact_path=path,
+                        producer_path=producer_path,
+                        message=f"JSON artifact {path} row {index} has dirty required field {label}: {preview(value)}",
+                        repair_hint=f"Do not hand-edit the JSON output. Fix the parser/fetcher so it normalizes {label}; derive stable identifiers from URLs or structured attributes instead of raw text.",
                     )
                 )
         url = row.get("url")
@@ -419,38 +446,58 @@ def inspect_json_records(records: list[Any], path: str, instruction: str) -> lis
         if "github" in instruction.lower():
             if isinstance(url, str) and not url.startswith("https://github.com/"):
                 issues.append(
-                    QualityIssue(
-                        severity="blocker",
+                    json_producer_issue(
                         code="json_github_url_invalid",
-                        path=path,
-                        message=f"JSON row {index} has invalid GitHub URL: {url}",
-                        repair_hint="Build absolute URLs for repository records.",
+                        artifact_path=path,
+                        producer_path=producer_path,
+                        message=f"JSON artifact {path} row {index} has invalid GitHub URL: {url}",
+                        repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher to build absolute GitHub repository URLs from the repository heading href, then rerun the command that writes the artifact.",
                     )
                 )
             if isinstance(repository, str) and repository:
                 if not GITHUB_REPO_RE.match(repository):
                     issues.append(
-                        QualityIssue(
-                            severity="blocker",
+                        json_producer_issue(
                             code="json_repository_invalid_format",
-                            path=path,
-                            message=f"JSON row {index} repository identifier has invalid format, got {preview(repository)}",
-                            repair_hint="Derive the repository identifier from the same source path as the URL.",
+                            artifact_path=path,
+                            producer_path=producer_path,
+                            message=f"JSON artifact {path} row {index} repository identifier has invalid format, got {preview(repository)}",
+                            repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher to derive owner/repository from the same repository href used for the URL.",
                         )
                     )
                 elif isinstance(url, str) and url.startswith("https://github.com/"):
                     expected_url = f"https://github.com/{repository}"
                     if url.rstrip("/") != expected_url:
                         issues.append(
-                            QualityIssue(
-                                severity="blocker",
+                            json_producer_issue(
                                 code="json_repository_url_mismatch",
-                                path=path,
-                                message=f"JSON row {index} repository {repository!r} does not match url {url!r}",
-                                repair_hint="Ensure repository and url are derived from the same source href.",
+                                artifact_path=path,
+                                producer_path=producer_path,
+                                message=f"JSON artifact {path} row {index} repository {repository!r} does not match url {url!r}",
+                                repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher so repository and url are derived from the same source href.",
                             )
                         )
     return dedupe_issues(issues)
+
+
+def json_producer_issue(
+    *,
+    code: str,
+    artifact_path: str,
+    producer_path: str | None,
+    message: str,
+    repair_hint: str,
+) -> QualityIssue:
+    target_path = producer_path if code in JSON_PRODUCER_ISSUE_CODES and producer_path else artifact_path
+    if producer_path and code in JSON_PRODUCER_ISSUE_CODES and artifact_path not in message:
+        message = f"{message} Generated artifact: {artifact_path}."
+    return QualityIssue(
+        severity="blocker",
+        code=code,
+        path=target_path,
+        message=message,
+        repair_hint=repair_hint,
+    )
 
 
 def inferred_required_json_fields(instruction: str) -> list[str]:
