@@ -31,6 +31,7 @@ def apply_loop_runtime_fixes(loop_module: Any) -> None:
     _patch_required_command_fallback(loop_module)
     _patch_targeted_repair_action_block(loop_module)
     _patch_targeted_repair_rerun_satisfied(loop_module)
+    _patch_stop_policy_for_final_ready(loop_module)
     _patch_maybe_auto_finalize_before_stop(loop_module)
     _patch_dobox_git_helpers(loop_module)
 
@@ -91,6 +92,31 @@ def _patch_targeted_repair_rerun_satisfied(loop_module: Any) -> None:
         return False
 
     loop_module.targeted_repair_rerun_satisfied = patched_targeted_repair_rerun_satisfied
+
+
+def _patch_stop_policy_for_final_ready(loop_module: Any) -> None:
+    stop_policy_cls = getattr(loop_module, "StopPolicy", None)
+    if stop_policy_cls is None or getattr(stop_policy_cls, "_runtime_final_ready_stop_patched", False):
+        return
+    setattr(stop_policy_cls, "_runtime_final_ready_stop_patched", True)
+    original_evaluate = stop_policy_cls.evaluate
+
+    def patched_evaluate(self, state):
+        decision = original_evaluate(self, state)
+        if getattr(decision, "reason", None) != "max_iterations_exceeded":
+            return decision
+        status = getattr(getattr(state, "latest_git_status", None), "output", "") or ""
+        try:
+            current_workflow = workflow_snapshot(state, status)
+        except Exception:
+            return decision
+        if current_workflow.phase == WorkflowPhase.FINAL_READY:
+            # Give the loop one final pass so its existing FINAL_READY auto-final
+            # path can submit a final_candidate instead of failing immediately.
+            return type(decision)(False, None)
+        return decision
+
+    stop_policy_cls.evaluate = patched_evaluate
 
 
 def _patch_maybe_auto_finalize_before_stop(loop_module: Any) -> None:
