@@ -45,6 +45,41 @@ def apply_loop_runtime_fixes(loop_module: Any) -> None:
         return ""
 
     loop_module.targeted_repair_action_block = advisory_targeted_repair_action_block
+    _patch_dobox_git_helpers(loop_module)
+
+
+def _patch_dobox_git_helpers(loop_module: Any) -> None:
+    tools_cls = getattr(loop_module, "DoBoxTools", None)
+    if tools_cls is None or getattr(tools_cls, "_runtime_git_helpers_patched", False):
+        return
+    setattr(tools_cls, "_runtime_git_helpers_patched", True)
+    original_git_status = tools_cls.git_status
+    original_git_diff = tools_cls.git_diff
+
+    async def safe_git_status(self):
+        try:
+            return await original_git_status(self)
+        except Exception as exc:
+            return ToolResult(
+                tool="git_status",
+                output=f"git_status unavailable: {type(exc).__name__}: {exc}",
+                exit_code=124,
+                metadata={"runtime_safe_fallback": True, "error_type": type(exc).__name__},
+            )
+
+    async def safe_git_diff(self):
+        try:
+            return await original_git_diff(self)
+        except Exception as exc:
+            return ToolResult(
+                tool="git_diff",
+                output=f"git_diff unavailable: {type(exc).__name__}: {exc}",
+                exit_code=124,
+                metadata={"runtime_safe_fallback": True, "error_type": type(exc).__name__},
+            )
+
+    tools_cls.git_status = safe_git_status
+    tools_cls.git_diff = safe_git_diff
 
 
 def _fallback_required_command_repair(loop_module: Any, state, result: ToolResult) -> RepairAction | None:
