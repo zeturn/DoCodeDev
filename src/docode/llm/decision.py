@@ -10,6 +10,29 @@ from .provider_compat import call_provider
 from .usage import LLMUsageMeter
 
 
+TOOL_DECISION_TYPES = {
+    "read_file",
+    "read_file_range",
+    "read_symbol",
+    "list_files",
+    "search",
+    "write_file",
+    "edit_file",
+    "replace_in_file",
+    "apply_patch",
+    "run_command",
+    "run_tests",
+    "run_build",
+    "run_lint",
+    "git_status",
+    "git_diff",
+    "web_search",
+    "fetch_url",
+    "preview",
+    "logs",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class AgentDecision:
     type: str
@@ -87,6 +110,13 @@ def parse_decision(raw: str) -> AgentDecision:
             return AgentDecision(type="tool_call", tool_name=tool_name, args=dict(data.get("input") or data.get("args") or {}))
     if decision_type and isinstance(data.get("args"), dict):
         return AgentDecision(type="tool_call", tool_name=decision_type, args=dict(data.get("args") or {}))
+    if decision_type in TOOL_DECISION_TYPES:
+        args = {
+            key: value
+            for key, value in data.items()
+            if key not in {"type", "action", "tool", "tool_name", "name"}
+        }
+        return AgentDecision(type="tool_call", tool_name=decision_type, args=args)
     if isinstance(data.get("tool"), dict):
         tool = data["tool"]
         tool_name = str(tool.get("tool_name") or tool.get("name") or "")

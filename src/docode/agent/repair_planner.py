@@ -104,6 +104,7 @@ def plan_repair_from_tool_result(*, tool: str, output: str, metadata: dict[str, 
         plan_import_error_missing_symbol,
         plan_name_error_did_you_mean,
         plan_unbound_local_error,
+        plan_dependency_failure,
         plan_module_not_found,
         plan_missing_required_field,
         plan_parser_records_empty,
@@ -113,7 +114,6 @@ def plan_repair_from_tool_result(*, tool: str, output: str, metadata: dict[str, 
         plan_json_semantic_failure,
         plan_cli_unrecognized_arguments,
         plan_invalid_number_literal,
-        plan_dependency_failure,
         plan_syntax_error,
     ):
         action = planner(output=output, command=command)
@@ -550,6 +550,15 @@ def plan_json_semantic_failure(*, output: str, command: str) -> RepairAction | N
 
 def plan_dependency_failure(*, output: str, command: str) -> RepairAction | None:
     lowered = output.lower()
+    missing_third_party_import = any(
+        marker in lowered
+        for marker in (
+            "modulenotfounderror: no module named 'bs4'",
+            'modulenotfounderror: no module named "bs4"',
+            "no module named 'requests'",
+            'no module named "requests"',
+        )
+    )
     markers = (
         "moduleNotFoundError: No module named 'bs4'".lower(),
         'moduleNotFoundError: No module named "bs4"'.lower(),
@@ -560,11 +569,25 @@ def plan_dependency_failure(*, output: str, command: str) -> RepairAction | None
     )
     if not any(marker in lowered for marker in markers):
         return None
+    if missing_third_party_import:
+        target_files = inferred_source_targets(output, command)
+        dependency_instruction = (
+            "2. Remove the unavailable third-party import from the source file and use the Python standard library instead.\n"
+            "3. Do not satisfy this repair by only adding `requirements.txt` or `pyproject.toml`; the required command reruns without installing dependencies.\n"
+            "4. Rerun the failing command after editing the source file."
+        )
+    else:
+        target_files = unique_preserving_order([*inferred_source_targets(output, command), "requirements.txt", "pyproject.toml"])
+        dependency_instruction = (
+            "2. Prefer removing third-party dependencies and using the Python standard library.\n"
+            "3. If a third-party dependency is absolutely necessary, declare it and verify import in an isolated environment.\n"
+            "4. Rerun the failing command after editing."
+        )
     return RepairAction(
         category="dependency_unavailable",
         signature="dependency_unavailable",
         reason="The implementation depends on unavailable or undeclared third-party packages.",
-        target_files=unique_preserving_order([*inferred_source_targets(output, command), "requirements.txt", "pyproject.toml"]),
+        target_files=target_files,
         allowed_tools=TARGETED_REPAIR_ALLOWED_TOOLS,
         forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
         rerun_commands=[command] if command else [],
@@ -572,9 +595,7 @@ def plan_dependency_failure(*, output: str, command: str) -> RepairAction | None
             "The implementation depends on unavailable or undeclared third-party packages.\n\n"
             "Required next action:\n"
             "1. Do not retry system pip install.\n"
-            "2. Prefer removing third-party dependencies and using the Python standard library.\n"
-            "3. If a third-party dependency is absolutely necessary, declare it and verify import in an isolated environment.\n"
-            "4. Rerun the failing command after editing."
+            f"{dependency_instruction}"
         ),
         initial_inspection_budget=1,
     )
