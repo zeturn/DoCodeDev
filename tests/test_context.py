@@ -46,6 +46,31 @@ class ContextManagerTests(TestCase):
 
         self.assertEqual(contract.must_modify_files, ["src/a.py", "src/b.py"])
 
+    def test_task_contract_does_not_invent_cli_command_from_filename(self) -> None:
+        contract = task_contract_from_instruction("Update cli.py so it can write JSON output.")
+
+        self.assertEqual(contract.must_modify_files, ["cli.py"])
+        self.assertEqual(contract.must_run_commands, [])
+
+    def test_task_contract_does_not_invent_calculator_unittest_from_filename(self) -> None:
+        contract = task_contract_from_instruction("Fix calculator.py so addition works.")
+
+        self.assertEqual(contract.must_modify_files, ["calculator.py"])
+        self.assertEqual(contract.must_run_commands, [])
+
+    def test_task_contract_keeps_explicit_verification_commands_exactly(self) -> None:
+        contract = task_contract_from_instruction(
+            "Update cli.py so it writes output.\n\n"
+            "Verification commands:\n"
+            "1. python cli.py --name Ada --output out.json\n"
+            "2. python -m json.tool out.json"
+        )
+
+        self.assertEqual(
+            contract.must_run_commands,
+            ["python cli.py --name Ada --output out.json", "python -m json.tool out.json"],
+        )
+
     def test_context_pack_preserves_task_and_summarizes_long_history(self) -> None:
         job = CodingJob(id=new_id("job"), user_id="u1", instruction="Refactor the payment adapter without losing retries")
         inspection = ProjectInspection(

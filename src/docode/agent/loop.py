@@ -34,6 +34,8 @@ from docode.storage.models import CodingJob, JobStatus
 from docode.storage.repository import JobRepository
 
 INITIAL_NO_DIFF_EXPLORATION_BUDGET = NO_DIFF_EXPLORATION_BUDGET
+LOCAL_INSPECTION_TOOLS = {"read_file", "read_file_range", "read_symbol", "list_files", "search", "git_status", "git_diff"}
+EDIT_TOOLS = {"write_file", "edit_file", "replace_in_file", "apply_patch"}
 CONTEXT_HEAVY_REPAIR_CATEGORIES = {
     "missing_required_field",
     "parsed_value_mismatch",
@@ -1170,13 +1172,13 @@ def task_specific_repair_hints(paths: list[str]) -> list[str]:
     hints: list[str] = []
     if "calculator.py" in file_names:
         hints.append(
-            "python-bugfix: read calculator.py, edit retry_count so it returns attempts, run "
-            "`python3 -m unittest discover -s tests`, run git_diff, then final_candidate."
+            "python-bugfix: inspect calculator.py and related tests, edit the implementation, "
+            "then run the explicit verification command from the task contract before final_candidate."
         )
     if "cli.py" in file_names:
         hints.append(
-            "python-cli: read cli.py, edit `print('TODO')` to print a greeting using args.name, run "
-            "`python3 cli.py --name Ada`, run git_diff, then final_candidate."
+            "python-cli: inspect cli.py and related tests, edit the implementation, "
+            "then run the explicit verification command from the task contract before final_candidate."
         )
     return hints
 
@@ -1222,7 +1224,7 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState
         and not successful_edit_tool_called(state)
         and exploratory_tool_calls(state) >= INITIAL_NO_DIFF_EXPLORATION_BUDGET
     ):
-        allowed = {"write_file", "edit_file", "replace_in_file", "apply_patch", "git_status", "git_diff"}
+        allowed = EDIT_TOOLS | LOCAL_INSPECTION_TOOLS
         return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     if workflow.phase == WorkflowPhase.TEST_REQUIRED and missing_must_modify_targets(state):
         allowed = {"write_file", "apply_patch", "git_status", "git_diff"}
@@ -1300,7 +1302,7 @@ def targeted_repair_allowed_tools_for_phase(state: AgentState) -> set[str]:
 
 def allowed_tools_for_repair_mode_name(repair_mode: str | None) -> set[str]:
     if repair_mode == "must_edit":
-        return {"edit_file", "write_file", "replace_in_file", "apply_patch", "git_status", "git_diff"}
+        return EDIT_TOOLS | LOCAL_INSPECTION_TOOLS
     if repair_mode in {"quality_repair", "targeted_repair"}:
         return {"read_file", "edit_file", "write_file", "replace_in_file", "apply_patch", "run_command", "git_status", "git_diff"}
     return set()
@@ -1488,13 +1490,11 @@ def edit_required_tool_block(state: AgentState, workflow: Any, tool_name: str, a
     _ = args
     if workflow.phase != WorkflowPhase.EDIT_REQUIRED:
         return ""
-    if state.repair_mode == "must_edit" and tool_name not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
-        return f"{tool_name} is blocked while EDIT_REQUIRED. Create or edit a target file now."
     if tool_name in {"write_file", "edit_file", "replace_in_file"}:
         target_block = edit_required_target_file_block(state, tool_name, args)
         if target_block:
             return target_block
-    if tool_name in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
+    if tool_name in EDIT_TOOLS or tool_name in LOCAL_INSPECTION_TOOLS:
         return ""
     if successful_edit_tool_called(state):
         return ""

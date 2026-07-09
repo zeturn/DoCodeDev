@@ -423,6 +423,25 @@ class EvalTests(TestCase):
         self.assertEqual(result["failure_class"], "model_unavailable")
         self.assertEqual(result["failure_category"], "provider_network_error")
 
+    def test_eval_case_result_classifies_must_edit_inspection_block(self) -> None:
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u1",
+            instruction="fix",
+            status=JobStatus.FAILED,
+            failure_reason="max_consecutive_failures_exceeded",
+        )
+        steps = [
+            {"type": "workflow_state", "phase": "EDIT_REQUIRED", "diff_exists": False},
+            {"type": "decision_rejected", "reason": "must_edit_tool_forbidden", "detail": "read_file is blocked while repair_mode=must_edit"},
+            {"type": "decision_rejected", "reason": "must_edit_tool_forbidden", "detail": "read_file is blocked while repair_mode=must_edit"},
+        ]
+
+        result = eval_case_result_from_job({"name": "parser-edge", "instruction": "fix"}, job, steps)
+
+        self.assertEqual(result["failure_class"], "agent_failed")
+        self.assertEqual(result["failure_category"], "inspection_blocked_by_must_edit")
+
     def test_eval_case_result_ignores_artifact_export_network_error_for_model_availability(self) -> None:
         job = CodingJob(
             id=new_id("job"),

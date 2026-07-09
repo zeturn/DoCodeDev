@@ -37,7 +37,7 @@ def task_contract_from_instruction(instruction: str) -> TaskContract:
     )
     files = target_files_from_instruction(instruction, all_files)
     explicit_commands = verification_commands_from_instruction(instruction)
-    commands = unique_preserving_order([*suggested_commands(all_files), *explicit_commands])
+    commands = unique_preserving_order(explicit_commands)
     forbidden = [
         "Do not call final_candidate until git_status shows at least one modified file.",
         "Do not finish with a clean git status; produce a non-empty git diff first.",
@@ -125,13 +125,8 @@ def contract_file_allowed(path: str) -> bool:
 
 
 def suggested_commands(files: list[str]) -> list[str]:
-    commands: list[str] = []
-    file_names = {path.rsplit("/", 1)[-1] for path in files}
-    if "calculator.py" in file_names:
-        commands.append("python3 -m unittest discover -s tests")
-    if "cli.py" in file_names:
-        commands.append("python3 cli.py --name Ada")
-    return commands
+    _ = files
+    return []
 
 
 def verification_commands_from_instruction(instruction: str) -> list[str]:

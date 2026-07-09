@@ -909,6 +909,8 @@ def classify_failure(
         return "model_unavailable", "provider_call_failed"
     if "provider_call_failed" in combined:
         return "model_unavailable", "provider_call_failed"
+    if inspection_blocked_by_must_edit(step_contents, verification):
+        return "agent_failed", "inspection_blocked_by_must_edit"
     if "max_llm_tokens_exceeded" in reason:
         return "budget_exceeded", "max_llm_tokens_exceeded"
     if "max_iterations_exceeded" in reason:
@@ -928,6 +930,37 @@ def classify_failure(
     if "workspace_diagnostic" in infra_diagnostics:
         return "verifier_failed", "workspace_inconsistent"
     return "agent_failed", None
+
+
+def inspection_blocked_by_must_edit(step_contents: list[dict[str, Any]], verification: dict[str, Any]) -> bool:
+    rejected = [
+        content
+        for content in step_contents
+        if content.get("type") == "decision_rejected" and "must_edit_tool_forbidden" in str(content.get("reason") or "").lower()
+    ]
+    if len(rejected) < 2:
+        return False
+    commands_run = [
+        content
+        for content in step_contents
+        if content.get("type") == "tool_result" and content.get("tool") == "run_command"
+    ]
+    if commands_run:
+        return False
+    if diff_evidence_exists(step_contents, verification):
+        return False
+    return True
+
+
+def diff_evidence_exists(step_contents: list[dict[str, Any]], verification: dict[str, Any]) -> bool:
+    for content in step_contents:
+        if content.get("type") == "workflow_state" and content.get("diff_exists") is True:
+            return True
+        status = str(content.get("git_status") or "").strip()
+        diff = str(content.get("git_diff") or "").strip()
+        if status or diff:
+            return True
+    return bool(str(verification.get("git_status") or "").strip() or str(verification.get("git_diff") or "").strip())
 
 
 def infra_category_from_reason(reason: str) -> str | None:

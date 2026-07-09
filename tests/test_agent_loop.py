@@ -235,6 +235,22 @@ class RepairModeForbiddenToolLLM:
         return AgentDecision(type="final_candidate", summary="Updated README after repair mode.")
 
 
+class MustEditReadThenWriteLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, tools, context
+        self.calls += 1
+        if self.calls == 1:
+            return AgentDecision(type="final_candidate", summary="Done without edits.")
+        if self.calls == 2:
+            return AgentDecision(type="tool_call", tool_name="read_file", args={"path": "README.md"})
+        if self.calls == 3:
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "README.md", "content": "done\n"})
+        return AgentDecision(type="final_candidate", summary="Updated README after inspecting in must_edit.")
+
+
 class RequiredTestGateLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -586,6 +602,8 @@ class FakeTools:
         if tool_name == "run_command":
             command = str(args["command"])
             return ToolResult(tool="run_command", output="checked\n", metadata={"command": command})
+        if tool_name == "read_file":
+            return await self.read_file(str(args["path"]))
         raise AssertionError(tool_name)
 
     async def list_files(self, path: str = ".") -> ToolResult:
@@ -958,6 +976,32 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
             self.assertEqual([step.content["reason"] for step in rejected], ["final_candidate_clean_git_status", "must_edit_tool_forbidden"])
 
+    async def test_agent_loop_allows_read_file_while_must_edit_without_rejection(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="update README.md"))
+            tools = FakeTools()
+            llm = MustEditReadThenWriteLLM()
+
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(result.result_summary, "Updated README after inspecting in must_edit.")
+            steps = await repo.list_steps(job.id)
+            rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
+            self.assertEqual([step.content["reason"] for step in rejected], ["final_candidate_clean_git_status"])
+            read_results = [step for step in steps if step.content.get("type") == "tool_result" and step.content.get("tool") == "read_file"]
+            self.assertEqual(len(read_results), 1)
+
     async def test_agent_loop_rejects_final_candidate_until_required_command_runs(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
@@ -1158,10 +1202,25 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIn("crawler.py", block)
         self.assertIn("manifest.json", block)
 
-    def test_must_edit_mode_allows_only_edit_tools_and_git_checks(self) -> None:
+    def test_must_edit_mode_allows_edit_inspection_and_git_tools(self) -> None:
         allowed = allowed_tools_for_repair_mode_name("must_edit")
 
-        self.assertEqual(allowed, {"edit_file", "write_file", "replace_in_file", "apply_patch", "git_status", "git_diff"})
+        self.assertEqual(
+            allowed,
+            {
+                "read_file",
+                "read_file_range",
+                "read_symbol",
+                "list_files",
+                "search",
+                "edit_file",
+                "write_file",
+                "replace_in_file",
+                "apply_patch",
+                "git_status",
+                "git_diff",
+            },
+        )
 
     def test_edit_required_after_exploration_only_exposes_edit_and_git_tools(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -1172,6 +1231,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             state.messages.append({"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": f"README_{idx}.md"}})
         definitions = [
             NamedTool("read_file"),
+            NamedTool("list_files"),
             NamedTool("web_search"),
             NamedTool("fetch_url"),
             NamedTool("run_command"),
@@ -1187,12 +1247,32 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(
             set(names),
-            {"write_file", "edit_file", "replace_in_file", "apply_patch", "git_status", "git_diff"},
+            {
+                "read_file",
+                "list_files",
+                "write_file",
+                "edit_file",
+                "replace_in_file",
+                "apply_patch",
+                "git_status",
+                "git_diff",
+            },
         )
-        self.assertNotIn("read_file", names)
         self.assertNotIn("web_search", names)
         self.assertNotIn("fetch_url", names)
         self.assertNotIn("run_command", names)
+
+    def test_edit_required_allows_inspection_tools_after_exploration_budget(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
+        state.task_contract = TaskContract(must_modify_files=["crawler.py"])
+        for _ in range(INITIAL_NO_DIFF_EXPLORATION_BUDGET):
+            state.messages.append({"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "README.md"}})
+        workflow = SimpleNamespace(phase=WorkflowPhase.EDIT_REQUIRED)
+
+        self.assertEqual(edit_required_tool_block(state, workflow, "read_file", {"path": "crawler.py"}), "")
+        self.assertEqual(edit_required_tool_block(state, workflow, "list_files", {"path": "."}), "")
+        self.assertEqual(edit_required_tool_block(state, workflow, "git_status", {}), "")
+        self.assertEqual(edit_required_tool_block(state, workflow, "write_file", {"path": "crawler.py"}), "")
 
     def test_edit_required_before_exploration_budget_keeps_search_tools_available(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="crawl github trends from https://github.com/trending"))

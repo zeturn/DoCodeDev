@@ -88,7 +88,7 @@ DIAGNOSTIC_CASES = {
 
 class DiagnosticLocalTools:
     def __init__(self, workspace: Path, *, test_command: str = "python -m unittest discover -s tests") -> None:
-        self.workspace = workspace
+        self.workspace = workspace.resolve()
         self.test_command = test_command
         self.initial_files = self.snapshot_files()
         self.command_results: list[ToolResult] = []
@@ -335,6 +335,8 @@ def classify_diagnostic_failure(*, job: CodingJob, steps: list[DocodeStep], requ
 
     if job.failure_reason and "artifact" in job.failure_reason:
         return "artifact_export_failure"
+    if diagnostic_inspection_blocked_by_must_edit(contents):
+        return "inspection_blocked_by_must_edit"
     if not tool_calls:
         return "planning_failure"
     if edits and any(result.get("exit_code") not in {0, None} for result in runs) and not repairs:
@@ -354,6 +356,24 @@ def classify_diagnostic_failure(*, job: CodingJob, steps: list[DocodeStep], requ
     if job.status != JobStatus.SUCCEEDED:
         return "bad_code_edit"
     return "unknown"
+
+
+def diagnostic_inspection_blocked_by_must_edit(contents: list[dict[str, object]]) -> bool:
+    rejected = [
+        content
+        for content in contents
+        if content.get("type") == "decision_rejected" and "must_edit_tool_forbidden" in str(content.get("reason") or "").lower()
+    ]
+    if len(rejected) < 2:
+        return False
+    if any(content.get("type") == "tool_result" and content.get("tool") == "run_command" for content in contents):
+        return False
+    for content in contents:
+        if content.get("type") == "workflow_state" and content.get("diff_exists") is True:
+            return False
+        if str(content.get("git_status") or "").strip() or str(content.get("git_diff") or "").strip():
+            return False
+    return True
 
 
 def summarize_recent_steps(steps: list[DocodeStep], limit: int = 20) -> str:
@@ -419,6 +439,31 @@ class DiagnosticClassifierTests(TestCase):
         )
 
         self.assertEqual(category, "missing_required_command")
+
+    def test_classifier_detects_must_edit_inspection_block(self) -> None:
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction="", status=JobStatus.FAILED, failure_reason="max_consecutive_failures_exceeded")
+        steps = [
+            DocodeStep(id=new_id("step"), job_id=job.id, step_index=0, kind="system", content={"type": "workflow_state", "diff_exists": False}),
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=1,
+                kind="system",
+                content={"type": "decision_rejected", "reason": "must_edit_tool_forbidden", "detail": "read_file blocked"},
+            ),
+            DocodeStep(
+                id=new_id("step"),
+                job_id=job.id,
+                step_index=2,
+                kind="system",
+                content={"type": "decision_rejected", "reason": "must_edit_tool_forbidden", "detail": "read_file blocked"},
+            ),
+            DocodeStep(id=new_id("step"), job_id=job.id, step_index=3, kind="tool", content={"type": "tool_result", "tool": "read_file", "exit_code": 0}),
+        ]
+
+        category = classify_diagnostic_failure(job=job, steps=steps, required_commands=("python -m unittest discover -s tests",))
+
+        self.assertEqual(category, "inspection_blocked_by_must_edit")
 
 
 @skipUnless(REAL_LLM_SMOKE_ENABLED, "set DOCODE_REAL_LLM_SMOKE=1 to run optional real LLM diagnostic suite")
