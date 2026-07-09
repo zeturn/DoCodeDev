@@ -3,12 +3,15 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest import IsolatedAsyncioTestCase, TestCase, skipUnless
 
 from docode.agent.loop import CodingAgentLoop
@@ -17,8 +20,12 @@ from docode.agent.stop_policy import StopPolicy
 from docode.agent.verifier import CodingVerifier
 from docode.agent.workflow import commands_equivalent
 from docode.artifacts.exporter import ArtifactExporter
+from docode.config import load_config
+from docode.dobox.client import DoBoxClient
+from docode.dobox.tools import DoBoxTools
 from docode.dobox.tools import ToolDefinition
 from docode.dobox.types import ToolResult
+from docode.runtime.smoke import check_http_health, ensure_dobox_smoke_token
 from docode.storage.models import CodingJob, DocodeStep, JobStatus, new_id
 
 from tests.test_real_llm_smoke import build_real_llm_or_skip
@@ -26,6 +33,7 @@ from tests.test_smoke_readme_job import RecordingRepository, normalize_path
 
 
 REAL_LLM_SMOKE_ENABLED = os.getenv("DOCODE_REAL_LLM_SMOKE", "").lower() in {"1", "true", "yes", "on"}
+REAL_DOBOX_SMOKE_ENABLED = os.getenv("DOCODE_REAL_DOBOX_SMOKE", "").lower() in {"1", "true", "yes", "on"}
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "repos" / "diagnostic"
 
 
@@ -463,7 +471,7 @@ def summarize_recent_steps(steps: list[DocodeStep], limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-async def diagnostic_failure_message(case: DiagnosticCase, job: CodingJob, tools: DiagnosticLocalTools, steps: list[DocodeStep]) -> str:
+async def diagnostic_failure_message(case: DiagnosticCase, job: CodingJob, tools: Any, steps: list[DocodeStep], *, mode: str = "local_fixture") -> str:
     status = await tools.git_status()
     diff = await tools.git_diff()
     runs = run_command_results(steps)
@@ -471,9 +479,10 @@ async def diagnostic_failure_message(case: DiagnosticCase, job: CodingJob, tools
     repairs = [step for step in steps if step.content.get("type") == "repair_action"]
     rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
     category = classify_diagnostic_failure(job=job, steps=steps, required_commands=case.required_commands)
-    changed_files = tools.changed_files()
+    changed_files = tools.changed_files() if hasattr(tools, "changed_files") else changed_files_from_status(status.output)
     return (
         f"case name: {case.name}\n"
+        f"mode: {mode}\n"
         f"job status: {job.status.value}\n"
         f"failure reason: {job.failure_reason or '<none>'}\n"
         f"final git status equivalent / changed files:\n{status.output or '<clean>'}\nchanged_files={json.dumps(changed_files)}\n"
@@ -486,6 +495,84 @@ async def diagnostic_failure_message(case: DiagnosticCase, job: CodingJob, tools
         f"whether rejected_decision steps occurred: {str(bool(rejected)).lower()} count={len(rejected)}\n"
         f"likely failure category: {category}\n"
     )
+
+
+def changed_files_from_status(status: str) -> list[str]:
+    files: list[str] = []
+    for line in status.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(maxsplit=1)
+        if len(parts) == 2:
+            files.append(parts[1].strip())
+    return files
+
+
+def diagnostic_trace_dir() -> Path:
+    configured = os.getenv("DOCODE_DIAGNOSTIC_TRACE_DIR")
+    root = Path(configured) if configured else Path(tempfile.gettempdir()) / "docode_real_llm_diagnostic_traces"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+async def write_diagnostic_trace(
+    *,
+    case: DiagnosticCase,
+    mode: str,
+    job: CodingJob,
+    steps: list[DocodeStep],
+    tools: Any,
+    provider: str | None,
+    model: str | None,
+    dobox_project_id: str | None = None,
+    dobox_sandbox_id: str | None = None,
+) -> Path:
+    status = await tools.git_status()
+    diff = await tools.git_diff()
+    final_files: dict[str, str] = {}
+    for path in likely_artifact_paths(case):
+        try:
+            result = await tools.read_file(path)
+        except Exception as exc:
+            final_files[path] = f"<read failed: {type(exc).__name__}: {exc}>"
+            continue
+        if result.exit_code == 0:
+            final_files[path] = result.output[:4000]
+    payload = {
+        "case": case.name,
+        "mode": mode,
+        "platform": platform.platform(),
+        "provider": provider,
+        "model": model,
+        "job_id": job.id,
+        "dobox_project_id": dobox_project_id,
+        "dobox_sandbox_id": dobox_sandbox_id,
+        "status": job.status.value,
+        "failure_reason": job.failure_reason,
+        "iterations": len([step for step in steps if step.content.get("type") == "llm_decision"]),
+        "run_command_results": run_command_results(steps),
+        "changed_files": changed_files_from_status(status.output),
+        "git_status": status.output,
+        "git_diff": diff.output[:20_000],
+        "final_files": final_files,
+        "required_commands_succeeded": {command: required_command_succeeded(steps, command) for command in case.required_commands},
+        "steps": [{"index": step.step_index, "kind": step.kind, "content": step.content} for step in steps],
+    }
+    path = diagnostic_trace_dir() / f"{mode}-{case.name}-{job.id}.json"
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return path
+
+
+def likely_artifact_paths(case: DiagnosticCase) -> list[str]:
+    paths = ["out.json", "output.json", "data/output.json"]
+    if case.name == "cli_output_bug":
+        paths.append("cli.py")
+    if case.name == "two_stage_repair":
+        paths.append("crawler.py")
+    if case.name == "parser_edge_case":
+        paths.append("parser.py")
+    return paths
 
 
 class DiagnosticClassifierTests(TestCase):
@@ -674,14 +761,20 @@ class RealLLMDiagnosticSuite(IsolatedAsyncioTestCase):
     def tearDownClass(cls) -> None:
         if not cls.summaries:
             return
-        print("\ncase | status | iterations | commands run | final attempted | repair actions | likely failure category | short reason")
+        print("\ncase | mode | status | iterations | commands run | final attempted | repair actions | likely failure category | short reason")
         for item in cls.summaries:
             print(
-                f"{item['case']} | {item['status']} | {item['iterations']} | {item['commands']} | "
+                f"{item['case']} | {item['mode']} | {item['status']} | {item['iterations']} | {item['commands']} | "
                 f"{item['final']} | {item['repairs']} | {item['category']} | {item['reason']}"
             )
 
     async def run_diagnostic_case(self, case: DiagnosticCase) -> None:
+        if REAL_DOBOX_SMOKE_ENABLED:
+            await self.run_real_dobox_diagnostic_case(case)
+        else:
+            await self.run_local_fixture_diagnostic_case(case)
+
+    async def run_local_fixture_diagnostic_case(self, case: DiagnosticCase) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp) / case.name
             shutil.copytree(FIXTURE_ROOT / case.fixture, workspace)
@@ -712,9 +805,19 @@ class RealLLMDiagnosticSuite(IsolatedAsyncioTestCase):
             result = await loop.run(job)
             steps = await repo.list_steps(job.id)
             category = classify_diagnostic_failure(job=result, steps=steps, required_commands=case.required_commands)
+            trace_path = await write_diagnostic_trace(
+                case=case,
+                mode="local_fixture",
+                job=result,
+                steps=steps,
+                tools=tools,
+                provider=result.provider or job.provider,
+                model=result.model or job.model,
+            )
             self.summaries.append(
                 {
                     "case": case.name,
+                    "mode": "local_fixture",
                     "status": result.status.value,
                     "iterations": len([step for step in steps if step.content.get("type") == "llm_decision"]),
                     "commands": len(run_command_results(steps)),
@@ -725,7 +828,149 @@ class RealLLMDiagnosticSuite(IsolatedAsyncioTestCase):
                 }
             )
             if result.status != JobStatus.SUCCEEDED:
-                self.fail(await diagnostic_failure_message(case, result, tools, steps))
+                self.fail((await diagnostic_failure_message(case, result, tools, steps, mode="local_fixture")) + f"trace: {trace_path}\n")
+
+    async def run_real_dobox_diagnostic_case(self, case: DiagnosticCase) -> None:
+        with TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts"
+            repo = RecordingRepository()
+            job = await repo.create_job(
+                CodingJob(
+                    id=new_id("job"),
+                    user_id="diagnostic",
+                    instruction=case.instruction,
+                    max_iterations=36,
+                    max_runtime_seconds=900,
+                    max_consecutive_failures=10,
+                    max_tool_calls=80,
+                    sandbox_network_mode="no_internet",
+                )
+            )
+            llm = await build_real_llm_or_skip(self, job)
+            config = await self._real_dobox_config(artifact_dir)
+            client = DoBoxClient(config.dobox_base_url, config.dobox_token)
+            project = await client.create_project(
+                name=f"docode-diagnostic-{case.name}-{new_id('diag')}",
+                network_mode=config.sandbox_network_mode,
+            )
+            session = await client.create_agent_session(project.project_id, name=f"docode-diagnostic-{case.name}")
+            try:
+                await self._seed_fixture(client, project.project_id, session.session_id, FIXTURE_ROOT / case.fixture)
+                await self._ensure_python_command(client, project.project_id, session.session_id)
+                tools = DoBoxTools(
+                    client,
+                    project.project_id,
+                    agent_session_id=session.session_id,
+                    command_timeout_seconds=45,
+                    output_limit_bytes=200_000,
+                    command_overrides={"test": case.required_commands[0]},
+                )
+                job = await repo.update_job(
+                    job.id,
+                    dobox_project_id=project.project_id,
+                    dobox_sandbox_id=project.sandbox_id,
+                    dobox_agent_session_id=session.session_id,
+                    sandbox_network_mode=config.sandbox_network_mode,
+                )
+                loop = CodingAgentLoop(
+                    llm=llm,
+                    tools=tools,
+                    verifier=CodingVerifier(),
+                    repository=repo,
+                    exporter=ArtifactExporter(
+                        artifact_dir,
+                        repo,
+                        workspace_archive_provider=lambda: client.archive_workspace(project.project_id, agent_session_id=session.session_id),
+                        workspace_file_reader=lambda path: client.read_file(project.project_id, path, agent_session_id=session.session_id),
+                    ),
+                    stop_policy=StopPolicy(max_iterations=36, max_runtime_seconds=900, max_consecutive_failures=10, max_tool_calls=80),
+                    quality_gate=QualityGate(),
+                )
+
+                result = await loop.run(job)
+                steps = await repo.list_steps(job.id)
+                category = classify_diagnostic_failure(job=result, steps=steps, required_commands=case.required_commands)
+                trace_path = await write_diagnostic_trace(
+                    case=case,
+                    mode="real_dobox",
+                    job=result,
+                    steps=steps,
+                    tools=tools,
+                    provider=result.provider or job.provider,
+                    model=result.model or job.model,
+                    dobox_project_id=project.project_id,
+                    dobox_sandbox_id=project.sandbox_id,
+                )
+                self.summaries.append(
+                    {
+                        "case": case.name,
+                        "mode": "real_dobox",
+                        "status": result.status.value,
+                        "iterations": len([step for step in steps if step.content.get("type") == "llm_decision"]),
+                        "commands": len(run_command_results(steps)),
+                        "final": final_candidate_attempted(steps),
+                        "repairs": len([step for step in steps if step.content.get("type") == "repair_action"]),
+                        "category": category,
+                        "reason": result.failure_reason or result.result_summary or "",
+                        "trace": str(trace_path),
+                    }
+                )
+                if result.status != JobStatus.SUCCEEDED:
+                    self.fail((await diagnostic_failure_message(case, result, tools, steps, mode="real_dobox")) + f"trace: {trace_path}\n")
+            finally:
+                await client.delete_project(project.project_id)
+
+    async def _real_dobox_config(self, artifact_dir: Path):
+        config = load_config()
+        config.artifact_dir = artifact_dir
+        config.sandbox_network_mode = "no_internet"
+        config.web_tools_enabled = False
+        ok, detail = await check_http_health(config.dobox_base_url.rstrip("/") + "/health")
+        if not ok:
+            self.skipTest(f"DoBox is unavailable at {config.dobox_base_url}: {detail}")
+        token, token_check = await ensure_dobox_smoke_token(config)
+        if token_check.status != "passed" or not token:
+            self.skipTest(f"DoBox auth failed: {token_check.detail}")
+        config.dobox_token = token
+        return config
+
+    async def _seed_fixture(self, client: DoBoxClient, project_id: str, session_id: str, fixture_root: Path) -> None:
+        for path in sorted(fixture_root.rglob("*")):
+            if path.is_file():
+                relative = path.relative_to(fixture_root).as_posix()
+                await client.write_file(project_id, relative, path.read_text(encoding="utf-8"), agent_session_id=session_id)
+        result = await client.run_command(
+            project_id,
+            [
+                "sh",
+                "-lc",
+                "git init -b main && git config user.email diagnostic@example.test && "
+                "git config user.name 'DoCode Diagnostic' && git add . && git commit -m 'Initial diagnostic fixture'",
+            ],
+            cwd="/workspace",
+            timeout_sec=30,
+            agent_session_id=session_id,
+        )
+        if result.exit_code != 0:
+            self.fail(f"failed to initialize diagnostic fixture git repository:\n{result.output}")
+
+    async def _ensure_python_command(self, client: DoBoxClient, project_id: str, session_id: str) -> None:
+        result = await client.run_command(
+            project_id,
+            [
+                "sh",
+                "-lc",
+                "command -v python >/dev/null 2>&1 || "
+                "(mkdir -p /tmp/docode-bin && ln -sf \"$(command -v python3)\" /tmp/docode-bin/python && "
+                "printf 'export PATH=/tmp/docode-bin:$PATH\\n' > \"$HOME/.bash_profile\") && "
+                "bash -lc 'python --version'",
+            ],
+            cwd="/workspace",
+            timeout_sec=30,
+            agent_session_id=session_id,
+        )
+        if result.exit_code != 0:
+            self.fail(f"failed to make python command available in diagnostic sandbox:\n{result.output}")
 
     async def test_credential_path_constructs_real_llm(self) -> None:
         job = CodingJob(

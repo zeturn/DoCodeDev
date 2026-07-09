@@ -413,7 +413,7 @@ async def run_smoke_verification(
 
     json_files = [path for path in changed_files if path.endswith(".json")]
     for path in json_files:
-        commands.append(f"python3 -m json.tool {shlex.quote(path)} >/dev/null")
+        commands.append(f"python3 -c {double_quote_shell_arg(json_file_check_script(path))}")
 
     if not commands:
         if not has_code_like_changes(changed_files):
@@ -1177,6 +1177,16 @@ def json_output_check_script(min_records: int = 1) -> str:
         "        files.append(p)\n"
         "print('JSON outputs:', ', '.join(files)); "
         "sys.exit(0 if files else 1)"
+    )
+    return "exec(" + repr(body) + ")"
+
+
+def json_file_check_script(path: str) -> str:
+    body = (
+        "import json, sys; "
+        f"path={path!r}; "
+        "json.load(open(path, encoding='utf-8')); "
+        "print('valid JSON:', path)"
     )
     return "exec(" + repr(body) + ")"
 
