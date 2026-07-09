@@ -30,6 +30,7 @@ def apply_loop_runtime_fixes(loop_module: Any) -> None:
 
     _patch_required_command_fallback(loop_module)
     _patch_targeted_repair_action_block(loop_module)
+    _patch_targeted_repair_rerun_satisfied(loop_module)
     _patch_maybe_auto_finalize_before_stop(loop_module)
     _patch_dobox_git_helpers(loop_module)
 
@@ -65,6 +66,31 @@ def _patch_targeted_repair_action_block(loop_module: Any) -> None:
         return original_block(state, tool_name, args)
 
     loop_module.targeted_repair_action_block = patched_targeted_repair_action_block
+
+
+def _patch_targeted_repair_rerun_satisfied(loop_module: Any) -> None:
+    original_satisfied = loop_module.targeted_repair_rerun_satisfied
+
+    def patched_targeted_repair_rerun_satisfied(state) -> bool:
+        if original_satisfied(state):
+            return True
+        action = state.active_repair_action or {}
+        commands = [str(command) for command in action.get("rerun_commands") or [] if str(command)]
+        if not commands:
+            return False
+        start = int(getattr(state, "active_repair_started_at", 0) or 0)
+        for message in reversed(state.messages[start:]):
+            if message.get("role") != "tool" or str(message.get("tool") or "") != "run_command":
+                continue
+            if int(message.get("exit_code") or 0) != 0:
+                continue
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            observed = " ".join(str(metadata.get("command") or "").split())
+            if observed and any(commands_equivalent(observed, command) for command in commands):
+                return True
+        return False
+
+    loop_module.targeted_repair_rerun_satisfied = patched_targeted_repair_rerun_satisfied
 
 
 def _patch_maybe_auto_finalize_before_stop(loop_module: Any) -> None:
