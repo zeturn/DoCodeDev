@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import posixpath
 import re
+import shlex
 from dataclasses import replace
 from typing import Any
 from urllib.parse import urlparse
@@ -11,7 +13,13 @@ from docode.agent.context import ContextManager, ContextPack, target_file_guidan
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
-from docode.agent.repair_planner import RepairAction, format_repair_action, plan_repair_from_tool_result
+from docode.agent.repair_planner import (
+    RepairAction,
+    TARGETED_REPAIR_FORBIDDEN_TOOLS,
+    format_repair_action,
+    infer_python_traceback_files,
+    plan_repair_from_tool_result,
+)
 from docode.agent.reviewer import CodeReviewer, ReviewResult
 from docode.agent.state import AgentState
 from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
@@ -45,6 +53,19 @@ CONTEXT_HEAVY_REPAIR_CATEGORIES = {
     "parser_record_count_mismatch",
 }
 MIN_CONTEXT_REPAIR_INSPECTION_BUDGET = 3
+FAILED_REQUIRED_COMMAND_ALLOWED_TOOLS = [
+    "read_file",
+    "read_file_range",
+    "list_files",
+    "search",
+    "edit_file",
+    "write_file",
+    "replace_in_file",
+    "apply_patch",
+    "run_command",
+    "git_status",
+    "git_diff",
+]
 
 
 class CodingAgentLoop:
@@ -384,6 +405,8 @@ class CodingAgentLoop:
 
     async def plan_targeted_repair_from_failure(self, state: AgentState, result: ToolResult) -> None:
         action = plan_repair_from_tool_result(tool=result.tool, output=result.output, metadata=result.metadata or {})
+        if action is None:
+            action = fallback_required_command_repair(state, result)
         if action is None:
             return
         action = refine_repair_action_targets(action, state.task_contract)
@@ -1102,6 +1125,108 @@ def refine_repair_action_targets(action: RepairAction, task_contract: TaskContra
     return replace(action, target_files=target_files)
 
 
+def fallback_required_command_repair(state: AgentState, result: ToolResult) -> RepairAction | None:
+    if result.tool != "run_command" or result.ok:
+        return None
+    task_contract = state.task_contract
+    if task_contract is None:
+        return None
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    command = normalize_command(str(metadata.get("command") or ""))
+    if not command:
+        return None
+    required_commands = [str(item) for item in task_contract.must_run_commands if str(item).strip()]
+    if not any(commands_equivalent(command, required) for required in required_commands):
+        return None
+
+    failure_summary = truncate_text(str(result.output or ""), 2400)
+    signature = "failed_required_command:" + hashlib.sha1(f"{command}\n{failure_summary}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+    target_files = fallback_required_command_target_files(state, output=str(result.output or ""), command=command)
+    target_text = ", ".join(target_files) if target_files else "the relevant source file"
+    instruction = (
+        "A required verification command failed, but no specific repair plan matched the output.\n\n"
+        f"Failed command:\n{command}\n\n"
+        f"Failure output summary:\n{failure_summary}\n\n"
+        f"Candidate target files: {target_text}.\n"
+        "Edit a relevant source file before rerunning the command.\n"
+        f"After editing, rerun exactly: {command}"
+    )
+    return RepairAction(
+        category="failed_required_command",
+        signature=signature,
+        reason="required verification command failed",
+        target_files=target_files,
+        allowed_tools=list(FAILED_REQUIRED_COMMAND_ALLOWED_TOOLS),
+        forbidden_tools=list(TARGETED_REPAIR_FORBIDDEN_TOOLS),
+        instruction=instruction,
+        rerun_commands=[command],
+        exploration_forbidden=False,
+        initial_inspection_budget=2,
+    )
+
+
+SOURCE_FILE_EXTENSIONS = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".rb",
+    ".php",
+    ".sh",
+}
+
+
+def fallback_required_command_target_files(state: AgentState, *, output: str, command: str) -> list[str]:
+    task_contract = state.task_contract
+    candidates: list[str] = []
+    if task_contract is not None:
+        candidates.extend(str(path) for path in task_contract.must_modify_files if str(path).strip())
+    candidates.extend(infer_python_traceback_files(output))
+    candidates.extend(source_files_implied_by_command(command))
+    status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
+    candidates.extend(changed_source_files_from_status(status_output))
+    return unique_preserving_paths(candidates)
+
+
+def source_files_implied_by_command(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    candidates: list[str] = []
+    for token in tokens:
+        cleaned = normalize_command_path_token(token)
+        if is_source_file_candidate(cleaned):
+            candidates.append(cleaned)
+    return candidates
+
+
+def changed_source_files_from_status(status_output: str) -> list[str]:
+    return [path for path in changed_paths_from_status(status_output) if is_source_file_candidate(path)]
+
+
+def normalize_command_path_token(token: str) -> str:
+    cleaned = str(token or "").strip().strip("'\"`")
+    cleaned = cleaned.split("::", 1)[0]
+    cleaned = cleaned.split(":", 1)[0] if re.search(r"\.[A-Za-z0-9]+:\d+$", cleaned) else cleaned
+    return normalize_workspace_relative_path(cleaned)
+
+
+def is_source_file_candidate(path: str) -> bool:
+    normalized = normalize_workspace_relative_path(path)
+    if not normalized or normalized.startswith("-") or generated_artifact_target(normalized):
+        return False
+    suffix = posixpath.splitext(normalized)[1].lower()
+    return suffix in SOURCE_FILE_EXTENSIONS
+
+
 def task_contract_source_targets(task_contract: TaskContract | None) -> list[str]:
     if task_contract is None:
         return []
@@ -1448,12 +1573,10 @@ def targeted_repair_action_block(state: AgentState, tool_name: str, args: dict[s
     _ = args
     if state.repair_mode != "targeted_repair" or not state.active_repair_action:
         return ""
-    forbidden_until_modified = {str(tool) for tool in state.active_repair_action.get("forbidden_until_modified") or [] if str(tool)}
-    if tool_name in forbidden_until_modified and not targeted_repair_modified_target(state):
-        target = next(iter(sorted(targeted_repair_targets(state))), "the target file")
+    if tool_name in targeted_repair_hard_forbidden_tools(state):
         return (
-            f"{tool_name} is blocked by the active targeted repair action until {target} is modified. "
-            "Edit the target file first with edit_file, write_file, replace_in_file, or apply_patch."
+            f"{tool_name} is blocked by the active targeted repair action. "
+            "Use local read/edit/run_command/git tools for this repair instead."
         )
     return ""
 

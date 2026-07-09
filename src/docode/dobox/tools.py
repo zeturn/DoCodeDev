@@ -279,14 +279,20 @@ class DoBoxTools:
         return self._compress("search", result.output, result.exit_code, {"query": query, "path": path}, truncated=result.truncated)
 
     async def git_status(self) -> ToolResult:
-        result = await self.client.git_status(self.project_id, agent_session_id=self.agent_session_id)
+        try:
+            result = await self.client.git_status(self.project_id, agent_session_id=self.agent_session_id)
+        except Exception as exc:
+            return runtime_safe_git_fallback("git_status", exc)
         return self._compress("git_status", result.output, result.exit_code, truncated=result.truncated)
 
     async def git_diff(self) -> ToolResult:
-        if hasattr(self.client, "git_diff_result"):
-            result = await self.client.git_diff_result(self.project_id, agent_session_id=self.agent_session_id)
-            return self._compress("git_diff", result.output, result.exit_code, truncated=result.truncated)
-        diff = await self.client.git_diff(self.project_id, agent_session_id=self.agent_session_id)
+        try:
+            if hasattr(self.client, "git_diff_result"):
+                result = await self.client.git_diff_result(self.project_id, agent_session_id=self.agent_session_id)
+                return self._compress("git_diff", result.output, result.exit_code, truncated=result.truncated)
+            diff = await self.client.git_diff(self.project_id, agent_session_id=self.agent_session_id)
+        except Exception as exc:
+            return runtime_safe_git_fallback("git_diff", exc)
         return self._compress("git_diff", diff, 0)
 
     async def git_commit(self, message: str) -> ToolResult:
@@ -462,6 +468,16 @@ def workspace_path_error(path: str, *, label: str = "path") -> str | None:
 
 def rejected_tool_result(tool: str, reason: str, metadata: dict[str, Any]) -> ToolResult:
     return ToolResult(tool=tool, output=f"rejected: {reason}", exit_code=2, metadata={**metadata, "rejected": True, "reason": reason})
+
+
+def runtime_safe_git_fallback(tool: str, exc: Exception) -> ToolResult:
+    error_type = type(exc).__name__
+    return ToolResult(
+        tool=tool,
+        output=f"{tool} unavailable: {error_type}: {exc}",
+        exit_code=124,
+        metadata={"runtime_safe_fallback": True, "error_type": error_type},
+    )
 
 
 def filter_handler_args(handler: ToolCallable, args: dict[str, Any]) -> dict[str, Any]:

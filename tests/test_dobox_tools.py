@@ -191,6 +191,54 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
         self.assertIn("+change", result.output)
         self.assertTrue(result.truncated)
 
+    async def test_git_diff_result_exception_returns_runtime_safe_fallback(self) -> None:
+        class RaisingDiffClient(FakeDoBoxClient):
+            async def git_diff_result(self, project_id, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                raise TimeoutError("diff timed out")
+
+        tools = DoBoxTools(RaisingDiffClient(), "project-123")
+
+        result = await tools.git_diff()
+
+        self.assertEqual(result.exit_code, 124)
+        self.assertIn("git_diff unavailable: TimeoutError: diff timed out", result.output)
+        self.assertEqual(result.metadata, {"runtime_safe_fallback": True, "error_type": "TimeoutError"})
+
+    async def test_git_status_exception_returns_runtime_safe_fallback(self) -> None:
+        class RaisingStatusClient(FakeDoBoxClient):
+            async def git_status(self, project_id, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                raise RuntimeError("status unavailable")
+
+        tools = DoBoxTools(RaisingStatusClient(), "project-123")
+
+        result = await tools.git_status()
+
+        self.assertEqual(result.exit_code, 124)
+        self.assertIn("git_status unavailable: RuntimeError: status unavailable", result.output)
+        self.assertEqual(result.metadata, {"runtime_safe_fallback": True, "error_type": "RuntimeError"})
+
+    async def test_git_helpers_preserve_normal_command_failures(self) -> None:
+        class FailingGitClient(FakeDoBoxClient):
+            async def git_status(self, project_id, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                return CommandResult("fatal: not a git repository", 128)
+
+            async def git_diff_result(self, project_id, agent_session_id=None):
+                self.agent_session_ids.append(agent_session_id)
+                return CommandResult("fatal: bad revision", 128)
+
+        tools = DoBoxTools(FailingGitClient(), "project-123")
+
+        status = await tools.git_status()
+        diff = await tools.git_diff()
+
+        self.assertEqual(status.exit_code, 128)
+        self.assertEqual(diff.exit_code, 128)
+        self.assertNotEqual((status.metadata or {}).get("runtime_safe_fallback"), True)
+        self.assertNotEqual((diff.metadata or {}).get("runtime_safe_fallback"), True)
+
     async def test_edit_file_replaces_exact_text_and_returns_diff(self) -> None:
         client = FakeDoBoxClient()
         tools = DoBoxTools(client, "project-123")

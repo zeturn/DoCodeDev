@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import difflib
+import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
@@ -134,7 +136,7 @@ class FixtureCalculatorTools:
         if command.startswith("git add -N"):
             return ToolResult(tool="run_command", output="", metadata={"command": command})
         completed = subprocess.run(
-            command,
+            executable_python_command(command),
             cwd=self.workspace,
             shell=True,
             text=True,
@@ -306,6 +308,12 @@ def normalize_path(path: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized
+
+
+def executable_python_command(command: str) -> str:
+    if command.startswith("python -m "):
+        return f"{shlex.quote(sys.executable)} {command[len('python ') :]}"
+    return command
 
 
 def safe_workspace_path(workspace: Path, path: str) -> Path:

@@ -17,6 +17,7 @@ from docode.agent.loop import (
     duplicate_inspection_pressure_tool_block,
     duplicate_read_file_block,
     edit_required_tool_block,
+    fallback_required_command_repair,
     latest_successful_read_index,
     latest_failed_required_command,
     preferred_targeted_repair_target,
@@ -1944,6 +1945,99 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIn("git_diff", names)
         self.assertIn("blocked by the active targeted repair action", repair_mode_tool_block(state, "fetch_url"))
         self.assertEqual(repair_mode_tool_block(state, "run_command"), "")
+        self.assertIn("blocked by the active targeted repair action", targeted_repair_action_block(state, "web_search", {"query": "x"}))
+        self.assertEqual(targeted_repair_action_block(state, "run_command", {"command": "python3 -m unittest discover -s tests"}), "")
+        self.assertEqual(targeted_repair_action_block(state, "read_file", {"path": "crawler.py"}), "")
+        self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "README.md"}), "")
+        self.assertEqual(targeted_repair_action_block(state, "git_diff", {}), "")
+
+    def test_fallback_required_command_repair_creates_generic_action(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.task_contract = TaskContract(
+            must_modify_files=["app.py"],
+            must_run_commands=["python3 scripts/check_formatter.py"],
+        )
+        state.latest_git_status = ToolResult(tool="git_status", output=" M changed.py\n M data/output.json\n")
+        output = (
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/formatter.py", line 8, in format_name\n'
+            "RuntimeError: custom validation failed\n"
+        )
+
+        action = fallback_required_command_repair(
+            state,
+            ToolResult(
+                tool="run_command",
+                output=output,
+                exit_code=1,
+                metadata={"command": "python3 scripts/check_formatter.py"},
+            ),
+        )
+
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.category, "failed_required_command")
+        self.assertTrue(action.signature.startswith("failed_required_command:"))
+        self.assertEqual(action.reason, "required verification command failed")
+        self.assertEqual(action.target_files, ["app.py", "formatter.py", "scripts/check_formatter.py", "changed.py"])
+        self.assertEqual(action.rerun_commands, ["python3 scripts/check_formatter.py"])
+        self.assertFalse(action.exploration_forbidden)
+        self.assertEqual(action.initial_inspection_budget, 2)
+        self.assertTrue({"read_file", "read_file_range", "list_files", "search", "write_file", "run_command", "git_diff"}.issubset(action.allowed_tools))
+        self.assertTrue({"web_search", "fetch_url", "preview", "logs"}.issubset(action.forbidden_tools))
+        self.assertIn("Failure output summary", action.instruction)
+        self.assertIn("Candidate target files: app.py, formatter.py, scripts/check_formatter.py, changed.py", action.instruction)
+        self.assertIn("Edit a relevant source file before rerunning", action.instruction)
+
+    def test_fallback_required_command_repair_only_handles_required_commands_and_does_not_invent_targets(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.task_contract = TaskContract(must_run_commands=["pytest"])
+
+        non_required = fallback_required_command_repair(
+            state,
+            ToolResult(tool="run_command", output="custom failure", exit_code=1, metadata={"command": "python3 check.py"}),
+        )
+        no_target = fallback_required_command_repair(
+            state,
+            ToolResult(tool="run_command", output="custom failure", exit_code=1, metadata={"command": "pytest"}),
+        )
+
+        self.assertIsNone(non_required)
+        self.assertIsNotNone(no_target)
+        assert no_target is not None
+        self.assertEqual(no_target.target_files, [])
+
+    async def test_specific_repair_planner_wins_over_generic_required_command_fallback(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Fix crawler.py"))
+            state = AgentState(job=job)
+            state.task_contract = TaskContract(
+                must_modify_files=["crawler.py"],
+                must_run_commands=["python3 -m unittest discover -s tests"],
+            )
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=FakeTools(),
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            await loop.plan_targeted_repair_from_failure(
+                state,
+                ToolResult(
+                    tool="run_command",
+                    output="ImportError: cannot import name 'parse_repositories' from 'crawler'",
+                    exit_code=1,
+                    metadata={"command": "python3 -m unittest discover -s tests"},
+                ),
+            )
+
+        self.assertIsNotNone(state.active_repair_action)
+        self.assertEqual(state.active_repair_action["category"], "import_error_missing_symbol")
+        self.assertNotEqual(state.active_repair_action["category"], "failed_required_command")
 
     def test_latest_failed_required_command_finds_classifiable_failure(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -2170,10 +2264,11 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
                 [
                     "python3 -m unittest discover -s tests",
                     "python3 -m unittest discover -s tests",
+                    "python3 -m unittest discover -s tests",
                 ],
             )
             rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
-            self.assertTrue(any(step.content.get("reason") == "targeted_repair_wrong_action" for step in rejected))
+            self.assertFalse(any(step.content.get("reason") == "targeted_repair_wrong_action" for step in rejected))
 
     def test_targeted_repair_edit_forced_does_not_generate_or_force_write_content(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix calculator.py."))
