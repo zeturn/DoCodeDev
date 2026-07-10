@@ -7,6 +7,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 
+MAX_UNIQUE_SOURCE_INSPECTIONS = 4
+
+
 def apply_runtime_hotfix() -> None:
     """Install a narrow source/verification pipeline hotfix.
 
@@ -22,13 +25,13 @@ def apply_runtime_hotfix() -> None:
 
     if getattr(loop, "_source_pipeline_hotfix_v1_applied", False):
         return
-    setattr(loop, "_source_pipeline_hotfix_v1_applied", True)
 
     _patch_prompt(loop, prompts)
     _patch_inspect_source_cache(DoBoxTools, ToolResult)
     _patch_source_tool_visibility(loop)
     _patch_source_domain_policy(loop)
     _patch_controller_verification_order(loop, workflow)
+    setattr(loop, "_source_pipeline_hotfix_v1_applied", True)
 
 
 def _patch_prompt(loop: Any, prompts: Any) -> None:
@@ -74,22 +77,15 @@ def _patch_inspect_source_cache(tools_cls: Any, tool_result_cls: Any) -> None:
             normalized_timeout = int(timeout)
         except (TypeError, ValueError):
             normalized_timeout = 15
-        key = (normalized_url, normalized_mode, normalized_max_bytes, normalized_timeout)
+
+        key = (normalized_url, normalized_mode)
         cache = getattr(self, "_docode_inspect_source_cache", None)
         if cache is None:
             cache = {}
             setattr(self, "_docode_inspect_source_cache", cache)
         cached = cache.get(key)
-        if cached is not None:
-            metadata = dict(cached.metadata or {})
-            metadata.update({"cached": True, "network_request_performed": False})
-            return tool_result_cls(
-                tool="inspect_source",
-                output=cached.output,
-                exit_code=cached.exit_code,
-                metadata=metadata,
-                truncated=cached.truncated,
-            )
+        if cached is not None and not _larger_refetch_needed(cached, normalized_max_bytes):
+            return _cached_source_result(cached, tool_result_cls)
 
         result = await original(
             self,
@@ -106,6 +102,41 @@ def _patch_inspect_source_cache(tools_cls: Any, tool_result_cls: Any) -> None:
         return enriched
 
     tools_cls.inspect_source = inspect_source
+
+
+def _larger_refetch_needed(cached: Any, requested_max_bytes: int) -> bool:
+    metadata = cached.metadata if isinstance(cached.metadata, dict) else {}
+    if not (cached.truncated or metadata.get("truncated")):
+        return False
+    try:
+        returned = int(metadata.get("returned_bytes") or 0)
+    except (TypeError, ValueError):
+        returned = 0
+    return requested_max_bytes > returned
+
+
+def _cached_source_result(cached: Any, tool_result_cls: Any) -> Any:
+    metadata = dict(cached.metadata or {})
+    metadata.update({"cached": True, "network_request_performed": False})
+    payload: dict[str, Any] = {
+        "requested_url": metadata.get("requested_url") or metadata.get("url"),
+        "final_url": metadata.get("final_url"),
+        "status_code": metadata.get("status_code"),
+        "content_type": metadata.get("content_type"),
+        "mode": metadata.get("mode"),
+        "cached": True,
+        "network_request_performed": False,
+        "truncated": bool(metadata.get("truncated") or cached.truncated),
+        "structure_summary": metadata.get("structure_summary") or {},
+        "instruction": "This exact source was already inspected. Reuse the existing raw source evidence and edit or inspect a distinct same-origin page; do not request this URL again.",
+    }
+    return tool_result_cls(
+        tool="inspect_source",
+        output=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        exit_code=cached.exit_code,
+        metadata=metadata,
+        truncated=cached.truncated,
+    )
 
 
 def _enrich_source_result(result: Any, tool_result_cls: Any) -> Any:
@@ -143,11 +174,7 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
         except (TypeError, ValueError, json.JSONDecodeError):
             return {}
         if isinstance(value, dict):
-            list_fields = {
-                str(key): len(item)
-                for key, item in value.items()
-                if isinstance(item, list)
-            }
+            list_fields = {str(key): len(item) for key, item in value.items() if isinstance(item, list)}
             cursor_fields = {
                 str(key): item
                 for key, item in value.items()
@@ -164,10 +191,7 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
             return {"kind": "json_array", "length": len(value), "sample_keys": sample_keys}
         return {"kind": type(value).__name__}
 
-    tag_counts = Counter(
-        match.group(1).lower()
-        for match in re.finditer(r"<\s*([A-Za-z][A-Za-z0-9:._-]*)\b", body)
-    )
+    tag_counts = Counter(match.group(1).lower() for match in re.finditer(r"<\s*([A-Za-z][A-Za-z0-9:._-]*)\b", body))
     class_counts: Counter[str] = Counter()
     for match in re.finditer(r"\bclass\s*=\s*(['\"])(.*?)\1", body, flags=re.IGNORECASE | re.DOTALL):
         for name in match.group(2).split():
@@ -179,11 +203,7 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
     namespaces = sorted(
         set(match.group(1) for match in re.finditer(r"\bxmlns(?::([A-Za-z0-9_.-]+))?\s*=", body, flags=re.IGNORECASE))
     )[:20]
-    repeated_tags = [
-        {"tag": tag, "count": count}
-        for tag, count in tag_counts.most_common(12)
-        if count > 1
-    ]
+    repeated_tags = [{"tag": tag, "count": count} for tag, count in tag_counts.most_common(12) if count > 1]
     kind = "xml" if "xml" in lowered or body.lstrip().startswith("<?xml") else "html"
     return {
         "kind": kind,
@@ -197,19 +217,20 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
 
 
 def _patch_source_tool_visibility(loop: Any) -> None:
-    original = loop.allowed_tool_definitions_for_state
+    original_definitions = loop.allowed_tool_definitions_for_state
+    original_repair_block = loop.repair_mode_tool_block
 
     def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> list[Any]:
-        selected = list(original(definitions, state))
+        selected = list(original_definitions(definitions, state))
         if not loop.is_crawler_instruction(state.job.instruction):
             return selected
         if loop.successful_source_inspection(state.messages, state.job.instruction) is None:
             return selected
-        if loop.successful_edit_tool_called(state):
-            return selected
         status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
         snapshot = loop.workflow_snapshot(state, status_output)
-        if snapshot.phase != loop.WorkflowPhase.EDIT_REQUIRED or state.repair_mode is not None:
+        if snapshot.phase == loop.WorkflowPhase.FINAL_READY:
+            return selected
+        if _unique_source_urls(state) >= MAX_UNIQUE_SOURCE_INSPECTIONS:
             return selected
         if any(getattr(definition, "name", None) == "inspect_source" for definition in selected):
             return selected
@@ -221,7 +242,33 @@ def _patch_source_tool_visibility(loop: Any) -> None:
             selected.append(inspect_definition)
         return selected
 
+    def repair_mode_tool_block(state: Any, tool_name: str) -> str:
+        if (
+            tool_name == "inspect_source"
+            and loop.is_crawler_instruction(state.job.instruction)
+            and loop.successful_source_inspection(state.messages, state.job.instruction) is not None
+            and _unique_source_urls(state) < MAX_UNIQUE_SOURCE_INSPECTIONS
+        ):
+            return ""
+        return original_repair_block(state, tool_name)
+
     loop.allowed_tool_definitions_for_state = allowed_tool_definitions_for_state
+    loop.repair_mode_tool_block = repair_mode_tool_block
+
+
+def _unique_source_urls(state: Any) -> int:
+    return len(
+        {
+            str(metadata.get("requested_url") or metadata.get("url") or "")
+            for message in state.messages
+            if message.get("role") == "tool"
+            and message.get("tool") == "inspect_source"
+            and int(message.get("exit_code") or 0) == 0
+            and isinstance((metadata := message.get("metadata")), dict)
+            and not metadata.get("cached")
+            and str(metadata.get("requested_url") or metadata.get("url") or "")
+        }
+    )
 
 
 def _patch_source_domain_policy(loop: Any) -> None:
@@ -256,19 +303,15 @@ def _patch_source_domain_policy(loop: Any) -> None:
                     "web_search is blocked because the query drifted to unrelated security-control content. "
                     f"Keep research anchored to the planned source domain(s): {', '.join(sorted(allowed_domains))}."
                 )
-        # Source-domain policy applies to actual network tools, not namespace,
-        # schema, vocabulary, documentation, or output URLs written into code.
+        # Network policy applies to network tools, not XML namespaces, schema
+        # identifiers, documentation URLs, or output links written into code.
         return ""
 
     loop.crawler_external_source_tool_block = crawler_external_source_tool_block
 
 
 def _allowed_source_origins(loop: Any, state: Any) -> set[tuple[str, str, int]]:
-    origins = {
-        origin
-        for url in loop.instruction_source_urls(state.job.instruction)
-        if (origin := _url_origin(url)) is not None
-    }
+    origins = {origin for url in loop.instruction_source_urls(state.job.instruction) if (origin := _url_origin(url)) is not None}
     for message in state.messages:
         if message.get("role") != "tool" or message.get("tool") != "inspect_source" or int(message.get("exit_code") or 0) != 0:
             continue
@@ -318,9 +361,9 @@ def _patch_controller_verification_order(loop: Any, workflow: Any) -> None:
             if loop.missing_must_modify_targets(state):
                 return ""
 
-        # Every successful source edit starts a new verification epoch. Execute
-        # explicit commands from the beginning so producers refresh artifacts
-        # before validators inspect them.
+        # Every successful source edit starts a new verification epoch. Run the
+        # explicit plan from the beginning so producer commands refresh their
+        # artifacts before validator commands consume them.
         for command in commands:
             if not workflow.command_was_run(state, command):
                 return command
