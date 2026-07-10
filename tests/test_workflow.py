@@ -94,3 +94,16 @@ class WorkflowCommandEquivalenceTests(TestCase):
         )
 
         self.assertFalse(command_was_run(state, "python -m unittest discover -s tests"))
+
+    def test_successful_command_before_latest_edit_is_stale(self) -> None:
+        command = "python3 checks/check_contract.py"
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
+        state.task_contract = TaskContract(must_run_commands=[command])
+        state.add_tool_result(ToolResult(tool="write_file", output="ok", metadata={"path": "source.py"}))
+        state.add_tool_result(ToolResult(tool="run_command", output="ok", metadata={"command": command}))
+        state.add_tool_result(ToolResult(tool="edit_file", output="ok", metadata={"path": "source.py"}))
+
+        self.assertFalse(command_was_run(state, command))
+
+        state.add_tool_result(ToolResult(tool="run_command", output="ok", metadata={"command": command}))
+        self.assertTrue(command_was_run(state, command))

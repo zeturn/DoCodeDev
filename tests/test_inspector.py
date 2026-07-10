@@ -37,3 +37,14 @@ class ProjectInspectorTests(IsolatedAsyncioTestCase):
         self.assertEqual(set(inspection.important_files), {"README.md", "package.json"})
         self.assertEqual(inspection.detected_commands["test"], "npm test")
         self.assertIn("`npm run build` exits successfully.", inspection.acceptance_criteria)
+
+    async def test_explicit_command_is_preserved_separately_from_detected_tests(self) -> None:
+        command = "python3 checks/check_contract.py --mode exact"
+        inspection = await ProjectInspector().inspect(
+            f"Update source.py.\nVerification commands:\n1. {command}",
+            InspectorTools(),
+        )
+
+        self.assertEqual(inspection.explicit_commands, [command])
+        self.assertEqual(inspection.detected_commands["test"], "npm test")
+        self.assertIn(f"The exact required command `{command}` exits successfully after the latest edit.", inspection.acceptance_criteria)

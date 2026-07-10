@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import posixpath
 import re
 import shlex
@@ -606,9 +607,22 @@ class CodingAgentLoop:
             {"type": "finalization_stage", "stage": "verification_start"},
         )
         await self.repository.update_job(job.id, status=JobStatus.VERIFYING)
-        evidence = verification_evidence_from_steps(await self.repository.list_steps(job.id)).with_no_test_reason(decision.no_test_reason)
+        evidence = verification_evidence_from_steps(
+            await self.repository.list_steps(job.id),
+            explicit_commands=list(state.task_contract.must_run_commands) if state.task_contract else [],
+        ).with_no_test_reason(decision.no_test_reason)
         try:
-            verification = await asyncio.wait_for(self.verifier.verify(job, self.tools, evidence=evidence), timeout=180)
+            verify_kwargs: dict[str, Any] = {"evidence": evidence}
+            verify_parameters = inspect.signature(self.verifier.verify).parameters
+            supports_context = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in verify_parameters.values())
+            if supports_context or "task_contract" in verify_parameters:
+                verify_kwargs["task_contract"] = state.task_contract
+            if supports_context or "inspection" in verify_parameters:
+                verify_kwargs["inspection"] = state.inspection
+            verification = await asyncio.wait_for(
+                self.verifier.verify(job, self.tools, **verify_kwargs),
+                timeout=180,
+            )
         except Exception as exc:
             await self.repository.add_step(
                 job.id,
@@ -753,9 +767,9 @@ class CodingAgentLoop:
         return None
 
     async def bootstrap(self, state: AgentState) -> None:
-        inspection = await self.inspector.inspect(state.job.instruction, self.tools)
-        state.inspection = inspection
         state.task_contract = task_contract_from_instruction(state.job.instruction)
+        inspection = await self.inspector.inspect(state.job.instruction, self.tools, state.task_contract)
+        state.inspection = inspection
         await self.repository.add_step(
             state.job.id,
             "system",
@@ -764,6 +778,7 @@ class CodingAgentLoop:
                 "listing": inspection.listing,
                 "important_files": list(inspection.important_files),
                 "detected_commands": inspection.detected_commands,
+                "explicit_commands": inspection.explicit_commands,
                 "plan": inspection.plan,
                 "acceptance_criteria": inspection.acceptance_criteria,
                 "task_contract": {
@@ -1029,6 +1044,15 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
             "output": result.smoke_result.output if result.smoke_result else None,
             "metadata": result.smoke_result.metadata if result.smoke_result else None,
         },
+        "explicit_commands": [
+            {
+                "command": (item.metadata or {}).get("command"),
+                "exit_code": item.exit_code,
+                "output": item.output,
+                "metadata": item.metadata or {},
+            }
+            for item in (result.explicit_results or [])
+        ],
         "llm_judgement": {
             "passed": result.llm_judgement.passed,
             "confidence": result.llm_judgement.confidence,
@@ -1039,6 +1063,7 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
         else None,
         "verification_plan": {
             "required_commands": result.verification_plan.required_commands,
+            "explicit_commands": result.verification_plan.explicit_commands,
             "smoke_commands": result.verification_plan.smoke_commands,
             "require_test_change": result.verification_plan.require_test_change,
             "require_entrypoint_run": result.verification_plan.require_entrypoint_run,
@@ -1054,6 +1079,19 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
             "successful_fetch_urls": result.evidence.successful_fetch_urls,
             "successful_web_search_queries": result.evidence.successful_web_search_queries,
             "relevant_fetch_urls": result.evidence.relevant_fetch_urls or [],
+            "latest_edit_step_index": result.evidence.latest_edit_step_index,
+            "latest_edit_epoch": result.evidence.latest_edit_epoch,
+            "command_runs": [
+                {
+                    "command": run.command,
+                    "output": run.output,
+                    "exit_code": run.exit_code,
+                    "step_index": run.step_index,
+                    "edit_epoch": run.edit_epoch,
+                    "explicit": run.explicit,
+                }
+                for run in (result.evidence.command_runs or [])
+            ],
             "no_test_reason": result.evidence.no_test_reason,
         }
         if result.evidence

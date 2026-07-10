@@ -5,13 +5,17 @@ import re
 import shlex
 import json
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from docode.agent.task_contract import verification_commands_from_instruction
+from docode.agent.task_contract import TaskContract, task_contract_from_instruction
+from docode.agent.workflow import EDIT_TOOLS, commands_equivalent
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
 from docode.git_changes import changed_paths_from_status, meaningful_change_path, parse_status_line, strip_ansi
 from docode.storage.models import CodingJob
+
+if TYPE_CHECKING:
+    from docode.agent.inspector import ProjectInspection
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +40,7 @@ class VerificationResult:
     lint_result: ToolResult | None = None
     smoke_result: ToolResult | None = None
     workspace_result: ToolResult | None = None
+    explicit_results: list[ToolResult] | None = None
     llm_judgement: VerifierJudgement | None = None
     verification_plan: "VerificationPlan | None" = None
     evidence: "VerificationEvidence | None" = None
@@ -44,6 +49,7 @@ class VerificationResult:
 @dataclass(frozen=True, slots=True)
 class VerificationPlan:
     required_commands: list[str]
+    explicit_commands: list[str]
     smoke_commands: list[str]
     require_test_change: bool = False
     require_entrypoint_run: bool = False
@@ -59,12 +65,25 @@ class VerificationPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class CommandEvidence:
+    command: str
+    output: str
+    exit_code: int
+    step_index: int
+    edit_epoch: int
+    explicit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class VerificationEvidence:
     successful_fetch_urls: list[str]
     successful_web_search_queries: list[str]
     relevant_fetch_urls: list[str] | None = None
     successful_commands: list[str] | None = None
     successful_command_outputs: list[str] | None = None
+    command_runs: list[CommandEvidence] | None = None
+    latest_edit_step_index: int = -1
+    latest_edit_epoch: int = 0
     no_test_reason: str | None = None
 
     @property
@@ -83,6 +102,9 @@ class VerificationEvidence:
             relevant_fetch_urls=self.relevant_fetch_urls,
             successful_commands=self.successful_commands,
             successful_command_outputs=self.successful_command_outputs,
+            command_runs=self.command_runs,
+            latest_edit_step_index=self.latest_edit_step_index,
+            latest_edit_epoch=self.latest_edit_epoch,
             no_test_reason=reason,
         )
 
@@ -106,20 +128,32 @@ class CodingVerifier:
         self.judge = judge
         self.judge_timeout_seconds = judge_timeout_seconds
 
-    async def verify(self, job: CodingJob, tools: DoBoxTools, evidence: VerificationEvidence | None = None) -> VerificationResult:
+    async def verify(
+        self,
+        job: CodingJob,
+        tools: DoBoxTools,
+        evidence: VerificationEvidence | None = None,
+        *,
+        task_contract: TaskContract | None = None,
+        inspection: ProjectInspection | None = None,
+    ) -> VerificationResult:
         evidence = evidence or empty_verification_evidence()
-        plan = build_verification_plan(job.instruction)
+        task_contract = task_contract or task_contract_from_instruction(job.instruction)
+        plan = build_verification_plan(job.instruction, task_contract=task_contract)
         await prepare_workspace_for_diff(tools)
         status_result = await safe_tool_call("git_status", tools.git_status)
         diff_result = await safe_tool_call("git_diff", tools.git_diff)
+        explicit_results = await run_or_reuse_explicit_commands(plan.explicit_commands, tools, evidence)
+        evidence = evidence_with_command_results(evidence, explicit_results)
         if plan.docs_only or plan.artifact_export:
             test_result = skipped_result("run_tests", "verification skipped for docs/artifact task")
             build_result = skipped_result("run_build", "verification skipped for docs/artifact task")
             lint_result = skipped_result("run_lint", "verification skipped for docs/artifact task")
         else:
-            test_result = await safe_tool_call("run_tests", tools.run_tests)
-            build_result = await safe_tool_call("run_build", tools.run_build)
-            lint_result = await safe_tool_call("run_lint", tools.run_lint)
+            detected_commands = inspection.detected_commands if inspection is not None else {}
+            test_result = await run_or_reuse_detected_check("test", "run_tests", tools, evidence, explicit_results, detected_commands)
+            build_result = await run_or_reuse_detected_check("build", "run_build", tools, evidence, explicit_results, detected_commands)
+            lint_result = await run_or_reuse_detected_check("lint", "run_lint", tools, evidence, explicit_results, detected_commands)
         non_git_workspace = is_non_git_status(status_result)
         workspace_result: ToolResult | None = None
         has_explicit_artifact = False
@@ -141,8 +175,9 @@ class CodingVerifier:
             verified_diff = await augment_diff_with_required_file_content(verified_diff, plan, tools)
         if plan.require_declared_python_dependencies or plan.require_crawler_artifacts:
             verified_diff = await augment_diff_with_policy_file_content(verified_diff, tools)
-        smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result, plan)
+        smoke_result = await run_smoke_verification(job, tools, verified_diff, test_result, build_result, lint_result, plan, explicit_results)
         smoke_ok = smoke_result.exit_code == 0
+        explicit_ok = all(result.exit_code == 0 for result in explicit_results)
         plan_ok, plan_fixes = evaluate_verification_plan(plan, verified_diff, test_result, build_result, lint_result, smoke_result, evidence)
 
         fixes: list[str] = []
@@ -160,6 +195,8 @@ class CodingVerifier:
             fixes.append("fix failing build command")
         if not lint_ok:
             fixes.append("fix failing lint command")
+        if not explicit_ok:
+            fixes.append("fix failing explicit verification command")
         if not smoke_ok:
             fixes.append("fix failing smoke verification command")
             fixes.append(smoke_failure_hint(smoke_result))
@@ -175,7 +212,7 @@ class CodingVerifier:
         if judgement is not None and not judgement.passed:
             fixes.extend(fix for fix in judgement.required_fixes if fix not in fixes)
 
-        command_checks_passed = status_ok and status_complete and has_change_evidence and diff_complete and tests_ok and build_ok and lint_ok and smoke_ok and plan_ok
+        command_checks_passed = status_ok and status_complete and has_change_evidence and diff_complete and tests_ok and build_ok and lint_ok and explicit_ok and smoke_ok and plan_ok
         llm_checks_passed = judgement is None or judgement.passed
         if command_checks_passed and llm_checks_passed:
             confidence = min(judgement.confidence, 0.95) if judgement is not None else 0.86
@@ -193,6 +230,7 @@ class CodingVerifier:
                 lint_result=lint_result,
                 smoke_result=smoke_result,
                 workspace_result=workspace_result,
+                explicit_results=explicit_results,
                 llm_judgement=judgement,
                 verification_plan=plan,
                 evidence=evidence,
@@ -216,6 +254,7 @@ class CodingVerifier:
             lint_result=lint_result,
             smoke_result=smoke_result,
             workspace_result=workspace_result,
+            explicit_results=explicit_results,
             llm_judgement=judgement,
             verification_plan=plan,
             evidence=evidence,
@@ -328,6 +367,141 @@ def skipped_result(tool: str, output: str) -> ToolResult:
     return ToolResult(tool=tool, output=output, exit_code=0, metadata={"detected": False, "skipped": True})
 
 
+async def run_or_reuse_explicit_commands(
+    commands: list[str],
+    tools: DoBoxTools,
+    evidence: VerificationEvidence,
+) -> list[ToolResult]:
+    results: list[ToolResult] = []
+    for command in commands:
+        recorded = latest_fresh_command_evidence(evidence, command)
+        if recorded is not None:
+            results.append(tool_result_from_command_evidence(recorded, explicit=True))
+            continue
+        result = await safe_optional_tool_call("run_command", tools, command, "/workspace")
+        metadata = dict(result.metadata or {})
+        metadata.update({"command": command, "explicit": True, "reused_evidence": False})
+        results.append(
+            ToolResult(
+                tool="run_command",
+                output=result.output,
+                exit_code=result.exit_code,
+                metadata=metadata,
+                truncated=result.truncated,
+            )
+        )
+    return results
+
+
+async def run_or_reuse_detected_check(
+    command_kind: str,
+    tool_name: str,
+    tools: DoBoxTools,
+    evidence: VerificationEvidence,
+    current_results: list[ToolResult],
+    detected_commands: dict[str, str | None],
+) -> ToolResult:
+    detector = getattr(tools, f"detect_{command_kind}_command", None)
+    runner = getattr(tools, tool_name, None)
+    if command_kind in detected_commands:
+        command = detected_commands.get(command_kind)
+    elif detector is not None:
+        detected = await safe_tool_call(f"detect_{command_kind}_command", detector)
+        command = str((detected.metadata or {}).get("command") or "") if isinstance(detected, ToolResult) else detected
+    else:
+        # Compatibility for lightweight verifier test doubles. Production tools
+        # always expose detectors, so repository checks are never guessed here.
+        return await safe_tool_call(tool_name, runner) if runner is not None else skipped_result(tool_name, "verification tool unavailable")
+    if not command:
+        return skipped_result(tool_name, f"no {command_kind} command detected")
+
+    for result in reversed(current_results):
+        observed = str((result.metadata or {}).get("command") or "")
+        if observed and commands_equivalent(observed, command):
+            return reused_check_result(tool_name, command, result)
+    recorded = latest_fresh_command_evidence(evidence, command)
+    if recorded is not None:
+        return reused_check_result(tool_name, command, tool_result_from_command_evidence(recorded))
+    if runner is None:
+        return ToolResult(tool=tool_name, output=f"{tool_name} unavailable", exit_code=1, metadata={"command": command, "detected": True})
+    return await safe_tool_call(tool_name, runner)
+
+
+def reused_check_result(tool_name: str, command: str, result: ToolResult) -> ToolResult:
+    metadata = dict(result.metadata or {})
+    metadata.update({"command": command, "detected": True, "reused_evidence": True})
+    return ToolResult(
+        tool=tool_name,
+        output=result.output,
+        exit_code=result.exit_code,
+        metadata=metadata,
+        truncated=result.truncated,
+    )
+
+
+def latest_fresh_command_evidence(evidence: VerificationEvidence, command: str) -> CommandEvidence | None:
+    matches = [
+        run
+        for run in (evidence.command_runs or [])
+        if run.step_index > evidence.latest_edit_step_index and commands_equivalent(run.command, command)
+    ]
+    return matches[-1] if matches else None
+
+
+def tool_result_from_command_evidence(recorded: CommandEvidence, *, explicit: bool | None = None) -> ToolResult:
+    return ToolResult(
+        tool="run_command",
+        output=recorded.output,
+        exit_code=recorded.exit_code,
+        metadata={
+            "command": recorded.command,
+            "explicit": recorded.explicit if explicit is None else explicit,
+            "reused_evidence": True,
+            "evidence_step_index": recorded.step_index,
+            "edit_epoch": recorded.edit_epoch,
+        },
+    )
+
+
+def evidence_with_command_results(
+    evidence: VerificationEvidence,
+    results: list[ToolResult],
+) -> VerificationEvidence:
+    successful_commands = list(evidence.successful_commands or [])
+    successful_outputs = list(evidence.successful_command_outputs or [])
+    command_runs = list(evidence.command_runs or [])
+    next_step = max([evidence.latest_edit_step_index, *(run.step_index for run in command_runs)], default=-1) + 1
+    for result in results:
+        command = str((result.metadata or {}).get("command") or "")
+        if not command or (result.metadata or {}).get("reused_evidence"):
+            continue
+        command_runs.append(
+            CommandEvidence(
+                command=command,
+                output=result.output,
+                exit_code=result.exit_code,
+                step_index=next_step,
+                edit_epoch=evidence.latest_edit_epoch,
+                explicit=bool((result.metadata or {}).get("explicit")),
+            )
+        )
+        next_step += 1
+        if result.exit_code == 0:
+            successful_commands.append(command)
+            successful_outputs.append(result.output)
+    return VerificationEvidence(
+        successful_fetch_urls=evidence.successful_fetch_urls,
+        successful_web_search_queries=evidence.successful_web_search_queries,
+        relevant_fetch_urls=evidence.relevant_fetch_urls,
+        successful_commands=successful_commands,
+        successful_command_outputs=successful_outputs,
+        command_runs=command_runs,
+        latest_edit_step_index=evidence.latest_edit_step_index,
+        latest_edit_epoch=evidence.latest_edit_epoch,
+        no_test_reason=evidence.no_test_reason,
+    )
+
+
 async def augment_diff_with_required_file_content(diff: str, plan: VerificationPlan, tools: DoBoxTools) -> str:
     additions: list[str] = []
     for path, terms in (plan.required_file_contains or {}).items():
@@ -378,8 +552,10 @@ async def run_smoke_verification(
     build_result: ToolResult,
     lint_result: ToolResult,
     plan: VerificationPlan | None = None,
+    explicit_results: list[ToolResult] | None = None,
 ) -> ToolResult:
     plan = plan or build_verification_plan(job.instruction)
+    explicit_results = explicit_results or []
     changed_files = changed_files_from_diff(diff)
     if not changed_files:
         return ToolResult(tool="run_smoke", output="no changed files detected for smoke verification", exit_code=0, metadata={"detected": False})
@@ -398,7 +574,7 @@ async def run_smoke_verification(
         if runnable:
             if plan.smoke_commands:
                 commands.extend(plan.smoke_commands)
-            else:
+            elif not successful_command_covers_entrypoint(explicit_results, runnable):
                 for path in runnable[:1]:
                     suffix = " --dry-run" if plan.require_crawler_artifacts and diff_file_contains(diff, path, "--dry-run") else ""
                     commands.append("python3 " + shlex.quote(path) + suffix)
@@ -484,7 +660,10 @@ def workspace_diagnostic_command() -> str:
     )
 
 
-def build_verification_plan(instruction: str) -> VerificationPlan:
+def build_verification_plan(
+    instruction: str,
+    task_contract: TaskContract | None = None,
+) -> VerificationPlan:
     lowered = (instruction or "").lower()
     is_external_source_repair = any(
         keyword in lowered
@@ -517,12 +696,15 @@ def build_verification_plan(instruction: str) -> VerificationPlan:
         required_commands.append("api_contract_or_mock")
     if is_bugfix and not is_docs and not is_external_source_repair:
         required_commands.append("related_test")
-    smoke_commands = extracted_verification_commands(instruction)
+    contract = task_contract or task_contract_from_instruction(instruction)
+    explicit_commands = list(contract.must_run_commands)
+    smoke_commands: list[str] = []
     required_file_contains = extracted_file_contains_checks(instruction)
     if is_docs and not required_file_contains and "readme" in lowered:
         required_file_contains = {"README.md": ["Installation", "Usage"]} if "installation" in lowered and "usage" in lowered else None
     return VerificationPlan(
         required_commands=required_commands,
+        explicit_commands=explicit_commands,
         smoke_commands=smoke_commands,
         require_test_change=is_bugfix and not is_docs and not is_external_source_repair,
         require_entrypoint_run=(is_crawler or is_cli) and not is_bugfix and not is_artifact_export,
@@ -571,8 +753,14 @@ def api_requires_external_source_evidence(lowered_instruction: str) -> bool:
     return any(marker in lowered_instruction for marker in ("external endpoint", "external api", "public api", "api endpoint", "endpoint"))
 
 
-def extracted_verification_commands(instruction: str) -> list[str]:
-    return verification_commands_from_instruction(instruction)[:5]
+def successful_command_covers_entrypoint(results: list[ToolResult], entrypoints: list[str]) -> bool:
+    for result in results:
+        if result.exit_code != 0:
+            continue
+        command = str((result.metadata or {}).get("command") or "")
+        if any(path in command for path in entrypoints):
+            return True
+    return False
 
 
 def extracted_file_contains_checks(instruction: str) -> dict[str, list[str]] | None:
@@ -642,7 +830,10 @@ def evaluate_verification_plan(
     for path, required_terms in (plan.required_file_contains or {}).items():
         if not diff_contains_file_terms(diff, path, required_terms):
             fixes.append(f"update {path} so it contains: {', '.join(required_terms)}")
-    if plan.require_entrypoint_run and not (smoke_result.metadata and smoke_result.metadata.get("detected")):
+    if plan.require_entrypoint_run and not (
+        (smoke_result.metadata and smoke_result.metadata.get("detected"))
+        or successful_explicit_command_exists(plan, evidence)
+    ):
         fixes.append("run the task entrypoint or CLI command as smoke verification")
     if plan.require_no_placeholder and diff_contains_placeholder(diff_lowered):
         fixes.append("remove placeholder/TODO/stub implementation text before finishing")
@@ -650,7 +841,7 @@ def evaluate_verification_plan(
         smoke_result,
         evidence,
         diff,
-        required_commands=plan.smoke_commands,
+        required_commands=plan.explicit_commands,
     ):
         fixes.append("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run")
     if plan.require_declared_python_dependencies:
@@ -660,6 +851,13 @@ def evaluate_verification_plan(
         crawler_fixes = crawler_artifact_fixes(diff, smoke_result, evidence)
         fixes.extend(fix for fix in crawler_fixes if fix not in fixes)
     return not fixes, fixes
+
+
+def successful_explicit_command_exists(plan: VerificationPlan, evidence: VerificationEvidence) -> bool:
+    return any(
+        (recorded := latest_fresh_command_evidence(evidence, command)) is not None and recorded.exit_code == 0
+        for command in plan.explicit_commands
+    )
 
 
 def has_test_change(changed_files: list[str]) -> bool:
@@ -909,40 +1107,68 @@ def is_test_path(path: str) -> bool:
     return normalized.startswith("tests/") or "/tests/" in normalized or normalized.startswith("test_") or "/test_" in normalized
 
 
-def verification_evidence_from_steps(steps) -> VerificationEvidence:
+def verification_evidence_from_steps(
+    steps,
+    *,
+    explicit_commands: list[str] | None = None,
+) -> VerificationEvidence:
     fetch_urls: list[str] = []
     relevant_fetch_urls: list[str] = []
     web_search_queries: list[str] = []
     successful_commands: list[str] = []
     successful_command_outputs: list[str] = []
-    for step in steps:
+    command_runs: list[CommandEvidence] = []
+    latest_edit_step_index = -1
+    edit_epoch = 0
+    explicit_commands = list(explicit_commands or [])
+    for fallback_index, step in enumerate(steps):
         content = getattr(step, "content", step)
-        if not isinstance(content, dict) or content.get("type") != "tool_result" or content.get("exit_code") != 0:
+        step_index = int(getattr(step, "step_index", fallback_index))
+        if not isinstance(content, dict) or content.get("type") != "tool_result":
             continue
         tool = content.get("tool")
         metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
-        if tool == "fetch_url":
+        exit_code = int(content.get("exit_code") or 0)
+        if tool in EDIT_TOOLS and exit_code == 0:
+            edit_epoch += 1
+            latest_edit_step_index = step_index
+        if tool == "fetch_url" and exit_code == 0:
             url = metadata.get("url")
             if isinstance(url, str) and url and url not in fetch_urls:
                 fetch_urls.append(url)
             if isinstance(url, str) and fetch_result_relevant(content, metadata) and url not in relevant_fetch_urls:
                 relevant_fetch_urls.append(url)
-        elif tool == "web_search":
+        elif tool == "web_search" and exit_code == 0:
             query = metadata.get("query")
             if isinstance(query, str) and query and query not in web_search_queries:
                 web_search_queries.append(query)
         elif tool == "run_command":
             command = metadata.get("command")
-            if isinstance(command, str) and command and command not in successful_commands:
-                successful_commands.append(command)
-                output = content.get("output") or content.get("summary") or ""
-                successful_command_outputs.append(str(output)[:2000])
+            if isinstance(command, str) and command:
+                output = str(content.get("output") or content.get("summary") or "")
+                explicit = bool(metadata.get("explicit")) or any(commands_equivalent(command, expected) for expected in explicit_commands)
+                command_runs.append(
+                    CommandEvidence(
+                        command=command,
+                        output=output,
+                        exit_code=exit_code,
+                        step_index=step_index,
+                        edit_epoch=edit_epoch,
+                        explicit=explicit,
+                    )
+                )
+                if exit_code == 0:
+                    successful_commands.append(command)
+                    successful_command_outputs.append(output)
     return VerificationEvidence(
         successful_fetch_urls=fetch_urls,
         successful_web_search_queries=web_search_queries,
         relevant_fetch_urls=relevant_fetch_urls,
         successful_commands=successful_commands,
         successful_command_outputs=successful_command_outputs,
+        command_runs=command_runs,
+        latest_edit_step_index=latest_edit_step_index,
+        latest_edit_epoch=edit_epoch,
     )
 
 
@@ -953,6 +1179,9 @@ def empty_verification_evidence() -> VerificationEvidence:
         relevant_fetch_urls=[],
         successful_commands=[],
         successful_command_outputs=[],
+        command_runs=[],
+        latest_edit_step_index=-1,
+        latest_edit_epoch=0,
     )
 
 
