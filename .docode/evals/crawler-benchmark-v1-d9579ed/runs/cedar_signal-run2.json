@@ -1,0 +1,76 @@
+{
+  "case": "cedar_signal",
+  "title": "Build a collector for the documented CNEOS news feed.",
+  "language": "Python/HTTP",
+  "mode": "real_deepseek_real_dobox",
+  "run": 2,
+  "network_mode": "project",
+  "status": "succeeded",
+  "failure_reason": null,
+  "iterations": 4,
+  "llm_decisions": 4,
+  "tool_calls": 5,
+  "commands_run": 2,
+  "successful_commands": 2,
+  "repair_actions": 0,
+  "successful_edits": 1,
+  "successful_reads": 2,
+  "final_candidate_attempted": true,
+  "read_before_edit": true,
+  "whole_file_rewrite": false,
+  "verifier_result": true,
+  "quality_gate_result": true,
+  "artifact_export_result": true,
+  "changed_files": [
+    "cedar_brief.json",
+    "cedar_digest.py"
+  ],
+  "functionally_correct": true,
+  "required_commands_passed": true,
+  "required_command_evidence": [
+    {
+      "command": "python cedar_digest.py https://cneos.jpl.nasa.gov/feed/news.xml cedar_brief.json",
+      "exit_codes": [
+        0
+      ],
+      "passed": true
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+      "exit_codes": [
+        0
+      ],
+      "passed": true
+    }
+  ],
+  "source_inspected_before_edit": false,
+  "strict_success": true,
+  "independent_failures": [],
+  "independent_results": [
+    {
+      "command": "python cedar_digest.py https://cneos.jpl.nasa.gov/feed/news.xml cedar_brief.json",
+      "exit_code": 0,
+      "output": "Wrote 10 entries to cedar_brief.json\r\n"
+    },
+    {
+      "check": "live_structural_validation",
+      "record_count": 10,
+      "failures": []
+    }
+  ],
+  "category": "success",
+  "short_reason": "Completed the requested changes in cedar_brief.json, cedar_digest.py.",
+  "trace_path": ".docode/evals/crawler-benchmark-v1-d9579ed/traces/cedar_signal-run2-job_169cf5fddde240c583c45bad276ab199.json",
+  "commands": [
+    {
+      "command": "python cedar_digest.py https://cneos.jpl.nasa.gov/feed/news.xml cedar_brief.json",
+      "exit_code": 0,
+      "summary": "Wrote 10 entries to cedar_brief.json"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+      "exit_code": 0,
+      "summary": "benchmark validation passed"
+    }
+  ]
+}
