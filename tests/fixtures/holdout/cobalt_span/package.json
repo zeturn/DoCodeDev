@@ -1,0 +1,8 @@
+{
+  "name": "tessera-flux",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/contract-check.mjs"
+  }
+}
