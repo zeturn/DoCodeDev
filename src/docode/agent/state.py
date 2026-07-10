@@ -37,6 +37,8 @@ class AgentState:
     repair_action_attempts: int = 0
     failure_signatures: dict[str, int] = field(default_factory=dict)
     last_failed_command: str | None = None
+    source_inspection_auto_attempted_urls: set[str] = field(default_factory=set)
+    source_inspection_excerpt_presented: bool = False
 
     def add_observation(self, content: str) -> None:
         self.messages.append({"role": "system", "kind": "observation", "content": content})

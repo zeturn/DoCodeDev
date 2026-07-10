@@ -23,6 +23,13 @@ from docode.agent.repair_planner import (
     plan_repair_from_tool_result,
 )
 from docode.agent.reviewer import CodeReviewer, ReviewResult
+from docode.agent.source_inspection import (
+    attempted_source_urls,
+    crawler_source_inspection_required,
+    instruction_source_urls,
+    source_inspection_evidence,
+    successful_source_inspection,
+)
 from docode.agent.state import AgentState
 from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
 from docode.agent.stop_policy import StopPolicy
@@ -129,6 +136,7 @@ class CodingAgentLoop:
                 return await self.fail(job.id, stop.reason or "stopped")
 
             refresh_targeted_repair_phase(state)
+            await self.maybe_execute_controller_source_inspection(state)
             context_pack = await self.collect_observation(state)
             observation = context_pack.render()
             await self.repository.add_step(job.id, "system", observation_step(context_pack))
@@ -239,6 +247,15 @@ class CodingAgentLoop:
                         requested_tool=tool_name,
                         requested_args=tool_args,
                         available_tools=sorted(current_tool_names),
+                        workflow_state=current_workflow.to_dict(),
+                    )
+                    continue
+                source_tool_block = source_inspection_required_tool_block(state, tool_name)
+                if source_tool_block:
+                    await self.record_rejected_decision(
+                        state,
+                        reason="source_inspection_required_tool_forbidden",
+                        detail=source_tool_block,
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
@@ -506,6 +523,71 @@ class CodingAgentLoop:
         state.iteration += 1
         return True
 
+    async def maybe_execute_controller_source_inspection(self, state: AgentState) -> bool:
+        if not crawler_source_inspection_required(state.job.instruction):
+            return False
+        if successful_source_inspection(state.messages, state.job.instruction) is not None:
+            return False
+        if successful_edit_tool_called(state):
+            return False
+        source_urls = instruction_source_urls(state.job.instruction)
+        if not source_urls:
+            return False
+        selected_url = source_urls[0]
+        attempted = attempted_source_urls(state.messages) | state.source_inspection_auto_attempted_urls
+        if selected_url in attempted:
+            return False
+        state.source_inspection_auto_attempted_urls.add(selected_url)
+        args: dict[str, object] = {"url": selected_url, "mode": "raw", "max_bytes": 50_000, "timeout": 15}
+        await self.repository.add_step(
+            state.job.id,
+            "system",
+            {
+                "type": "source_inspection_auto_execution",
+                "reason": "crawler_literal_source_requires_sandbox_inspection_before_edit",
+                "url": selected_url,
+                "execution_scope": "sandbox",
+            },
+        )
+        await self.repository.add_step(
+            state.job.id,
+            "tool",
+            {"type": "tool_call", "tool": "inspect_source", "args": sanitize_tool_args(args)},
+        )
+        try:
+            result = await self.tools.call("inspect_source", args)
+        except Exception as exc:
+            result = tool_exception_result("inspect_source", exc)
+        result = enrich_tool_result_metadata("inspect_source", args, result)
+        result = ToolResult(
+            tool=result.tool,
+            output=result.output,
+            exit_code=result.exit_code,
+            metadata={**(result.metadata or {}), "controller_owned": True},
+            truncated=result.truncated,
+        )
+        state.add_tool_result(result)
+        await self.repository.add_step(
+            state.job.id,
+            "tool",
+            {
+                "type": "tool_result",
+                "tool": result.tool,
+                "exit_code": result.exit_code,
+                "summary": summarize_output(result.output),
+                "output": result.output,
+                "truncated": result.truncated,
+                "metadata": result.metadata or {},
+            },
+        )
+        evidence = source_inspection_evidence(state.messages, state.job.instruction)[-1]
+        await self.repository.add_step(
+            state.job.id,
+            "system",
+            {"type": "source_inspection_evidence", **evidence.to_dict()},
+        )
+        return True
+
     async def maybe_activate_required_command_repair(self, state: AgentState, workflow: Any) -> bool:
         if workflow.phase != WorkflowPhase.REPAIR_REQUIRED:
             return False
@@ -567,6 +649,16 @@ class CodingAgentLoop:
         cancelled = await self.cancelled_job(job.id)
         if cancelled is not None:
             return cancelled
+        if crawler_source_inspection_required(job.instruction) and successful_source_inspection(state.messages, job.instruction) is None:
+            await self.record_rejected_decision(
+                state,
+                reason="source_inspection_required_before_final",
+                detail=(
+                    "A successful sandbox inspect_source result for a literal task source is required before final_candidate. "
+                    "web_search and host fetch_url results do not satisfy this requirement."
+                ),
+            )
+            return None
         status = await self.tools.git_status()
         state.latest_git_status = status
         final_summary = (decision.summary or "").strip()
@@ -826,7 +918,8 @@ class CodingAgentLoop:
             },
         )
         workflow = workflow_snapshot(state, status.output)
-        return self.context_manager.build_pack(
+        include_source_body = not state.source_inspection_excerpt_presented
+        context_pack = self.context_manager.build_pack(
             job=state.job,
             inspection=state.inspection,
             messages=state.messages,
@@ -840,7 +933,12 @@ class CodingAgentLoop:
             active_repair_action=state.active_repair_action,
             targeted_repair_phase=state.targeted_repair_phase,
             workflow_phase=workflow.phase.value if hasattr(workflow.phase, "value") else str(workflow.phase),
+            include_source_body=include_source_body,
         )
+        source_evidence = source_inspection_evidence(state.messages, state.job.instruction)
+        if include_source_body and source_evidence and source_evidence[-1].body:
+            state.source_inspection_excerpt_presented = True
+        return context_pack
 
     async def fail(self, job_id: str, reason: str) -> CodingJob:
         current = await self.repository.get_job(job_id)
@@ -1099,6 +1197,7 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
         "evidence": {
             "successful_fetch_urls": result.evidence.successful_fetch_urls,
             "successful_web_search_queries": result.evidence.successful_web_search_queries,
+            "successful_source_inspections": result.evidence.successful_source_inspections or [],
             "relevant_fetch_urls": result.evidence.relevant_fetch_urls or [],
             "latest_edit_step_index": result.evidence.latest_edit_step_index,
             "latest_edit_epoch": result.evidence.latest_edit_epoch,
@@ -1140,6 +1239,7 @@ def observation_step(context_pack: ContextPack) -> dict[str, object]:
         "repo_map": context_pack.repo_map,
         "working_memory": context_pack.working_memory,
         "file_memory": context_pack.file_memory,
+        "source_inspection": context_pack.source_inspection,
         "latest_evidence": context_pack.latest_evidence,
         "recent_messages": context_pack.recent_messages,
     }
@@ -1161,6 +1261,10 @@ def enrich_tool_result_metadata(tool_name: str, args: dict[str, object], result:
         command = args.get("command")
         if command:
             metadata["command"] = str(command)
+    if tool_name == "inspect_source":
+        metadata.setdefault("requested_url", str(args.get("url") or ""))
+        metadata.setdefault("mode", str(args.get("mode") or "raw"))
+        metadata.setdefault("execution_scope", "sandbox")
     if metadata == (result.metadata or {}):
         return result
     return ToolResult(
@@ -1180,7 +1284,11 @@ def compact_llm_message(message: dict[str, Any]) -> dict[str, Any]:
     if "content" in message:
         compact["content"] = truncate_text(str(message["content"]), 500)
     if "output" in message:
-        compact["output"] = truncate_text(str(message["output"]), 500)
+        compact["output"] = (
+            "<source body represented in Source Inspection>"
+            if message.get("tool") == "inspect_source"
+            else truncate_text(str(message["output"]), 500)
+        )
     metadata = message.get("metadata")
     if isinstance(metadata, dict):
         keep = {}
@@ -1613,6 +1721,8 @@ def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) ->
 
 def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState) -> list[Any]:
     refresh_targeted_repair_phase(state)
+    if successful_source_inspection(state.messages, state.job.instruction) is not None:
+        definitions = [definition for definition in definitions if getattr(definition, "name", None) != "inspect_source"]
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         allowed = targeted_repair_allowed_tools_for_phase(state) - targeted_repair_hard_forbidden_tools(state)
         return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
@@ -2107,10 +2217,6 @@ def path_changed_after_message(state: AgentState, path: str, index: int) -> bool
 def crawler_source_research_priority_active(state: AgentState, workflow: Any) -> bool:
     if workflow.phase != WorkflowPhase.EDIT_REQUIRED:
         return False
-    if successful_edit_tool_called(state):
-        return False
-    if exploratory_tool_calls(state) >= INITIAL_NO_DIFF_EXPLORATION_BUDGET:
-        return False
     if not is_crawler_instruction(state.job.instruction):
         return False
     if not instruction_source_urls(state.job.instruction):
@@ -2119,27 +2225,30 @@ def crawler_source_research_priority_active(state: AgentState, workflow: Any) ->
 
 
 def initial_crawler_source_tools(state: AgentState) -> set[str]:
-    base = {"write_file", "edit_file", "replace_in_file", "apply_patch"}
-    if explicit_source_fetch_attempted(state):
+    base = {"inspect_source", "git_status", "read_file", "read_file_range", "read_symbol", "list_files"}
+    if attempted_source_urls(state.messages):
         return base | {"fetch_url", "web_search"}
-    return base | {"fetch_url"}
-
-
-def instruction_source_urls(instruction: str) -> list[str]:
-    urls: list[str] = []
-    for match in re.findall(r"https?://[^\s'\"`)>]+", instruction or ""):
-        cleaned = match.rstrip(".,;:")
-        if cleaned and cleaned not in urls:
-            urls.append(cleaned)
-    return urls
+    return base
 
 
 def source_research_succeeded(state: AgentState) -> bool:
-    return any(
-        message.get("role") == "tool"
-        and message.get("tool") in {"fetch_url", "web_search"}
-        and int(message.get("exit_code") or 0) == 0
-        for message in state.messages
+    return successful_source_inspection(state.messages, state.job.instruction) is not None
+
+
+def source_inspection_required_tool_block(state: AgentState, tool_name: str) -> str:
+    if not crawler_source_inspection_required(state.job.instruction):
+        return ""
+    if successful_source_inspection(state.messages, state.job.instruction) is not None:
+        return ""
+    allowed = initial_crawler_source_tools(state)
+    if tool_name in allowed:
+        return ""
+    candidates = instruction_source_urls(state.job.instruction)
+    candidate_text = ", ".join(candidates[:3]) or "the literal source URL"
+    return (
+        "Source inspection is required before editing or running verification commands. The current diff must remain empty. "
+        f"Call inspect_source from the sandbox for one of these literal candidates: {candidate_text}. "
+        "A local scaffold read, web_search, or host fetch_url does not satisfy this stage."
     )
 
 
@@ -2500,6 +2609,15 @@ def crawler_external_source_tool_block(state: AgentState, tool_name: str, args: 
     allowed = instruction_source_domains(state.job.instruction)
     if not allowed:
         return ""
+    if tool_name == "inspect_source":
+        raw_url = str(args.get("url") or "")
+        candidates = instruction_source_urls(state.job.instruction)
+        if raw_url in candidates:
+            return ""
+        return (
+            "inspect_source must use a literal source candidate from the task without changing its query string: "
+            + ", ".join(candidates[:5])
+        )
     if tool_name == "fetch_url":
         raw_url = str(args.get("url") or "")
         host = urlparse(raw_url).hostname or ""

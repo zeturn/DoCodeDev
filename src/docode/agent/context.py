@@ -8,7 +8,8 @@ from urllib.parse import urlparse
 
 from docode.agent.inspector import ProjectInspection
 from docode.agent.stuck import git_status_clean
-from docode.agent.task_contract import TaskContract
+from docode.agent.source_inspection import instruction_source_urls, source_inspection_evidence
+from docode.agent.task_contract import TaskContract, is_crawler_instruction
 from docode.agent.workflow import display_command
 from docode.dobox.types import ToolResult
 from docode.git_changes import changed_paths_from_status, strip_ansi
@@ -21,6 +22,7 @@ class ContextPack:
     repo_map: str
     working_memory: str
     file_memory: str
+    source_inspection: str
     action_summary: str
     latest_evidence: str
     recent_messages: list[dict[str, Any]] = field(default_factory=list)
@@ -31,6 +33,7 @@ class ContextPack:
             ("Repo Map", self.repo_map),
             ("Working Memory", self.working_memory),
             ("File Memory", self.file_memory),
+            ("Source Inspection", self.source_inspection),
             ("Action Summary", self.action_summary),
             ("Latest Evidence", self.latest_evidence),
         ]
@@ -58,6 +61,7 @@ class ContextManager:
         active_repair_action: dict[str, Any] | None = None,
         targeted_repair_phase: str | None = None,
         workflow_phase: str | None = None,
+        include_source_body: bool = True,
     ) -> ContextPack:
         repair_active = repair_mode == "targeted_repair" and active_repair_action is not None
         compact_mode = (workflow_phase in {"EDIT_REQUIRED", "TEST_REQUIRED", "FINAL_READY"}) and not repair_active
@@ -81,6 +85,7 @@ class ContextManager:
             llm_cost_used=llm_cost_used,
         )
         file_memory = self.file_memory(inspection, messages, repair_active=repair_active)
+        source_inspection = self.source_inspection(job, messages, include_body=include_source_body)
         action_summary = self.action_summary(
             job=job,
             messages=messages,
@@ -104,6 +109,7 @@ class ContextManager:
             repo_map=clip_text(repo_map, 700 if compact_mode else section_bytes),
             working_memory=clip_text(working_memory, 900 if compact_mode else section_bytes),
             file_memory=clip_text(file_memory, 700 if compact_mode else (3_000 if repair_active else section_bytes)),
+            source_inspection=clip_text(source_inspection, 2_600 if include_source_body else 1_000),
             action_summary=clip_text(action_summary, 900 if compact_mode else 1_600),
             latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else (8_000 if repair_active else section_bytes)),
             recent_messages=recent_messages,
@@ -150,8 +156,8 @@ class ContextManager:
                 "Source Guidance:\n"
                 + "\n".join(f"- preferred_source_url: {url}" for url in source_urls[:5])
                 + ("\n" + "\n".join(f"- preferred_source_domain: {domain}" for domain in domains[:5]) if domains else "")
-                + "\n- First inspect these sources with fetch_url before broadening to web_search."
-                + "\n- If web_search becomes necessary, keep queries anchored to these URLs/domains and the requested target."
+                + "\n- Inspect a literal source with sandbox-native inspect_source before editing."
+                + "\n- fetch_url and web_search are supplemental discovery tools and do not satisfy sandbox source inspection."
             )
         if repair_mode:
             parts.append(
@@ -215,6 +221,42 @@ class ContextManager:
             if snippets:
                 parts.append("Repair file snippets already available in context:\n" + snippets)
         return "\n\n".join(parts) if parts else "No file memory yet."
+
+    def source_inspection(self, job: CodingJob, messages: list[dict[str, Any]], *, include_body: bool) -> str:
+        candidates = instruction_source_urls(job.instruction)
+        if not candidates:
+            return ""
+        evidence = source_inspection_evidence(messages, job.instruction)
+        lines = ["Literal source candidates:", *(f"- {url}" for url in candidates[:5])]
+        if not evidence:
+            lines.extend(
+                [
+                    "Status: pending",
+                    "Required next action: inspect_source must run in the sandbox before any edit or verification command.",
+                ]
+            )
+            return "\n".join(lines)
+        latest = evidence[-1]
+        lines.extend(
+            [
+                f"Status: {'successful' if latest.successful else 'failed'}",
+                f"Requested URL: {latest.requested_url}",
+                f"Final URL: {latest.final_url}",
+                f"HTTP status: {latest.status_code}",
+                f"Execution scope: {latest.execution_scope or '<missing>'}",
+                f"Mode: {latest.mode}",
+                f"Before first edit: {latest.before_first_edit}",
+            ]
+        )
+        if latest.error:
+            lines.append(f"Error: {latest.error}")
+        if include_body and latest.body:
+            lines.extend(["Raw source excerpt (shown once):", clip_text(latest.body, 1_800)])
+        elif latest.successful:
+            lines.append("The raw body was already shown; use this evidence without requesting the same URL again.")
+        else:
+            lines.append("Do not guess a parser. inspect_source may try a different literal candidate; fetch/search may supplement diagnosis.")
+        return "\n".join(lines)
 
     def action_summary(
         self,
@@ -356,27 +398,24 @@ def compact_message(message: dict[str, Any], *, content_limit: int = 1200) -> di
     if "content" in message:
         compact["content"] = clip_text(str(message["content"]), content_limit)
     if "output" in message:
-        compact["output"] = clip_text(str(message["output"]), content_limit)
+        compact["output"] = (
+            "<source body represented in Source Inspection>"
+            if message.get("tool") == "inspect_source"
+            else clip_text(str(message["output"]), content_limit)
+        )
     metadata = message.get("metadata")
     if isinstance(metadata, dict):
         compact["metadata"] = compact_metadata(metadata)
     return compact
 
 
-def instruction_source_urls(instruction: str) -> list[str]:
-    urls: list[str] = []
-    for match in re.findall(r"https?://[^\s'\"`)>]+", instruction or "", flags=re.IGNORECASE):
-        cleaned = match.rstrip(".,;:")
-        if cleaned and cleaned not in urls:
-            urls.append(cleaned)
-    return urls
-
-
 def tool_evidence(message: dict[str, Any], *, output_limit: int = 900) -> str:
     tool = str(message.get("tool") or "tool")
     exit_code = int(message.get("exit_code") or 0)
     metadata = compact_metadata(message.get("metadata") if isinstance(message.get("metadata"), dict) else {})
-    if message.get("truncated") and output_limit <= 200:
+    if tool == "inspect_source":
+        output = "<source body represented in Source Inspection>"
+    elif message.get("truncated") and output_limit <= 200:
         original = metadata.get("original_output_bytes")
         output = f"<truncated output: {original} bytes>" if original else "<truncated output>"
     else:
@@ -619,11 +658,6 @@ def final_candidate_reason(clean: bool, repair_mode: str | None) -> str:
     if repair_mode == "must_edit":
         return " because repair_mode requires an edit confirmation first"
     return " after tests pass"
-
-
-def is_crawler_instruction(instruction: str) -> bool:
-    lowered = (instruction or "").lower()
-    return any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
 
 
 def crawler_contract_requirements() -> list[str]:

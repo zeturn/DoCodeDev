@@ -78,6 +78,7 @@ class CommandEvidence:
 class VerificationEvidence:
     successful_fetch_urls: list[str]
     successful_web_search_queries: list[str]
+    successful_source_inspections: list[dict[str, Any]] | None = None
     relevant_fetch_urls: list[str] | None = None
     successful_commands: list[str] | None = None
     successful_command_outputs: list[str] | None = None
@@ -88,7 +89,16 @@ class VerificationEvidence:
 
     @property
     def has_external_source_evidence(self) -> bool:
-        return bool((self.relevant_fetch_urls or []) or self.successful_web_search_queries)
+        return bool(self.has_sandbox_source_evidence or (self.relevant_fetch_urls or []) or self.successful_web_search_queries)
+
+    @property
+    def has_sandbox_source_evidence(self) -> bool:
+        return any(
+            item.get("execution_scope") == "sandbox"
+            and bool(item.get("successful"))
+            and bool(item.get("before_first_edit"))
+            for item in (self.successful_source_inspections or [])
+        )
 
     @property
     def has_no_test_reason(self) -> bool:
@@ -99,6 +109,7 @@ class VerificationEvidence:
         return VerificationEvidence(
             successful_fetch_urls=self.successful_fetch_urls,
             successful_web_search_queries=self.successful_web_search_queries,
+            successful_source_inspections=self.successful_source_inspections,
             relevant_fetch_urls=self.relevant_fetch_urls,
             successful_commands=self.successful_commands,
             successful_command_outputs=self.successful_command_outputs,
@@ -492,6 +503,7 @@ def evidence_with_command_results(
     return VerificationEvidence(
         successful_fetch_urls=evidence.successful_fetch_urls,
         successful_web_search_queries=evidence.successful_web_search_queries,
+        successful_source_inspections=evidence.successful_source_inspections,
         relevant_fetch_urls=evidence.relevant_fetch_urls,
         successful_commands=successful_commands,
         successful_command_outputs=successful_outputs,
@@ -1114,11 +1126,13 @@ def verification_evidence_from_steps(
 ) -> VerificationEvidence:
     fetch_urls: list[str] = []
     relevant_fetch_urls: list[str] = []
+    source_inspections: list[dict[str, Any]] = []
     web_search_queries: list[str] = []
     successful_commands: list[str] = []
     successful_command_outputs: list[str] = []
     command_runs: list[CommandEvidence] = []
     latest_edit_step_index = -1
+    first_edit_step_index: int | None = None
     edit_epoch = 0
     explicit_commands = list(explicit_commands or [])
     for fallback_index, step in enumerate(steps):
@@ -1130,9 +1144,25 @@ def verification_evidence_from_steps(
         metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
         exit_code = int(content.get("exit_code") or 0)
         if tool in EDIT_TOOLS and exit_code == 0:
+            if first_edit_step_index is None:
+                first_edit_step_index = step_index
             edit_epoch += 1
             latest_edit_step_index = step_index
-        if tool == "fetch_url" and exit_code == 0:
+        if tool == "inspect_source":
+            status_code = int_or_zero(metadata.get("status_code"))
+            scope = str(metadata.get("execution_scope") or "")
+            source_inspections.append(
+                {
+                    "requested_url": str(metadata.get("requested_url") or metadata.get("url") or ""),
+                    "final_url": str(metadata.get("final_url") or metadata.get("requested_url") or metadata.get("url") or ""),
+                    "status_code": status_code or None,
+                    "execution_scope": scope,
+                    "mode": str(metadata.get("mode") or "raw"),
+                    "successful": exit_code == 0 and scope == "sandbox" and 200 <= status_code < 400,
+                    "step_index": step_index,
+                }
+            )
+        elif tool == "fetch_url" and exit_code == 0:
             url = metadata.get("url")
             if isinstance(url, str) and url and url not in fetch_urls:
                 fetch_urls.append(url)
@@ -1160,9 +1190,12 @@ def verification_evidence_from_steps(
                 if exit_code == 0:
                     successful_commands.append(command)
                     successful_command_outputs.append(output)
+    for inspection in source_inspections:
+        inspection["before_first_edit"] = first_edit_step_index is None or int(inspection["step_index"]) < first_edit_step_index
     return VerificationEvidence(
         successful_fetch_urls=fetch_urls,
         successful_web_search_queries=web_search_queries,
+        successful_source_inspections=[item for item in source_inspections if item["successful"]],
         relevant_fetch_urls=relevant_fetch_urls,
         successful_commands=successful_commands,
         successful_command_outputs=successful_command_outputs,
@@ -1176,6 +1209,7 @@ def empty_verification_evidence() -> VerificationEvidence:
     return VerificationEvidence(
         successful_fetch_urls=[],
         successful_web_search_queries=[],
+        successful_source_inspections=[],
         relevant_fetch_urls=[],
         successful_commands=[],
         successful_command_outputs=[],
