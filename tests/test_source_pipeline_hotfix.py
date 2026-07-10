@@ -15,8 +15,9 @@ from docode.storage.models import CodingJob
 
 class SourcePipelineHotfixImportTests(TestCase):
     def test_hotfix_is_installed(self) -> None:
-        self.assertTrue(getattr(loop, "_source_pipeline_hotfix_v1_applied", False))
-        self.assertTrue(getattr(docode, "__runtime_hotfix_applied__", True))
+        self.assertTrue(getattr(loop, "_source_pipeline_hotfix_v1_applied", False), getattr(docode, "__runtime_hotfix_error__", None))
+        self.assertTrue(getattr(docode, "__runtime_hotfix_applied__", False), getattr(docode, "__runtime_hotfix_error__", None))
+        self.assertIsNone(getattr(docode, "__runtime_hotfix_error__", None))
 
     def test_same_origin_derived_source_is_allowed(self) -> None:
         state = SimpleNamespace(
@@ -49,9 +50,7 @@ class SourcePipelineHotfixImportTests(TestCase):
 
     def test_xml_namespace_in_written_code_is_not_treated_as_source_drift(self) -> None:
         state = SimpleNamespace(
-            job=SimpleNamespace(
-                instruction="Build an RSS collector from http://127.0.0.1:8765/feed.xml"
-            ),
+            job=SimpleNamespace(instruction="Build an RSS collector from http://127.0.0.1:8765/feed.xml"),
             messages=[],
         )
 
@@ -81,9 +80,7 @@ class InspectSourceCacheTests(IsolatedAsyncioTestCase):
             "truncated": False,
             "body_encoding": "utf-8",
         }
-        client = SimpleNamespace(
-            run_command=AsyncMock(return_value=CommandResult(output=json.dumps(payload), exit_code=0))
-        )
+        client = SimpleNamespace(run_command=AsyncMock(return_value=CommandResult(output=json.dumps(payload), exit_code=0)))
         tools = DoBoxTools(client, "project-1", agent_session_id="session-1")
 
         first = await tools.inspect_source("http://127.0.0.1:8765/feed", mode="raw")
@@ -105,22 +102,17 @@ class VerificationOrderHotfixTests(TestCase):
         validator = "python validate_output.py"
         job = CodingJob(
             id="job-hotfix-order",
+            user_id="test-user",
             instruction="Repair the collector. Verification commands:\n1. python build_output.py\n2. python validate_output.py",
             provider="test",
             model="test",
         )
         state = AgentState(job=job)
-        state.task_contract = SimpleNamespace(
-            must_run_commands=[producer, validator],
-            must_modify_files=[],
-        )
+        state.task_contract = SimpleNamespace(must_run_commands=[producer, validator], must_modify_files=[])
         state.inspection = SimpleNamespace()
         state.repair_mode = "targeted_repair"
         state.active_repair_started_at = 0
-        state.active_repair_action = {
-            "target_files": ["collector.py"],
-            "rerun_commands": [validator],
-        }
+        state.active_repair_action = {"target_files": ["collector.py"], "rerun_commands": [validator]}
         state.messages.extend(
             [
                 {
@@ -132,10 +124,7 @@ class VerificationOrderHotfixTests(TestCase):
             ]
         )
         state.latest_git_status = SimpleNamespace(output=" M collector.py\n")
-        snapshot = SimpleNamespace(
-            phase=loop.WorkflowPhase.TEST_REQUIRED,
-            diff_exists=True,
-        )
+        snapshot = SimpleNamespace(phase=loop.WorkflowPhase.TEST_REQUIRED, diff_exists=True)
 
         command = loop.controller_owned_required_command(state, snapshot)
 
