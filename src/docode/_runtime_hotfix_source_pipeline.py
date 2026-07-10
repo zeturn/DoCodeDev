@@ -201,7 +201,7 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
         set(match.group(1).lower() for match in re.finditer(r"\b(data-[A-Za-z0-9_.:-]+)\s*=", body, flags=re.IGNORECASE))
     )[:20]
     namespaces = sorted(
-        set(match.group(1) for match in re.finditer(r"\bxmlns(?::([A-Za-z0-9_.-]+))?\s*=", body, flags=re.IGNORECASE))
+        set((match.group(1) or "default") for match in re.finditer(r"\bxmlns(?::([A-Za-z0-9_.-]+))?\s*=", body, flags=re.IGNORECASE))
     )[:20]
     repeated_tags = [{"tag": tag, "count": count} for tag, count in tag_counts.most_common(12) if count > 1]
     kind = "xml" if "xml" in lowered or body.lstrip().startswith("<?xml") else "html"
@@ -211,7 +211,7 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
         "repeated_tags": repeated_tags,
         "class_names": [name for name, _ in class_counts.most_common(20)],
         "data_attributes": data_attributes,
-        "namespace_prefixes": [item or "default" for item in namespaces],
+        "namespace_prefixes": namespaces,
         "relative_links_present": bool(re.search(r"\b(?:href|src)\s*=\s*['\"]/(?!/)", body, flags=re.IGNORECASE)),
     }
 
