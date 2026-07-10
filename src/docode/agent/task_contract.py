@@ -7,6 +7,13 @@ import re
 
 FILE_REF_RE = re.compile(r"\b[\w./-]+\.(?:py|js|ts|go|rs|md|json|toml|yaml|yml|txt|csv|html)\b")
 NUMBERED_COMMAND_RE = re.compile(r"^\s*\d+[.)]\s+(.+)$")
+TARGET_HEADING_RE = re.compile(
+    r"^\s*(?:[-*+]\s*)?(?:target|edit|modify)\s+files?\s*:\s*(?P<value>.*)$",
+    flags=re.IGNORECASE,
+)
+HEREDOC_OPENER_RE = re.compile(
+    r"<<(?P<strip_tabs>-)?\s*(?:'(?P<single>[^'\n]+)'|\"(?P<double>[^\"\n]+)\"|(?P<bare>[^\s;&|()<>]+))"
+)
 EDIT_TARGET_VERBS = {
     "add",
     "build",
@@ -32,7 +39,7 @@ class TaskContract:
 def task_contract_from_instruction(instruction: str) -> TaskContract:
     all_files = unique_preserving_order(
         path
-        for match in FILE_REF_RE.finditer(instruction or "")
+        for match in FILE_REF_RE.finditer(text_outside_verification_blocks(instruction))
         if (path := normalize_contract_file(match.group(0))) and contract_file_allowed(path)
     )
     files = target_files_from_instruction(instruction, all_files)
@@ -46,6 +53,10 @@ def task_contract_from_instruction(instruction: str) -> TaskContract:
 
 
 def target_files_from_instruction(instruction: str, fallback_files: list[str]) -> list[str]:
+    explicit, targets = explicit_target_block(instruction)
+    if explicit:
+        return targets
+
     targets: list[str] = []
     in_verification_block = False
     for raw_line in (instruction or "").splitlines():
@@ -94,6 +105,61 @@ def target_files_from_instruction(instruction: str, fallback_files: list[str]) -
     return unique_preserving_order(targets or fallback_files)
 
 
+def explicit_target_block(instruction: str) -> tuple[bool, list[str]]:
+    """Return whether an explicit target heading exists and its declared paths."""
+
+    lines = (instruction or "").splitlines()
+    targets: list[str] = []
+    explicit = False
+    index = 0
+    while index < len(lines):
+        match = TARGET_HEADING_RE.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        explicit = True
+        inline = match.group("value").strip()
+        if inline:
+            targets.extend(target_paths_from_value(inline))
+            index += 1
+            continue
+
+        index += 1
+        while index < len(lines):
+            raw_line = lines[index]
+            line = raw_line.strip()
+            if not line or section_heading(line) or TARGET_HEADING_RE.match(raw_line):
+                break
+            block_targets = target_paths_from_value(line, require_path_list=True)
+            if not block_targets:
+                break
+            targets.extend(block_targets)
+            index += 1
+    return explicit, unique_preserving_order(targets)
+
+
+def target_paths_from_value(value: str, *, require_path_list: bool = False) -> list[str]:
+    text = value.strip().strip("`")
+    text = re.sub(r"^[-*+]\s+", "", text)
+    matches = list(FILE_REF_RE.finditer(text))
+    if require_path_list:
+        remainder = FILE_REF_RE.sub("", text)
+        if not re.fullmatch(r"[\s,;`'\"()\[\]]*", remainder):
+            return []
+    return [
+        path
+        for match in matches
+        if (path := normalize_contract_file(match.group(0))) and contract_file_allowed(path)
+    ]
+
+
+def section_heading(line: str) -> bool:
+    text = line.strip().lstrip("- ").strip()
+    if verification_heading(text.rstrip(":")):
+        return True
+    return bool(text.endswith(":"))
+
+
 def explicit_target_hint(line: str) -> bool:
     return any(marker in line for marker in ("target file:", "target files:", "edit file:", "edit files:"))
 
@@ -131,43 +197,127 @@ def suggested_commands(files: list[str]) -> list[str]:
 
 def verification_commands_from_instruction(instruction: str) -> list[str]:
     commands: list[str] = []
+    lines = (instruction or "").splitlines()
     in_verification_block = False
-    for raw_line in (instruction or "").splitlines():
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
         line = raw_line.strip()
         lowered = line.lower()
         heading = lowered.lstrip("- ").rstrip(":")
         if verification_heading(heading):
             in_verification_block = True
+            index += 1
             continue
         if in_verification_block:
+            if markdown_fence(line) or not line:
+                index += 1
+                continue
             command = normalize_command_line(line)
             if command and command_like(command):
+                delimiter = heredoc_delimiter_from_command(command)
+                if delimiter is not None:
+                    collected = collect_heredoc_command(lines, index, command, delimiter)
+                    if collected is not None:
+                        full_command, index = collected
+                        commands.append(full_command)
+                    else:
+                        index = len(lines)
+                    continue
                 commands.append(command)
+                index += 1
                 continue
             if line and line.endswith(":"):
                 in_verification_block = verification_heading(line.lower().lstrip("- ").rstrip(":"))
+                index += 1
                 continue
             if line and not command_like(command):
                 in_verification_block = False
         if "verify with:" not in lowered and "suggested verification commands:" not in lowered:
+            index += 1
             continue
         if lowered.startswith("semantic checks:") or lowered.startswith("- semantic checks:"):
+            index += 1
             continue
         _, value = line.split(":", 1)
         command = normalize_command_line(value)
         if command and command_like(command):
-            commands.append(command)
+            delimiter = heredoc_delimiter_from_command(command)
+            if delimiter is not None:
+                collected = collect_heredoc_command(lines, index, command, delimiter)
+                if collected is not None:
+                    full_command, index = collected
+                    commands.append(full_command)
+                    continue
+                index = len(lines)
+                continue
+            else:
+                commands.append(command)
+        index += 1
     return commands[:8]
 
 
-def normalize_command_line(line: str) -> str:
+def heredoc_delimiter_from_command(command: str) -> tuple[str, bool] | None:
+    match = HEREDOC_OPENER_RE.search(command)
+    if match is None:
+        return None
+    delimiter = match.group("single") or match.group("double") or match.group("bare")
+    return delimiter, bool(match.group("strip_tabs"))
+
+
+def collect_heredoc_command(
+    lines: list[str],
+    start_index: int,
+    first_line: str,
+    delimiter: tuple[str, bool],
+) -> tuple[str, int] | None:
+    marker, strip_tabs = delimiter
+    body: list[str] = [first_line]
+    index = start_index + 1
+    while index < len(lines):
+        raw_line = lines[index]
+        body.append(raw_line)
+        candidate = raw_line.lstrip("\t") if strip_tabs else raw_line
+        if candidate == marker:
+            return "\n".join(body), index + 1
+        index += 1
+    return None
+
+
+def strip_command_list_prefix(line: str) -> str:
     text = line.strip().strip("`")
-    if text.startswith("- "):
-        text = text[2:].strip().strip("`")
+    text = re.sub(r"^[-*+]\s+", "", text)
     numbered = NUMBERED_COMMAND_RE.match(text)
     if numbered:
         text = numbered.group(1).strip().strip("`")
     return text.strip(" -`")
+
+
+def normalize_command_line(line: str) -> str:
+    return strip_command_list_prefix(line)
+
+
+def markdown_fence(line: str) -> bool:
+    return bool(re.fullmatch(r"`{3,}(?:[A-Za-z0-9_+-]+)?", line.strip()))
+
+
+def text_outside_verification_blocks(instruction: str) -> str:
+    lines = (instruction or "").splitlines()
+    kept: list[str] = []
+    in_verification_block = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        heading = line.lower().lstrip("- ").rstrip(":")
+        if verification_heading(heading):
+            in_verification_block = True
+            continue
+        if in_verification_block:
+            if line and line.endswith(":") and not verification_heading(heading):
+                in_verification_block = False
+                kept.append(raw_line)
+            continue
+        kept.append(raw_line)
+    return "\n".join(kept)
 
 
 def verification_heading(heading: str) -> bool:

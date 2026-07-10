@@ -660,6 +660,37 @@ class FakeTools:
         return None
 
 
+class ControllerCommandTools(FakeTools):
+    def __init__(self, *exit_codes: int) -> None:
+        super().__init__()
+        self.exit_codes = list(exit_codes or (0,))
+        self.commands: list[str] = []
+
+    async def call(self, tool_name: str, args: dict[str, object]) -> ToolResult:
+        if tool_name != "run_command":
+            return await super().call(tool_name, args)
+        self.call_count += 1
+        command = str(args["command"])
+        self.commands.append(command)
+        exit_code = self.exit_codes.pop(0) if self.exit_codes else 0
+        output = "validated\n" if exit_code == 0 else "AssertionError: schema mismatch\n"
+        return ToolResult(tool="run_command", output=output, exit_code=exit_code, metadata={"command": command})
+
+
+class ControllerRequiredCommandLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, *, system, messages, tools, context):
+        _ = system, messages, tools, context
+        self.calls += 1
+        if self.calls == 1:
+            return AgentDecision(type="tool_call", tool_name="write_file", args={"path": "crawler.py", "content": "print('ok')\n"})
+        if self.calls == 2:
+            return AgentDecision(type="tool_call", tool_name="run_command", args={"command": "python crawler.py --dry-run"})
+        raise AssertionError("LLM must not be called after the controller satisfies the multiline command")
+
+
 class AgentLoopTests(IsolatedAsyncioTestCase):
     def test_compact_llm_message_truncates_large_fields(self) -> None:
         message = {
@@ -686,6 +717,202 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
                 "path": "/workspace/crawler.py",
             },
         )
+
+    async def test_controller_executes_complete_multiline_required_command_before_llm(self) -> None:
+        heredoc = "python - <<'PY'\nprint('validated')\nPY"
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Modify crawler.py"))
+            state = AgentState(job=job)
+            state.inspection = SimpleNamespace()
+            state.task_contract = TaskContract(
+                must_modify_files=["crawler.py"],
+                must_run_commands=["python crawler.py --dry-run", heredoc],
+            )
+            state.latest_git_status = ToolResult(tool="git_status", output=" M crawler.py\n")
+            state.messages.extend(
+                [
+                    {"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "crawler.py"}},
+                    {
+                        "role": "tool",
+                        "tool": "run_command",
+                        "exit_code": 0,
+                        "metadata": {"command": "python crawler.py --dry-run"},
+                    },
+                ]
+            )
+            llm = ScriptedLLM()
+            tools = ControllerCommandTools(0)
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            executed = await loop.maybe_execute_controller_required_command(
+                state,
+                workflow_snapshot(state, state.latest_git_status.output),
+            )
+
+            self.assertTrue(executed)
+            self.assertEqual(llm.calls, 0)
+            self.assertEqual(tools.commands, [heredoc])
+            self.assertEqual(state.messages[-1]["metadata"]["command"], heredoc)
+            self.assertEqual(state.tool_calls_count, 1)
+            self.assertEqual(state.iteration, 1)
+            self.assertEqual(workflow_snapshot(state, state.latest_git_status.output).phase, WorkflowPhase.FINAL_READY)
+            steps = await repo.list_steps(job.id)
+            auto = next(step for step in steps if step.content.get("type") == "required_command_auto_execution")
+            self.assertEqual(auto.content["reason"], "controller_owned_multiline_verification")
+            self.assertEqual(auto.content["command"], heredoc)
+            self.assertIn("3 lines", auto.content["command_summary"])
+            self.assertTrue(any(step.content.get("type") == "tool_call" for step in steps))
+            result = next(step for step in steps if step.content.get("type") == "tool_result")
+            self.assertEqual(result.content["exit_code"], 0)
+            self.assertEqual(result.content["metadata"]["command"], heredoc)
+
+    async def test_loop_auto_finalizes_after_controller_satisfies_multiline_command(self) -> None:
+        heredoc = "python - <<'PY'\nprint('validated')\nPY"
+        instruction = (
+            "Target file: crawler.py\n\n"
+            "Verification commands:\n"
+            "1. python crawler.py --dry-run\n"
+            "2. " + heredoc
+        )
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction=instruction))
+            llm = ControllerRequiredCommandLLM()
+            tools = ControllerCommandTools(0, 0)
+            loop = CodingAgentLoop(
+                llm=llm,
+                tools=tools,
+                verifier=PassingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60),
+                quality_gate=PassingQualityGate(),
+            )
+
+            result = await loop.run(job)
+
+            self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertEqual(llm.calls, 2)
+            self.assertEqual(tools.commands, ["python crawler.py --dry-run", heredoc])
+            steps = await repo.list_steps(job.id)
+            auto = next(step for step in steps if step.content.get("type") == "auto_final_candidate")
+            self.assertEqual(auto.content["reason"], "controller_required_commands_satisfied")
+
+    async def test_failed_controller_command_requires_edit_before_controller_rerun(self) -> None:
+        heredoc = "python - <<'PY'\nassert False\nPY"
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Modify crawler.py"))
+            state = AgentState(job=job)
+            state.inspection = SimpleNamespace()
+            state.task_contract = TaskContract(must_modify_files=["crawler.py"], must_run_commands=[heredoc])
+            state.latest_git_status = ToolResult(tool="git_status", output=" M crawler.py\n")
+            state.messages.append({"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "crawler.py"}})
+            tools = ControllerCommandTools(1, 0)
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=8, max_runtime_seconds=60),
+            )
+
+            first = await loop.maybe_execute_controller_required_command(
+                state,
+                workflow_snapshot(state, state.latest_git_status.output),
+            )
+            without_edit = await loop.maybe_execute_controller_required_command(
+                state,
+                workflow_snapshot(state, state.latest_git_status.output),
+            )
+
+            self.assertTrue(first)
+            self.assertFalse(without_edit)
+            self.assertEqual(tools.commands, [heredoc])
+            self.assertEqual(state.repair_mode, "targeted_repair")
+            self.assertEqual(state.active_repair_action["rerun_commands"], [heredoc])
+            self.assertFalse(workflow_snapshot(state, state.latest_git_status.output).final_allowed)
+
+            state.messages.append({"role": "tool", "tool": "edit_file", "exit_code": 0, "metadata": {"path": "crawler.py"}})
+            after_edit = await loop.maybe_execute_controller_required_command(
+                state,
+                workflow_snapshot(state, state.latest_git_status.output),
+            )
+
+            self.assertTrue(after_edit)
+            self.assertEqual(tools.commands, [heredoc, heredoc])
+            self.assertIsNone(state.active_repair_action)
+            self.assertIsNone(state.repair_mode)
+            self.assertEqual(workflow_snapshot(state, state.latest_git_status.output).phase, WorkflowPhase.FINAL_READY)
+
+    async def test_controller_does_not_run_multiline_command_before_required_edit(self) -> None:
+        heredoc = "python - <<'PY'\nprint('ok')\nPY"
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Modify app.py"))
+            state = AgentState(job=job)
+            state.inspection = SimpleNamespace()
+            state.task_contract = TaskContract(must_modify_files=["app.py"], must_run_commands=[heredoc])
+            state.latest_git_status = ToolResult(tool="git_status", output=" M other.py\n")
+            tools = ControllerCommandTools(0)
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            before_edit = await loop.maybe_execute_controller_required_command(
+                state,
+                workflow_snapshot(state, state.latest_git_status.output),
+            )
+            state.messages.append({"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "other.py"}})
+            wrong_edit = await loop.maybe_execute_controller_required_command(
+                state,
+                workflow_snapshot(state, state.latest_git_status.output),
+            )
+
+            self.assertFalse(before_edit)
+            self.assertFalse(wrong_edit)
+            self.assertEqual(tools.commands, [])
+
+    async def test_controller_leaves_one_line_required_commands_model_driven(self) -> None:
+        with TemporaryDirectory() as tmp:
+            repo = InMemoryJobRepository()
+            job = await repo.create_job(CodingJob(id=new_id("job"), user_id="u1", instruction="Modify app.py"))
+            state = AgentState(job=job)
+            state.inspection = SimpleNamespace()
+            state.task_contract = TaskContract(must_modify_files=["app.py"], must_run_commands=["python app.py"])
+            state.latest_git_status = ToolResult(tool="git_status", output=" M app.py\n")
+            state.messages.append({"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "app.py"}})
+            tools = ControllerCommandTools(0)
+            loop = CodingAgentLoop(
+                llm=ScriptedLLM(),
+                tools=tools,
+                verifier=CodingVerifier(),
+                repository=repo,
+                exporter=ArtifactExporter(Path(tmp), repo),
+                stop_policy=StopPolicy(max_iterations=5, max_runtime_seconds=60),
+            )
+
+            executed = await loop.maybe_execute_controller_required_command(
+                state,
+                workflow_snapshot(state, state.latest_git_status.output),
+            )
+
+            self.assertFalse(executed)
+            self.assertEqual(tools.commands, [])
 
     def test_verification_feedback_includes_smoke_command_and_output(self) -> None:
         feedback = verification_repair_feedback(
@@ -1772,7 +1999,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
         forced = targeted_repair_forced_tool(state, "edit_file", {"path": "crawler.py", "old": "x", "new": "y"})
 
-        self.assertEqual(set(names), {tool.name for tool in definitions})
+        self.assertEqual(set(names), {"write_file", "edit_file", "apply_patch"})
         self.assertIsNone(forced)
         self.assertEqual(targeted_repair_action_block(state, "edit_file", {"path": "crawler.py"}), "")
         self.assertEqual(targeted_repair_exploration_block(state, "read_file"), "")
@@ -1939,7 +2166,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertIsNone(forced)
 
-    def test_targeted_repair_edit_forced_tool_list_keeps_normal_tools_except_explicit_unsafe_forbidden(self) -> None:
+    def test_targeted_repair_edit_forced_tool_list_only_exposes_edit_tools(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.repair_mode = "targeted_repair"
         state.active_repair_action = {
@@ -1975,7 +2202,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
 
         self.assertEqual(state.targeted_repair_phase, "edit_forced")
-        self.assertEqual(set(names), {"read_file", "search", "list_files", "write_file", "apply_patch", "run_command", "git_status", "git_diff"})
+        self.assertEqual(set(names), {"write_file", "apply_patch"})
 
     def test_targeted_repair_explicit_unsafe_forbidden_tools_are_blocked(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -2000,11 +2227,12 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertNotIn("web_search", names)
         self.assertNotIn("fetch_url", names)
-        self.assertIn("run_command", names)
+        self.assertNotIn("run_command", names)
+        self.assertNotIn("read_file", names)
         self.assertIn("write_file", names)
         self.assertIn("apply_patch", names)
-        self.assertIn("git_status", names)
-        self.assertIn("git_diff", names)
+        self.assertNotIn("git_status", names)
+        self.assertNotIn("git_diff", names)
         self.assertIn("blocked by the active targeted repair action", repair_mode_tool_block(state, "fetch_url"))
         self.assertEqual(repair_mode_tool_block(state, "run_command"), "")
         self.assertIn("blocked by the active targeted repair action", targeted_repair_action_block(state, "web_search", {"query": "x"}))

@@ -646,7 +646,12 @@ def evaluate_verification_plan(
         fixes.append("run the task entrypoint or CLI command as smoke verification")
     if plan.require_no_placeholder and diff_contains_placeholder(diff_lowered):
         fixes.append("remove placeholder/TODO/stub implementation text before finishing")
-    if plan.require_external_source_verified and not external_source_verified(smoke_result, evidence, diff):
+    if plan.require_external_source_verified and not external_source_verified(
+        smoke_result,
+        evidence,
+        diff,
+        required_commands=plan.smoke_commands,
+    ):
         fixes.append("verify the external API/data source with fetch_url or web_search evidence and a successful smoke/dry-run")
     if plan.require_declared_python_dependencies:
         dependency_fixes = undeclared_dependency_fixes(diff)
@@ -706,9 +711,16 @@ def diff_contains_placeholder(diff_lowered: str) -> bool:
     return bool(re.search(r"\b(?:todo|placeholder|stub)\b|not implemented|pass\s+#", diff_lowered))
 
 
-def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvidence, diff: str = "") -> bool:
-    _ = smoke_result
+def external_source_verified(
+    smoke_result: ToolResult,
+    evidence: VerificationEvidence,
+    diff: str = "",
+    *,
+    required_commands: list[str] | None = None,
+) -> bool:
     if evidence.has_external_source_evidence:
+        return True
+    if successful_required_url_command_evidence(smoke_result, evidence, required_commands or []):
         return True
     diff_lowered = diff.lower()
     for url in evidence.successful_fetch_urls:
@@ -718,6 +730,30 @@ def external_source_verified(smoke_result: ToolResult, evidence: VerificationEvi
         return True
     if "api.example.invalid" in diff_lowered and re.search(r"\+\s*source_url\s*=\s*['\"]https?://", diff_lowered):
         return True
+    return False
+
+
+def successful_required_url_command_evidence(
+    smoke_result: ToolResult,
+    evidence: VerificationEvidence,
+    required_commands: list[str],
+) -> bool:
+    if smoke_result.exit_code != 0 or not required_commands:
+        return False
+    outputs = list(evidence.successful_command_outputs or [])
+    for index, command in enumerate(evidence.successful_commands or []):
+        if command not in required_commands or not re.search(r"https?://[^\s'\"`)>]+", command):
+            continue
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        executable = tokens[0].rsplit("/", 1)[-1].lower() if tokens else ""
+        if executable in {"echo", "printf", "true"}:
+            continue
+        output = outputs[index].strip() if index < len(outputs) else ""
+        if output:
+            return True
     return False
 
 
@@ -899,9 +935,8 @@ def verification_evidence_from_steps(steps) -> VerificationEvidence:
             command = metadata.get("command")
             if isinstance(command, str) and command and command not in successful_commands:
                 successful_commands.append(command)
-            output = content.get("output") or content.get("summary")
-            if isinstance(output, str) and output:
-                successful_command_outputs.append(output[:2000])
+                output = content.get("output") or content.get("summary") or ""
+                successful_command_outputs.append(str(output)[:2000])
     return VerificationEvidence(
         successful_fetch_urls=fetch_urls,
         successful_web_search_queries=web_search_queries,

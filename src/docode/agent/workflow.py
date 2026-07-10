@@ -124,7 +124,7 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             required_tests_passed=False,
             final_allowed=False,
             reason="required_tests_missing",
-            required_action=f"run this exact verification command before final_candidate: {missing_commands[0]}",
+            required_action=f"run this exact verification command before final_candidate: {display_command(missing_commands[0])}",
             missing_commands=missing_commands,
             latest_test_failure_signature=latest_failure_signature,
         )
@@ -138,7 +138,7 @@ def workflow_snapshot(state: AgentState, git_status_output: str) -> WorkflowSnap
             required_tests_passed=False,
             final_allowed=False,
             reason="required_tests_failed",
-            required_action=f"repair the failing source file, then rerun the exact verification command: {next_command}",
+            required_action=f"repair the failing source file, then rerun the exact verification command: {display_command(next_command)}",
             latest_test_failure_signature=latest_failure_signature,
             rerun_after_patch=next_command or None,
         )
@@ -195,7 +195,7 @@ def final_candidate_gate(state: AgentState, git_status_output: str) -> FinalGate
             repair_mode="must_edit",
         )
     if snapshot.reason == "required_tests_missing":
-        commands = ", ".join(snapshot.missing_commands or required_commands(state.task_contract))
+        commands = ", ".join(display_command(command) for command in (snapshot.missing_commands or required_commands(state.task_contract)))
         return FinalGate(
             allowed=False,
             reason="final_candidate_tests_missing",
@@ -310,7 +310,15 @@ def successful_edit_tool_called(state: AgentState) -> bool:
 
 
 def normalize_command(command: str) -> str:
-    cleaned = " ".join(command.strip().split())
+    normalized_lines = command.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    normalized_lines = [line.rstrip() for line in normalized_lines]
+    while normalized_lines and not normalized_lines[0]:
+        normalized_lines.pop(0)
+    while normalized_lines and not normalized_lines[-1]:
+        normalized_lines.pop()
+    if len(normalized_lines) > 1:
+        return "\n".join(normalized_lines)
+    cleaned = " ".join((normalized_lines[0] if normalized_lines else "").split())
     for suffix in (" 2>&1", " 1>&2"):
         if cleaned.endswith(suffix):
             cleaned = cleaned[: -len(suffix)].strip()
@@ -322,6 +330,8 @@ def commands_equivalent(observed: str, expected: str) -> bool:
     expected = normalize_command(expected)
     if observed == expected:
         return True
+    if "\n" in observed or "\n" in expected:
+        return False
     if is_compound_shell_command(observed):
         return compound_command_contains_success_segment(observed, expected)
     if observed.endswith(" -v") and observed[: -3] == expected:
@@ -333,6 +343,15 @@ def commands_equivalent(observed: str, expected: str) -> bool:
         extra = observed[len(unittest) :].strip()
         return extra in {"", "-v"}
     return False
+
+
+def display_command(command: str) -> str:
+    normalized = command.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    lines = normalized.split("\n") if normalized else []
+    if len(lines) <= 1:
+        return lines[0].strip() if lines else "<empty command>"
+    first = lines[0].strip() or "<empty first line>"
+    return f"{first} [multiline verification command, {len(lines)} lines]"
 
 
 def is_compound_shell_command(command: str) -> bool:
@@ -375,4 +394,3 @@ def target_file_modified_after_repair_start(state: AgentState) -> bool:
 
 def meaningful_diff_exists(git_status_output: str) -> bool:
     return any(meaningful_change_path(path) for path in changed_paths_from_status(git_status_output))
-

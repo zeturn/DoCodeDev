@@ -24,13 +24,15 @@ from docode.agent.reviewer import CodeReviewer, ReviewResult
 from docode.agent.state import AgentState
 from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
 from docode.agent.stop_policy import StopPolicy
-from docode.agent.task_contract import TaskContract, is_crawler_instruction, task_contract_from_instruction
+from docode.agent.task_contract import TaskContract, heredoc_delimiter_from_command, is_crawler_instruction, task_contract_from_instruction
 from docode.agent.verifier import CodingVerifier, VerificationResult, changed_files_from_diff, verification_evidence_from_steps
 from docode.agent.workflow import (
     WorkflowPhase,
     changed_paths_from_status,
     commands_equivalent,
+    display_command,
     final_candidate_gate,
+    normalize_command,
     successful_edit_tool_called,
     workflow_snapshot,
 )
@@ -126,6 +128,19 @@ class CodingAgentLoop:
             context_pack = await self.collect_observation(state)
             observation = context_pack.render()
             await self.repository.add_step(job.id, "system", observation_step(context_pack))
+            current_workflow = workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else "")
+            if await self.maybe_execute_controller_required_command(state, current_workflow):
+                completed_workflow = workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else "")
+                if completed_workflow.phase == WorkflowPhase.FINAL_READY and state.repair_mode is None and not state.active_repair_action:
+                    finalized = await self.auto_finalize_ready_workflow(
+                        state,
+                        reason="controller_required_commands_satisfied",
+                        detail="The controller executed the final multiline verification command successfully; submitting from complete workflow evidence.",
+                        workflow_state=completed_workflow.to_dict(),
+                    )
+                    if finalized is not None:
+                        return finalized
+                continue
             stuck = self.stuck_detector.evaluate(state=state, latest_git_status=state.latest_git_status.output if state.latest_git_status else "")
             if stuck.stuck:
                 state.stuck_count += 1
@@ -411,6 +426,63 @@ class CodingAgentLoop:
             return
         action = refine_repair_action_targets(action, state.task_contract)
         await self.activate_targeted_repair(state, action, result=result)
+
+    async def maybe_execute_controller_required_command(self, state: AgentState, workflow: Any) -> bool:
+        command = controller_owned_required_command(state, workflow)
+        if not command:
+            return False
+        args: dict[str, object] = {"command": command, "cwd": "/workspace"}
+        await self.repository.add_step(
+            state.job.id,
+            "system",
+            {
+                "type": "required_command_auto_execution",
+                "reason": "controller_owned_multiline_verification",
+                "command": command,
+                "command_summary": display_command(command),
+            },
+        )
+        await self.repository.add_step(
+            state.job.id,
+            "tool",
+            {
+                "type": "tool_call",
+                "tool": "run_command",
+                "args": sanitize_tool_args(args),
+            },
+        )
+        try:
+            result = await self.tools.call("run_command", args)
+        except Exception as exc:
+            result = tool_exception_result("run_command", exc)
+        result = enrich_tool_result_metadata("run_command", args, result)
+        state.add_tool_result(result)
+        note_targeted_repair_tool_result(state, result)
+        await self.repository.add_step(
+            state.job.id,
+            "tool",
+            {
+                "type": "tool_result",
+                "tool": result.tool,
+                "exit_code": result.exit_code,
+                "summary": summarize_output(result.output),
+                "output": result.output,
+                "truncated": result.truncated,
+                "metadata": result.metadata or {},
+            },
+        )
+        if not result.ok:
+            await self.plan_targeted_repair_from_failure(state, result)
+        elif targeted_repair_rerun_satisfied(state):
+            state.active_repair_action = None
+            state.active_repair_started_at = 0
+            state.targeted_repair_phase = None
+            state.targeted_repair_inspections = 0
+            state.targeted_repair_edits = 0
+            if state.repair_mode == "targeted_repair":
+                state.repair_mode = None
+        state.iteration += 1
+        return True
 
     async def maybe_activate_required_command_repair(self, state: AgentState, workflow: Any) -> bool:
         if workflow.phase != WorkflowPhase.REPAIR_REQUIRED:
@@ -1049,7 +1121,7 @@ def compact_llm_message(message: dict[str, Any]) -> dict[str, Any]:
         keep = {}
         for key in ("path", "command", "reason", "url", "status_code", "content_type", "prompt_output_truncated"):
             if key in metadata:
-                keep[key] = metadata[key]
+                keep[key] = display_command(str(metadata[key])) if key == "command" else metadata[key]
         if keep:
             compact["metadata"] = keep
     return compact
@@ -1145,13 +1217,14 @@ def fallback_required_command_repair(state: AgentState, result: ToolResult) -> R
     signature = "failed_required_command:" + hashlib.sha1(f"{command}\n{failure_summary}".encode("utf-8", errors="ignore")).hexdigest()[:12]
     target_files = fallback_required_command_target_files(state, output=str(result.output or ""), command=command)
     target_text = ", ".join(target_files) if target_files else "the relevant source file"
+    command_summary = display_command(command)
     instruction = (
         "A required verification command failed, but no specific repair plan matched the output.\n\n"
-        f"Failed command:\n{command}\n\n"
+        f"Failed command:\n{command_summary}\n\n"
         f"Failure output summary:\n{failure_summary}\n\n"
         f"Candidate target files: {target_text}.\n"
         "Edit a relevant source file before rerunning the command.\n"
-        f"After editing, rerun exactly: {command}"
+        f"After editing, the controller will rerun exactly: {command_summary}"
     )
     return RepairAction(
         category="failed_required_command",
@@ -1454,6 +1527,8 @@ def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) ->
 def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState) -> list[Any]:
     refresh_targeted_repair_phase(state)
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
+        if state.targeted_repair_phase == "edit_forced":
+            return [definition for definition in definitions if getattr(definition, "name", None) in EDIT_TOOLS]
         forbidden = targeted_repair_hard_forbidden_tools(state)
         return [definition for definition in definitions if getattr(definition, "name", None) not in forbidden]
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
@@ -1677,7 +1752,7 @@ def targeted_repair_modified_target(state: AgentState) -> bool:
         tool = str(message.get("tool") or "")
         if tool == "run_command" and int(message.get("exit_code") or 0) != 0 and rerun_commands:
             metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-            observed = " ".join(str(metadata.get("command") or "").split())
+            observed = str(metadata.get("command") or "")
             if any(commands_equivalent(observed, command) for command in rerun_commands):
                 return False
         if tool not in {"write_file", "edit_file", "replace_in_file", "apply_patch"} or int(message.get("exit_code") or 0) != 0:
@@ -1705,10 +1780,9 @@ def targeted_repair_rerun_satisfied(state: AgentState) -> bool:
         if int(message.get("exit_code") or 0) != 0:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        observed = " ".join(str(metadata.get("command") or "").split())
+        observed = str(metadata.get("command") or "")
         for command in commands:
-            expected = " ".join(command.split())
-            if commands_equivalent(observed, expected):
+            if commands_equivalent(observed, command):
                 return True
     return False
 
@@ -1924,8 +1998,8 @@ def required_test_tool_block(state: AgentState, workflow: Any, tool_name: str, a
         return ""
     if tool_name != "run_command":
         return f"{tool_name} is blocked while TEST_REQUIRED. Run this exact command first: {next_command}"
-    observed = " ".join(str(args.get("command") or "").strip().split())
-    expected = " ".join(next_command.strip().split())
+    observed = str(args.get("command") or "")
+    expected = next_command
     if not commands_equivalent(observed, expected):
         return f"Wrong command for TEST_REQUIRED. Run this exact command first: {next_command}"
     return ""
@@ -1989,7 +2063,7 @@ def required_command_attempted(state: AgentState, command: str) -> bool:
         if message.get("role") != "tool" or message.get("tool") != "run_command":
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        observed = " ".join(str(metadata.get("command") or "").split())
+        observed = str(metadata.get("command") or "")
         if observed and commands_equivalent(observed, command):
             return True
     return False
@@ -2063,7 +2137,7 @@ def targeted_repair_rerun_command_block(state: AgentState, args: dict[str, objec
     command = next_targeted_repair_rerun_command(state)
     if not command:
         return ""
-    observed = " ".join(str(args.get("command") or "").strip().split())
+    observed = str(args.get("command") or "")
     if commands_equivalent(observed, command):
         return ""
     return f"Active targeted repair was modified; rerun only the repair command now: {command}"
@@ -2087,7 +2161,7 @@ def targeted_repair_successful_commands_after_latest_edit(state: AgentState) -> 
         if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        command = " ".join(str(metadata.get("command") or "").split())
+        command = str(metadata.get("command") or "")
         if command:
             observed.append(command)
     return observed
@@ -2103,6 +2177,37 @@ def next_targeted_repair_rerun_command(state: AgentState) -> str:
         if not any(commands_equivalent(seen, command) for seen in observed):
             return command
     return ""
+
+
+def controller_owned_required_command(state: AgentState, workflow: Any) -> str:
+    contract_commands = [
+        str(command)
+        for command in (state.task_contract.must_run_commands if state.task_contract is not None else [])
+        if str(command)
+    ]
+    if not contract_commands:
+        return ""
+
+    if state.active_repair_action:
+        if state.repair_mode != "targeted_repair" or not targeted_repair_modified_target(state):
+            return ""
+        rerun = next_targeted_repair_rerun_command(state)
+        command = next((item for item in contract_commands if commands_equivalent(item, rerun)), "")
+    else:
+        if state.repair_mode is not None or workflow.phase != WorkflowPhase.TEST_REQUIRED:
+            return ""
+        if not getattr(workflow, "diff_exists", False) or not successful_edit_tool_called(state):
+            return ""
+        if missing_must_modify_targets(state):
+            return ""
+        missing = list(getattr(workflow, "missing_commands", None) or [])
+        command = str(missing[0]) if missing else ""
+
+    if not command or not any(commands_equivalent(command, item) for item in contract_commands):
+        return ""
+    if "\n" not in command and heredoc_delimiter_from_command(command) is None:
+        return ""
+    return command
 
 
 def targeted_repair_forced_tool(
@@ -2123,7 +2228,7 @@ def targeted_repair_forced_tool(
     if not missing:
         return None
     command = str(missing[0])
-    observed = " ".join(str((args or {}).get("command") or "").split()) if tool_name == "run_command" else ""
+    observed = str((args or {}).get("command") or "") if tool_name == "run_command" else ""
     if tool_name == "run_command" and commands_equivalent(observed, command):
         return None
     return "run_command", {"command": command}, "test_required_requires_exact_command"
@@ -2323,14 +2428,6 @@ def latest_failed_required_command(state: AgentState) -> ToolResult | None:
     return None
 
 
-def normalize_command(command: str) -> str:
-    cleaned = " ".join(command.strip().split())
-    for suffix in (" 2>&1", " 1>&2"):
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)].strip()
-    return cleaned
-
-
 def target_edit_allowed_while_tests_missing(state: AgentState, tool_name: str, args: dict[str, object]) -> bool:
     if tool_name not in {"write_file", "edit_file", "replace_in_file", "apply_patch"}:
         return False
@@ -2393,7 +2490,7 @@ def normalize_workspace_relative_path(path: str) -> str:
 
 
 def required_command_failed_after_latest_edit(state: AgentState, command: str) -> bool:
-    expected = " ".join(command.strip().split())
+    expected = command
     seen_edit = False
     for message in reversed(state.messages):
         if message.get("role") != "tool":
@@ -2403,8 +2500,8 @@ def required_command_failed_after_latest_edit(state: AgentState, command: str) -
             seen_edit = True
             break
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        observed = " ".join(str(metadata.get("command") or "").strip().split())
-        if observed == expected and int(message.get("exit_code") or 0) != 0:
+        observed = str(metadata.get("command") or "")
+        if commands_equivalent(observed, expected) and int(message.get("exit_code") or 0) != 0:
             return True
     return False if seen_edit else False
 

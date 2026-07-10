@@ -462,7 +462,7 @@ def inspect_json_records(records: list[Any], path: str, instruction: str, *, pro
                             artifact_path=path,
                             producer_path=producer_path,
                             message=f"JSON artifact {path} row {index} repository identifier has invalid format, got {preview(repository)}",
-                            repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher to derive owner/repository from the same repository href used for the URL.",
+                            repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher to derive the repository owner and name from the same href used for the URL.",
                         )
                     )
                 elif isinstance(url, str) and url.startswith("https://github.com/"):

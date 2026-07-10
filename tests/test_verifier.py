@@ -623,6 +623,56 @@ class VerifierTests(IsolatedAsyncioTestCase):
             result.required_fixes,
         )
 
+    async def test_public_url_crawler_accepts_successful_explicit_url_command_evidence(self) -> None:
+        command = "python crawler.py --url https://example.test/products --output out.json --dry-run"
+        diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('JSON outputs: out.json')\n"
+
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=(
+                    "Build a crawler for https://example.test/products that writes product records to JSON.\n\n"
+                    "Verification commands:\n"
+                    f"1. {command}"
+                ),
+            ),
+            CrawlerPolicyVerifierTools(diff, smoke_output="JSON outputs: out.json\nmin_records=2"),
+            evidence=VerificationEvidence(
+                successful_fetch_urls=[],
+                successful_web_search_queries=[],
+                relevant_fetch_urls=[],
+                successful_commands=[command],
+                successful_command_outputs=["wrote 12 records to out.json"],
+            ),
+        )
+
+        self.assertTrue(result.passed)
+
+    async def test_public_url_crawler_rejects_unrelated_or_print_only_url_command(self) -> None:
+        required = "python crawler.py --url https://example.test/products --output out.json --dry-run"
+        diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('JSON outputs: out.json')\n"
+        instruction = (
+            "Build a crawler for https://example.test/products that writes product records to JSON.\n\n"
+            "Verification commands:\n"
+            f"1. {required}"
+        )
+        for observed in ("python crawler.py --url https://other.test/items", "echo https://example.test/products"):
+            with self.subTest(observed=observed):
+                result = await CodingVerifier().verify(
+                    CodingJob(id=new_id("job"), user_id="u1", instruction=instruction),
+                    CrawlerPolicyVerifierTools(diff, smoke_output="JSON outputs: out.json\nmin_records=2"),
+                    evidence=VerificationEvidence(
+                        successful_fetch_urls=[],
+                        successful_web_search_queries=[],
+                        relevant_fetch_urls=[],
+                        successful_commands=[observed],
+                        successful_command_outputs=["ok"],
+                    ),
+                )
+
+                self.assertFalse(result.passed)
+
     async def test_crawler_output_flag_alone_does_not_verify_artifact(self) -> None:
         diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('done')\n"
 

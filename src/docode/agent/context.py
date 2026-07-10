@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from docode.agent.inspector import ProjectInspection
 from docode.agent.stuck import git_status_clean
 from docode.agent.task_contract import TaskContract
+from docode.agent.workflow import display_command
 from docode.dobox.types import ToolResult
 from docode.git_changes import changed_paths_from_status, strip_ansi
 from docode.storage.models import CodingJob
@@ -137,7 +138,7 @@ class ContextManager:
                 mandatory.append("Prefer editing the file most directly responsible for the failing behavior")
             else:
                 mandatory.append("You must produce non-empty git diff before final_candidate")
-            mandatory.extend(f"You must run suggested command: {command}" for command in task_contract.must_run_commands)
+            mandatory.extend(f"You must run suggested command: {display_command(command)}" for command in task_contract.must_run_commands)
             mandatory.extend(task_contract.forbidden_finish_conditions)
             if is_crawler_instruction(job.instruction):
                 mandatory.extend(crawler_contract_requirements())
@@ -164,7 +165,7 @@ class ContextManager:
             next_action = f"inspect or modify {targets}, then rerun the relevant command when useful"
             parts.append(
                 "Active Targeted Repair:\n"
-                + json.dumps(active_repair_action, ensure_ascii=False, indent=2)
+                + json.dumps(display_repair_action(active_repair_action), ensure_ascii=False, indent=2)
                 + "\n\n"
                 + f"Targeted repair phase: {phase}\n"
                 + f"Suggested next action: {next_action}"
@@ -299,7 +300,7 @@ class ContextManager:
         active = ""
         if active_repair_action:
             target_files = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "<none>"
-            rerun = ", ".join(str(command) for command in active_repair_action.get("rerun_commands") or []) or "<none>"
+            rerun = ", ".join(display_command(str(command)) for command in active_repair_action.get("rerun_commands") or []) or "<none>"
             snippets = repair_file_snippets(messages, output_limit=1600)
             active = (
                 "\n\nActive Targeted Repair:\n"
@@ -430,8 +431,16 @@ def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "original_output_bytes",
     ):
         if key in metadata:
-            keep[key] = metadata[key]
+            keep[key] = display_command(str(metadata[key])) if key == "command" else metadata[key]
     return keep
+
+
+def display_repair_action(action: dict[str, Any]) -> dict[str, Any]:
+    displayed = dict(action)
+    rerun_commands = action.get("rerun_commands")
+    if isinstance(rerun_commands, list):
+        displayed["rerun_commands"] = [display_command(str(command)) for command in rerun_commands]
+    return displayed
 
 
 def next_missing_command(messages: list[dict[str, Any]]) -> str:
@@ -613,4 +622,3 @@ def clip_text(text: str, limit: int) -> str:
     if len(encoded) <= limit:
         return text
     return encoded[:limit].decode("utf-8", errors="replace") + "\n<truncated>"
-
