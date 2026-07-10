@@ -118,6 +118,13 @@ def _larger_refetch_needed(cached: Any, requested_max_bytes: int) -> bool:
 def _cached_source_result(cached: Any, tool_result_cls: Any) -> Any:
     metadata = dict(cached.metadata or {})
     metadata.update({"cached": True, "network_request_performed": False})
+    body_excerpt = ""
+    try:
+        cached_payload = json.loads(str(cached.output or ""))
+        if isinstance(cached_payload, dict) and isinstance(cached_payload.get("body"), str):
+            body_excerpt = cached_payload["body"][:4000]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
     payload: dict[str, Any] = {
         "requested_url": metadata.get("requested_url") or metadata.get("url"),
         "final_url": metadata.get("final_url"),
@@ -128,7 +135,8 @@ def _cached_source_result(cached: Any, tool_result_cls: Any) -> Any:
         "network_request_performed": False,
         "truncated": bool(metadata.get("truncated") or cached.truncated),
         "structure_summary": metadata.get("structure_summary") or {},
-        "instruction": "This exact source was already inspected. Reuse the existing raw source evidence and edit or inspect a distinct same-origin page; do not request this URL again.",
+        "body_excerpt": body_excerpt,
+        "instruction": "This exact source was already inspected. Reuse this cached excerpt and edit or inspect a distinct same-origin page; do not request this URL again.",
     }
     return tool_result_cls(
         tool="inspect_source",
@@ -339,7 +347,12 @@ def _format_origin(origin: tuple[str, str, int]) -> str:
 
 
 def _patch_controller_verification_order(loop: Any, workflow: Any) -> None:
+    original = loop.controller_owned_required_command
+
     def controller_owned_required_command(state: Any, snapshot: Any) -> str:
+        if not loop.is_crawler_instruction(state.job.instruction):
+            return original(state, snapshot)
+
         commands = [
             str(command)
             for command in (state.task_contract.must_run_commands if state.task_contract is not None else [])
