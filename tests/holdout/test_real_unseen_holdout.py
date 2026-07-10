@@ -27,7 +27,7 @@ from tests.test_smoke_readme_job import RecordingRepository
 
 
 REAL_HOLDOUT_ENABLED = os.getenv("DOCODE_REAL_HOLDOUT", "").lower() in {"1", "true", "yes", "on"}
-RESULT_ROOT = Path(".docode/evals/eff27a7-unseen-holdout")
+RESULT_ROOT = Path(os.getenv("DOCODE_HOLDOUT_RESULT_ROOT", ".docode/evals/eff27a7-unseen-holdout"))
 RESULT_PATH = RESULT_ROOT / "results.json"
 TRACE_ROOT = RESULT_ROOT / "traces"
 
@@ -432,7 +432,7 @@ class RealUnseenHoldoutTests(IsolatedAsyncioTestCase):
         payload = {
             "baseline": "eff27a7cbe70408097591369787105ffc5aea777",
             "tag": "agent-baseline-eff27a7",
-            "branch": "eval/unseen-holdout-eff27a7",
+            "branch": os.getenv("DOCODE_HOLDOUT_RESULT_BRANCH", "eval/unseen-holdout-eff27a7"),
             "provider": os.getenv("DOCODE_REAL_LLM_PROVIDER", "deepseek"),
             "model": os.getenv("DOCODE_REAL_LLM_MODEL", "deepseek-chat"),
             "requested_runs_per_case": requested_runs,
