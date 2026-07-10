@@ -28,6 +28,7 @@ TOOL_DECISION_TYPES = {
     "git_diff",
     "web_search",
     "fetch_url",
+    "inspect_source",
     "preview",
     "logs",
 }

@@ -3,12 +3,22 @@ from __future__ import annotations
 import inspect
 import posixpath
 import difflib
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .client import DoBoxClient
 from .file_readers import read_line_range, read_python_symbol
+from .source_inspection import (
+    INSPECT_SOURCE_COMMAND,
+    INSPECT_SOURCE_DEFAULT_BYTES,
+    INSPECT_SOURCE_DEFAULT_TIMEOUT,
+    INSPECT_SOURCE_PROGRAM,
+    compact_json,
+    inspect_source_error_payload,
+    inspect_source_validation_error,
+)
 from .types import FileResult, ToolResult
 from docode.git_changes import filter_diff_output, filter_status_output
 
@@ -105,6 +115,17 @@ class DoBoxTools:
     def definitions(self) -> list[ToolDefinition]:
         return [
             ToolDefinition("run_command", "Run a shell command inside the project sandbox.", {"command": "string", "cwd": "string"}, self.run_command),
+            ToolDefinition(
+                "inspect_source",
+                "Fetch and inspect an HTTP/HTTPS source from inside the project sandbox network namespace.",
+                {
+                    "url": "string",
+                    "mode": {"type": "string", "enum": ["raw", "text", "json", "headers"], "default": "raw"},
+                    "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 200000, "default": 50000},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 30, "default": 15},
+                },
+                self.inspect_source,
+            ),
             ToolDefinition("read_file", "Read a file under /workspace.", {"path": "string"}, self.read_file),
             ToolDefinition(
                 "read_file_range",
@@ -169,6 +190,76 @@ class DoBoxTools:
             result.exit_code,
             {"command": command, "cwd": cwd, "executed_command": executable_command},
             truncated=result.truncated,
+        )
+
+    async def inspect_source(
+        self,
+        url: str,
+        mode: str = "raw",
+        max_bytes: int = INSPECT_SOURCE_DEFAULT_BYTES,
+        timeout: int = INSPECT_SOURCE_DEFAULT_TIMEOUT,
+    ) -> ToolResult:
+        error = inspect_source_validation_error(url, mode, max_bytes, timeout)
+        normalized_url = url.strip() if isinstance(url, str) else str(url or "")
+        normalized_mode = mode if isinstance(mode, str) else str(mode or "")
+        if error:
+            payload = inspect_source_error_payload(url=normalized_url, mode=normalized_mode, error=error)
+            return ToolResult(
+                tool="inspect_source",
+                output=compact_json(payload),
+                exit_code=2,
+                metadata={**payload, "rejected": True},
+            )
+
+        config = compact_json({"url": normalized_url, "mode": normalized_mode, "max_bytes": max_bytes, "timeout": timeout})
+        command = [*INSPECT_SOURCE_COMMAND, INSPECT_SOURCE_PROGRAM, config]
+        output_limit = min(1_250_000, max(self.output_limit_bytes, max_bytes * 6 + 16_384))
+        try:
+            result = await self.client.run_command(
+                self.project_id,
+                command,
+                cwd="/workspace",
+                timeout_sec=timeout + 5,
+                output_limit=output_limit,
+                agent_session_id=self.agent_session_id,
+            )
+        except Exception as exc:
+            payload = inspect_source_error_payload(
+                url=normalized_url,
+                mode=normalized_mode,
+                error=f"sandbox execution failed: {type(exc).__name__}: {exc}",
+            )
+            return ToolResult(tool="inspect_source", output=compact_json(payload), exit_code=1, metadata=payload)
+
+        if result.truncated:
+            payload = inspect_source_error_payload(
+                url=normalized_url,
+                mode=normalized_mode,
+                error="sandbox command output was truncated before a complete source result was returned",
+            )
+            return ToolResult(tool="inspect_source", output=compact_json(payload), exit_code=1, metadata=payload, truncated=True)
+        try:
+            payload = json.loads(result.output.strip())
+            if not isinstance(payload, dict):
+                raise ValueError("source result is not a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            payload = inspect_source_error_payload(
+                url=normalized_url,
+                mode=normalized_mode,
+                error=f"invalid sandbox source result: {exc}",
+            )
+            if result.output.strip():
+                payload["sandbox_output"] = result.output.strip()[:2_000]
+            return ToolResult(tool="inspect_source", output=compact_json(payload), exit_code=result.exit_code or 1, metadata=payload)
+
+        payload["execution_scope"] = "sandbox"
+        metadata = {key: value for key, value in payload.items() if key != "body"}
+        return ToolResult(
+            tool="inspect_source",
+            output=compact_json(payload),
+            exit_code=result.exit_code,
+            metadata=metadata,
+            truncated=bool(payload.get("truncated")),
         )
 
     async def read_file(self, path: str) -> ToolResult:
