@@ -1257,3 +1257,113 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertEqual((evidence.command_runs or [])[-1].output, "second success\nwith details")
         self.assertTrue(all(run.explicit for run in evidence.command_runs or []))
         self.assertEqual(evidence.latest_edit_epoch, 1)
+
+    async def test_controller_heredoc_evidence_is_reused_with_safe_newline_normalization(self) -> None:
+        command = "python - <<'PY'\nprint('verified')\nPY"
+
+        class HeredocTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 6\n")
+
+        tools = HeredocTools()
+        observed = command.replace("\n", "\r\n")
+        evidence = VerificationEvidence(
+            successful_fetch_urls=[],
+            successful_web_search_queries=[],
+            command_runs=[CommandEvidence(observed, "verified\n", 0, 2, 1, True)],
+            latest_edit_step_index=1,
+            latest_edit_epoch=1,
+        )
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+            ),
+            tools,
+            evidence=evidence,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertNotIn(command, tools.commands)
+        self.assertTrue((result.explicit_results or [])[0].metadata["reused_evidence"])
+
+    async def test_incomplete_or_different_heredoc_evidence_does_not_match(self) -> None:
+        command = "python - <<'PY'\nprint('required')\nPY"
+
+        class HeredocTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 7\n")
+
+        for observed in ("python - <<'PY'", "python - <<'PY'\nprint('different')\nPY"):
+            with self.subTest(observed=observed):
+                tools = HeredocTools()
+                evidence = VerificationEvidence(
+                    successful_fetch_urls=[],
+                    successful_web_search_queries=[],
+                    command_runs=[CommandEvidence(observed, "unrelated\n", 0, 2, 1, False)],
+                    latest_edit_step_index=1,
+                    latest_edit_epoch=1,
+                )
+                result = await CodingVerifier().verify(
+                    CodingJob(
+                        id=new_id("job"),
+                        user_id="u1",
+                        instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+                    ),
+                    tools,
+                    evidence=evidence,
+                )
+
+                self.assertTrue(result.passed)
+                self.assertEqual(tools.commands.count(command), 1)
+                self.assertFalse((result.explicit_results or [])[0].metadata["reused_evidence"])
+
+    async def test_explicit_success_does_not_suppress_detected_failing_test(self) -> None:
+        command = "python checks/check_contract.py"
+
+        class FailingDetectedTestTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return "pytest"
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def run_tests(self) -> ToolResult:
+                return ToolResult(tool="run_tests", output="1 failed", exit_code=1, metadata={"detected": True, "command": "pytest"})
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 8\n")
+
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+            ),
+            FailingDetectedTestTools(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIn("fix failing verification command", result.required_fixes)

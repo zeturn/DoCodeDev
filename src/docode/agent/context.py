@@ -162,7 +162,7 @@ class ContextManager:
         if active_repair_action:
             phase = targeted_repair_phase or "inspect_allowed"
             targets = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "the target file"
-            next_action = f"inspect or modify {targets}, then rerun the relevant command when useful"
+            next_action = targeted_repair_phase_guidance(phase, targets, active_repair_action)
             parts.append(
                 "Active Targeted Repair:\n"
                 + json.dumps(display_repair_action(active_repair_action), ensure_ascii=False, indent=2)
@@ -309,7 +309,7 @@ class ContextManager:
                 f"- phase: {targeted_repair_phase or 'inspect_allowed'}\n"
                 f"- target_files: {target_files}\n"
                 f"- rerun: {rerun}\n"
-                "- suggested_next_action: inspect, edit, or rerun based on the latest failure output"
+                f"- suggested_next_action: {targeted_repair_phase_guidance(targeted_repair_phase or 'inspect_allowed', target_files, active_repair_action)}"
                 + ("\n\nRepair file snippets:\n" + snippets if snippets else "")
             )
         return (
@@ -396,6 +396,8 @@ def repair_file_snippets(messages: list[dict[str, Any]], *, output_limit: int = 
         if tool not in {"read_file", "read_file_range", "read_symbol"}:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if metadata.get("blocked"):
+            continue
         path = str(metadata.get("path") or metadata.get("resolved_path") or "<unknown>")
         symbol = str(metadata.get("symbol") or "")
         key = (path, symbol or tool)
@@ -420,7 +422,12 @@ def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "command",
         "detected",
         "rejected",
+        "blocked",
         "reason",
+        "read_budget",
+        "observed_reads",
+        "target_files",
+        "next_action",
         "url",
         "status_code",
         "content_type",
@@ -433,6 +440,18 @@ def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         if key in metadata:
             keep[key] = display_command(str(metadata[key])) if key == "command" else metadata[key]
     return keep
+
+
+def targeted_repair_phase_guidance(phase: str, targets: str, action: dict[str, Any]) -> str:
+    if phase == "rerun_required":
+        commands = [display_command(str(command)) for command in action.get("rerun_commands") or [] if str(command)]
+        return "rerun the exact repair command now" + (f": {commands[0]}" if commands else "; inspect git status/diff afterward")
+    if phase == "edit_forced":
+        return (
+            f"edit {targets} now. Focused target reads remain available, but repeated or over-budget reads return structured "
+            "repair_read_budget_exhausted feedback; run_command stays blocked until an edit succeeds"
+        )
+    return f"read only the relevant portions of {targets}, then edit; run_command stays blocked until an edit succeeds"
 
 
 def display_repair_action(action: dict[str, Any]) -> dict[str, Any]:

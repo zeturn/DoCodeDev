@@ -18,6 +18,7 @@ from docode.agent.repair_planner import (
     RepairAction,
     TARGETED_REPAIR_FORBIDDEN_TOOLS,
     format_repair_action,
+    infer_named_fixture_files,
     infer_python_traceback_files,
     plan_repair_from_tool_result,
 )
@@ -47,6 +48,8 @@ from docode.storage.repository import JobRepository
 INITIAL_NO_DIFF_EXPLORATION_BUDGET = NO_DIFF_EXPLORATION_BUDGET
 LOCAL_INSPECTION_TOOLS = {"read_file", "read_file_range", "read_symbol", "list_files", "search", "git_status", "git_diff"}
 EDIT_TOOLS = {"write_file", "edit_file", "replace_in_file", "apply_patch"}
+FOCUSED_REPAIR_READ_TOOLS = {"read_file", "read_file_range", "read_symbol"}
+TARGETED_REPAIR_GIT_TOOLS = {"git_status", "git_diff"}
 CONTEXT_HEAVY_REPAIR_CATEGORIES = {
     "missing_required_field",
     "parsed_value_mismatch",
@@ -246,6 +249,24 @@ class CodingAgentLoop:
                         reason=f"{state.repair_mode}_tool_forbidden" if state.repair_mode else "repair_mode_tool_forbidden",
                         detail=repair_tool_block,
                     )
+                    continue
+                repair_read_result = targeted_repair_read_policy_result(state, tool_name, tool_args)
+                if repair_read_result is not None:
+                    state.add_tool_result(repair_read_result)
+                    await self.repository.add_step(
+                        job.id,
+                        "tool",
+                        {
+                            "type": "tool_result",
+                            "tool": repair_read_result.tool,
+                            "exit_code": repair_read_result.exit_code,
+                            "summary": summarize_output(repair_read_result.output),
+                            "output": repair_read_result.output,
+                            "truncated": repair_read_result.truncated,
+                            "metadata": repair_read_result.metadata or {},
+                        },
+                    )
+                    state.iteration += 1
                     continue
                 targeted_action_block = targeted_repair_action_block(state, tool_name, tool_args)
                 if targeted_action_block:
@@ -1126,10 +1147,16 @@ def observation_step(context_pack: ContextPack) -> dict[str, object]:
 
 def enrich_tool_result_metadata(tool_name: str, args: dict[str, object], result: ToolResult) -> ToolResult:
     metadata = dict(result.metadata or {})
-    if "path" not in metadata and tool_name in {"write_file", "edit_file", "replace_in_file", "read_file"}:
+    if "path" not in metadata and tool_name in {"write_file", "edit_file", "replace_in_file", *FOCUSED_REPAIR_READ_TOOLS}:
         path = args.get("path")
         if path:
             metadata["path"] = str(path)
+    if tool_name == "read_file_range":
+        metadata.setdefault("start_line", args.get("start_line", 1))
+        metadata.setdefault("end_line", args.get("end_line", 120))
+    elif tool_name == "read_symbol":
+        metadata.setdefault("symbol", args.get("symbol", ""))
+        metadata.setdefault("context_lines", args.get("context_lines", 5))
     if "command" not in metadata and tool_name == "run_command":
         command = args.get("command")
         if command:
@@ -1231,7 +1258,10 @@ def refine_repair_action_targets(action: RepairAction, task_contract: TaskContra
     source_targets = task_contract_source_targets(task_contract)
     if not source_targets:
         return action
-    target_files = unique_preserving_paths([*source_targets, *action.target_files])
+    action_targets = list(action.target_files)
+    if "main.py" in action_targets and "main.py" not in source_targets:
+        action_targets = [path for path in action_targets if path != "main.py"]
+    target_files = unique_preserving_paths([*source_targets, *action_targets])
     if target_files == action.target_files:
         return action
     return replace(action, target_files=target_files)
@@ -1302,10 +1332,29 @@ def fallback_required_command_target_files(state: AgentState, *, output: str, co
     if task_contract is not None:
         candidates.extend(str(path) for path in task_contract.must_modify_files if str(path).strip())
     candidates.extend(infer_python_traceback_files(output))
+    candidates.extend(infer_named_fixture_files(output, command))
     candidates.extend(source_files_implied_by_command(command))
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     candidates.extend(changed_source_files_from_status(status_output))
+    candidates.extend(successfully_inspected_source_files(state))
     return unique_preserving_paths(candidates)
+
+
+def successfully_inspected_source_files(state: AgentState) -> list[str]:
+    paths: list[str] = []
+    for message in state.messages:
+        if (
+            message.get("role") != "tool"
+            or message.get("tool") not in FOCUSED_REPAIR_READ_TOOLS
+            or int(message.get("exit_code") or 0) != 0
+        ):
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        suffix = posixpath.splitext(path)[1].lower()
+        if path and suffix in SOURCE_FILE_EXTENSIONS:
+            paths.append(path)
+    return unique_preserving_paths(paths)
 
 
 def source_files_implied_by_command(command: str) -> list[str]:
@@ -1565,10 +1614,8 @@ def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) ->
 def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState) -> list[Any]:
     refresh_targeted_repair_phase(state)
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
-        if state.targeted_repair_phase == "edit_forced":
-            return [definition for definition in definitions if getattr(definition, "name", None) in EDIT_TOOLS]
-        forbidden = targeted_repair_hard_forbidden_tools(state)
-        return [definition for definition in definitions if getattr(definition, "name", None) not in forbidden]
+        allowed = targeted_repair_allowed_tools_for_phase(state) - targeted_repair_hard_forbidden_tools(state)
+        return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     workflow = workflow_snapshot(state, status_output)
     if crawler_source_research_priority_active(state, workflow):
@@ -1595,7 +1642,9 @@ def repair_mode_tool_block(state: AgentState, tool_name: str) -> str:
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         if tool_name in targeted_repair_hard_forbidden_tools(state):
             return repair_mode_forbidden_detail(state, tool_name)
-        return ""
+        if tool_name in targeted_repair_allowed_tools_for_phase(state):
+            return ""
+        return repair_mode_forbidden_detail(state, tool_name)
     if state.repair_mode not in {"must_edit", "quality_repair", "targeted_repair"}:
         return ""
     allowed = allowed_tools_for_repair_mode(state)
@@ -1618,44 +1667,9 @@ def targeted_repair_hard_forbidden_tools(state: AgentState) -> set[str]:
 
 
 def targeted_repair_allowed_tools_for_phase(state: AgentState) -> set[str]:
-    action = state.active_repair_action or {}
-
-    # 一旦 target file 已经在本轮 repair 后被修改，才允许 rerun command。
     if targeted_repair_modified_target(state):
         return {"run_command", "git_status", "git_diff"}
-
-    # target file 还没改之前，绝对不要暴露 run_command。
-    # inspect_allowed 允许读一次，也允许模型直接改。
-    if state.targeted_repair_phase == "inspect_allowed":
-        return {
-            "read_file",
-            "read_file_range",
-            "read_symbol",
-            "edit_file",
-            "write_file",
-            "replace_in_file",
-            "apply_patch",
-            "git_status",
-            "git_diff",
-        }
-
-    # edit_forced 阶段只允许修改，不允许继续读/搜/跑测试。
-    if state.targeted_repair_phase == "edit_forced":
-        return {
-            "edit_file",
-            "write_file",
-            "replace_in_file",
-            "apply_patch",
-        }
-
-    # fallback：保守处理，不允许 run_command
-    return {
-        "read_file",
-        "edit_file",
-        "write_file",
-        "replace_in_file",
-        "apply_patch",
-    }
+    return FOCUSED_REPAIR_READ_TOOLS | EDIT_TOOLS | TARGETED_REPAIR_GIT_TOOLS
 
 
 def allowed_tools_for_repair_mode_name(repair_mode: str | None) -> set[str]:
@@ -1669,9 +1683,15 @@ def allowed_tools_for_repair_mode_name(repair_mode: str | None) -> set[str]:
 def repair_mode_forbidden_detail(state: AgentState, tool_name: str) -> str:
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         instruction = str(state.active_repair_action.get("instruction") or "")
+        if not targeted_repair_modified_target(state):
+            return (
+                f"{tool_name} is blocked until an active target file is modified. "
+                "Use focused target reads, edit tools, git_status, or git_diff now.\n"
+                f"{instruction}"
+            )
         return (
             f"{tool_name} is blocked by the active targeted repair action.\n"
-            f"Use local read/edit/run_command/git tools for this repair instead.\n{instruction}"
+            f"Rerun the exact repair command or inspect git status/diff now.\n{instruction}"
         )
     if state.repair_mode == "must_edit":
         return (
@@ -1698,13 +1718,85 @@ def targeted_repair_action_block(state: AgentState, tool_name: str, args: dict[s
     return ""
 
 
+def targeted_repair_read_policy_result(
+    state: AgentState,
+    tool_name: str,
+    args: dict[str, object],
+) -> ToolResult | None:
+    if (
+        state.repair_mode != "targeted_repair"
+        or not state.active_repair_action
+        or tool_name not in FOCUSED_REPAIR_READ_TOOLS
+    ):
+        return None
+    path = normalize_workspace_relative_path(str(args.get("path") or ""))
+    targets = targeted_repair_targets(state)
+    if targets and not any(status_change_covers_target(path, target) for target in targets):
+        return repair_read_blocked_result(
+            tool_name,
+            path,
+            "repair_read_not_targeted",
+            targets,
+            "Read one of the active target files or edit the most likely source target.",
+        )
+    if repeated_targeted_repair_read(state, tool_name, args):
+        return repair_read_blocked_result(
+            tool_name,
+            path,
+            "repair_read_repeated",
+            targets,
+            "Use a different range/symbol if the prior output was truncated; otherwise edit the target now.",
+        )
+    budget = targeted_repair_inspection_budget(state)
+    observed = targeted_repair_read_count(state)
+    if observed < budget or not usable_targeted_repair_read_exists(state):
+        return None
+    if truncated_read_followup_allowed(state, tool_name, path):
+        return None
+    return repair_read_blocked_result(
+        tool_name,
+        path,
+        "repair_read_budget_exhausted",
+        targets,
+        "The focused read budget is exhausted. Edit the target file now, then rerun the required command.",
+        observed=observed,
+        budget=budget,
+    )
+
+
+def repair_read_blocked_result(
+    tool_name: str,
+    path: str,
+    reason: str,
+    targets: set[str],
+    next_action: str,
+    *,
+    observed: int | None = None,
+    budget: int | None = None,
+) -> ToolResult:
+    target_text = ", ".join(sorted(targets)) or "<unspecified>"
+    output = f"{reason}: read not executed. Target files: {target_text}. {next_action}"
+    metadata: dict[str, Any] = {
+        "path": path,
+        "blocked": True,
+        "reason": reason,
+        "target_files": sorted(targets),
+        "next_action": next_action,
+    }
+    if observed is not None:
+        metadata["observed_reads"] = observed
+    if budget is not None:
+        metadata["read_budget"] = budget
+    return ToolResult(tool=tool_name, output=output, exit_code=0, metadata=metadata)
+
+
 def note_targeted_repair_tool_result(state: AgentState, result: ToolResult) -> None:
     if state.repair_mode != "targeted_repair" or not state.active_repair_action:
         return
     if not result.ok:
         refresh_targeted_repair_phase(state)
         return
-    if result.tool in {"read_file", "read_file_range", "read_symbol", "search", "list_files"}:
+    if result.tool in FOCUSED_REPAIR_READ_TOOLS and useful_targeted_repair_read_result(state, result):
         state.targeted_repair_inspections += 1
     elif result.tool in {"edit_file", "write_file", "replace_in_file", "apply_patch"}:
         state.targeted_repair_edits += 1
@@ -1773,9 +1865,93 @@ def targeted_repair_read_count(state: AgentState) -> int:
         return 0
     count = 0
     for message in state.messages[state.active_repair_started_at :]:
-        if message.get("role") == "tool" and message.get("tool") in {"read_file", "read_file_range", "read_symbol", "search", "list_files"}:
+        if useful_targeted_repair_read_message(state, message):
             count += 1
     return count
+
+
+def useful_targeted_repair_read_result(state: AgentState, result: ToolResult) -> bool:
+    return useful_targeted_repair_read_message(
+        state,
+        {
+            "role": "tool",
+            "tool": result.tool,
+            "exit_code": result.exit_code,
+            "output": result.output,
+            "truncated": result.truncated,
+            "metadata": result.metadata or {},
+        },
+    )
+
+
+def useful_targeted_repair_read_message(state: AgentState, message: dict[str, Any]) -> bool:
+    if (
+        message.get("role") != "tool"
+        or message.get("tool") not in FOCUSED_REPAIR_READ_TOOLS
+        or int(message.get("exit_code") or 0) != 0
+        or not str(message.get("output") or "").strip()
+    ):
+        return False
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    if metadata.get("blocked"):
+        return False
+    path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+    targets = targeted_repair_targets(state)
+    return bool(path) and (not targets or any(status_change_covers_target(path, target) for target in targets))
+
+
+def usable_targeted_repair_read_exists(state: AgentState) -> bool:
+    return any(
+        useful_targeted_repair_read_message(state, message)
+        for message in state.messages[state.active_repair_started_at :]
+    )
+
+
+def repeated_targeted_repair_read(state: AgentState, tool_name: str, args: dict[str, object]) -> bool:
+    requested = targeted_repair_read_identity(tool_name, args)
+    for message in state.messages[state.active_repair_started_at :]:
+        if message.get("role") != "tool" or message.get("tool") != tool_name or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if metadata.get("blocked"):
+            continue
+        if targeted_repair_read_identity(tool_name, metadata) == requested:
+            return True
+    return False
+
+
+def targeted_repair_read_identity(tool_name: str, values: dict[str, object]) -> tuple[object, ...]:
+    path = normalize_workspace_relative_path(str(values.get("path") or ""))
+    if tool_name == "read_file_range":
+        return tool_name, path, int_or_default(values.get("start_line"), 1), int_or_default(values.get("end_line"), 120)
+    if tool_name == "read_symbol":
+        return tool_name, path, str(values.get("symbol") or ""), int_or_default(values.get("context_lines"), 5)
+    return tool_name, path
+
+
+def int_or_default(value: object, default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def truncated_read_followup_allowed(state: AgentState, tool_name: str, path: str) -> bool:
+    if tool_name not in {"read_file_range", "read_symbol"}:
+        return False
+    for message in reversed(state.messages[state.active_repair_started_at :]):
+        if message.get("role") != "tool" or message.get("tool") not in FOCUSED_REPAIR_READ_TOOLS:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        seen_path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if seen_path != path or metadata.get("blocked"):
+            continue
+        return bool(
+            message.get("truncated")
+            or metadata.get("source_truncated")
+            or metadata.get("prompt_output_truncated")
+        )
+    return False
 
 
 def targeted_repair_modified_target(state: AgentState) -> bool:

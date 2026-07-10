@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 
 from docode.dobox.tools import DoBoxTools
-from docode.agent.task_contract import TaskContract, is_crawler_instruction, task_contract_from_instruction
+from docode.agent.task_contract import TaskContract, is_crawler_instruction, task_contract_from_instruction, text_outside_verification_blocks
 
 
 IMPORTANT_FILES = (
@@ -94,7 +94,7 @@ def build_initial_plan(
         plan.append("Run the exact required verification commands: " + "; ".join(_display_command(command) for command in explicit) + ".")
     if checks:
         plan.append("Run detected verification commands: " + "; ".join(checks) + ".")
-    else:
+    elif not explicit:
         plan.append("No standard verification command was detected; create or explain a task-appropriate verification path.")
     plan.append("Finish only after verification passes and a final summary can be exported.")
     return plan
@@ -132,7 +132,7 @@ def has_public_source_url(instruction: str) -> bool:
 
 
 def summarize_instruction(instruction: str, limit: int = 240) -> str:
-    compact = " ".join(part.strip() for part in instruction.splitlines() if part.strip())
+    compact = " ".join(part.strip() for part in text_outside_verification_blocks(instruction).splitlines() if part.strip())
     if len(compact) <= limit:
         return compact
     return compact[: limit - 13].rstrip() + " <truncated>"

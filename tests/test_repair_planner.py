@@ -328,7 +328,7 @@ def test_parsed_value_mismatch_repair() -> None:
 
     assert action is not None
     assert action.category == "parsed_value_mismatch"
-    assert action.target_files == ["main.py"]
+    assert action.target_files == ["main.py", "tests/test_parser.py"]
     assert "Observed value: `user1/repo1`" in action.instruction
     assert "Expected value: `user/repo`" in action.instruction
     assert "fixture/test consistency" in action.instruction
@@ -387,7 +387,7 @@ def test_fixture_owner_sample_mismatch_targets_fixture_first() -> None:
 
     assert action is not None
     assert action.category == "parsed_value_mismatch"
-    assert action.target_files == ["main.py"]
+    assert action.target_files == ["main.py", "tests/test_parser.py"]
     assert "based on evidence" in action.instruction
 
 

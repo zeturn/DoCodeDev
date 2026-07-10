@@ -256,7 +256,13 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
     if actual is None or expected is None:
         return None
     field = assertion_field_name(output)
-    targets = unique_preserving_order([*inferred_source_targets(output, command), *infer_named_fixture_files(output, command)])
+    targets = unique_preserving_order(
+        [
+            *inferred_source_targets(output, command),
+            *inferred_test_targets(output, command),
+            *infer_named_fixture_files(output, command),
+        ]
+    )
     rerun = command or "python3 -m unittest discover -s tests"
     field_line = f"Field under test: `{field}`\n" if field else ""
     return RepairAction(

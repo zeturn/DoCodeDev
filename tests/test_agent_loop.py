@@ -29,7 +29,10 @@ from docode.agent.loop import (
     targeted_repair_action_block,
     targeted_repair_exploration_block,
     targeted_repair_forced_tool,
+    targeted_repair_read_count,
+    targeted_repair_read_policy_result,
     targeted_repair_rerun_satisfied,
+    successfully_inspected_source_files,
     verification_repair_feedback,
 )
 from docode.agent.quality_gate import QualityGateResult, QualityIssue
@@ -1999,7 +2002,10 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
         forced = targeted_repair_forced_tool(state, "edit_file", {"path": "crawler.py", "old": "x", "new": "y"})
 
-        self.assertEqual(set(names), {"write_file", "edit_file", "apply_patch"})
+        self.assertEqual(
+            set(names),
+            {"read_file", "read_file_range", "write_file", "edit_file", "apply_patch", "git_status", "git_diff"},
+        )
         self.assertIsNone(forced)
         self.assertEqual(targeted_repair_action_block(state, "edit_file", {"path": "crawler.py"}), "")
         self.assertEqual(targeted_repair_exploration_block(state, "read_file"), "")
@@ -2018,10 +2024,10 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(state.targeted_repair_phase, "inspect_allowed")
         self.assertIn("read_file", names)
-        self.assertIn("search", names)
-        self.assertIn("web_search", names)
+        self.assertNotIn("search", names)
+        self.assertNotIn("web_search", names)
         self.assertIn("write_file", names)
-        self.assertIn("run_command", names)
+        self.assertNotIn("run_command", names)
 
     def test_targeted_repair_wrong_target_edit_is_guidance_not_rejected(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -2166,7 +2172,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertIsNone(forced)
 
-    def test_targeted_repair_edit_forced_tool_list_only_exposes_edit_tools(self) -> None:
+    def test_targeted_repair_edit_forced_keeps_focused_reads_and_git_in_schema(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
         state.repair_mode = "targeted_repair"
         state.active_repair_action = {
@@ -2188,11 +2194,15 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         }
         definitions = [
             NamedTool("read_file"),
+            NamedTool("read_file_range"),
+            NamedTool("read_symbol"),
             NamedTool("search"),
             NamedTool("list_files"),
             NamedTool("web_search"),
             NamedTool("fetch_url"),
             NamedTool("write_file"),
+            NamedTool("edit_file"),
+            NamedTool("replace_in_file"),
             NamedTool("apply_patch"),
             NamedTool("run_command"),
             NamedTool("git_status"),
@@ -2202,7 +2212,113 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
 
         self.assertEqual(state.targeted_repair_phase, "edit_forced")
-        self.assertEqual(set(names), {"write_file", "apply_patch"})
+        self.assertEqual(
+            set(names),
+            {
+                "read_file",
+                "read_file_range",
+                "read_symbol",
+                "write_file",
+                "edit_file",
+                "replace_in_file",
+                "apply_patch",
+                "git_status",
+                "git_diff",
+            },
+        )
+
+    def test_edit_forced_allows_first_target_read_when_no_usable_content_exists(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix source.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {"target_files": ["source.py"], "initial_inspection_budget": 0}
+
+        result = targeted_repair_read_policy_result(state, "read_file", {"path": "source.py"})
+
+        self.assertIsNone(result)
+
+    def test_repeated_target_read_returns_structured_result(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix source.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {"target_files": ["source.py"], "initial_inspection_budget": 1}
+        state.messages.append(
+            {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "VALUE = 1\n", "metadata": {"path": "source.py"}}
+        )
+
+        result = targeted_repair_read_policy_result(state, "read_file", {"path": "/workspace/source.py"})
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.metadata["reason"], "repair_read_repeated")
+        self.assertTrue(result.metadata["blocked"])
+
+    def test_unrelated_reads_do_not_consume_focused_budget(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix source.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {"target_files": ["source.py"], "initial_inspection_budget": 1}
+        state.messages.append(
+            {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "notes", "metadata": {"path": "notes.txt"}}
+        )
+
+        result = targeted_repair_read_policy_result(state, "read_file", {"path": "notes.txt"})
+
+        self.assertEqual(targeted_repair_read_count(state), 0)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.metadata["reason"], "repair_read_not_targeted")
+
+    def test_truncated_target_read_permits_focused_range_or_symbol_followup(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix source.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {"target_files": ["source.py"], "initial_inspection_budget": 1}
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool": "read_file",
+                "exit_code": 0,
+                "output": "partial source",
+                "truncated": True,
+                "metadata": {"path": "source.py", "source_truncated": True},
+            }
+        )
+
+        allowed = targeted_repair_read_policy_result(
+            state,
+            "read_file_range",
+            {"path": "source.py", "start_line": 40, "end_line": 90},
+        )
+        blocked = targeted_repair_read_policy_result(state, "read_symbol", {"path": "source.py", "symbol": "transform"})
+
+        self.assertIsNone(allowed)
+        self.assertIsNone(blocked)
+
+    def test_budget_exhaustion_is_structured_not_schema_failure(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix source.py."))
+        state.repair_mode = "targeted_repair"
+        state.active_repair_started_at = 0
+        state.active_repair_action = {"target_files": ["source.py"], "initial_inspection_budget": 1}
+        state.messages.append(
+            {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "VALUE = 1\n", "metadata": {"path": "source.py"}}
+        )
+        definitions = [NamedTool("read_file_range"), NamedTool("read_symbol"), NamedTool("write_file"), NamedTool("run_command")]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+        result = targeted_repair_read_policy_result(
+            state,
+            "read_file_range",
+            {"path": "source.py", "start_line": 2, "end_line": 8},
+        )
+
+        self.assertIn("read_file_range", names)
+        self.assertNotIn("run_command", names)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.metadata["reason"], "repair_read_budget_exhausted")
+        self.assertNotIn("tool_not_in_current_schema", result.output)
 
     def test_targeted_repair_explicit_unsafe_forbidden_tools_are_blocked(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=""))
@@ -2228,13 +2344,13 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertNotIn("web_search", names)
         self.assertNotIn("fetch_url", names)
         self.assertNotIn("run_command", names)
-        self.assertNotIn("read_file", names)
+        self.assertIn("read_file", names)
         self.assertIn("write_file", names)
         self.assertIn("apply_patch", names)
-        self.assertNotIn("git_status", names)
-        self.assertNotIn("git_diff", names)
-        self.assertIn("blocked by the active targeted repair action", repair_mode_tool_block(state, "fetch_url"))
-        self.assertEqual(repair_mode_tool_block(state, "run_command"), "")
+        self.assertIn("git_status", names)
+        self.assertIn("git_diff", names)
+        self.assertIn("blocked", repair_mode_tool_block(state, "fetch_url"))
+        self.assertIn("blocked until an active target file is modified", repair_mode_tool_block(state, "run_command"))
         self.assertIn("blocked by the active targeted repair action", targeted_repair_action_block(state, "web_search", {"query": "x"}))
         self.assertEqual(targeted_repair_action_block(state, "run_command", {"command": "python3 -m unittest discover -s tests"}), "")
         self.assertEqual(targeted_repair_action_block(state, "read_file", {"path": "crawler.py"}), "")
@@ -2296,6 +2412,50 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(no_target)
         assert no_target is not None
         self.assertEqual(no_target.target_files, [])
+
+    def test_fallback_repair_keeps_previously_inspected_source_candidates(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Repair shared modules."))
+        state.task_contract = TaskContract(must_run_commands=["npm test"])
+        state.latest_git_status = ToolResult(tool="git_status", output=" M src/first.ts\n")
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "export const first = 1", "metadata": {"path": "src/first.ts"}},
+                {"role": "tool", "tool": "read_file_range", "exit_code": 0, "output": "export const second = 2", "metadata": {"path": "src/second.ts"}},
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "output": "notes", "metadata": {"path": "README.md"}},
+            ]
+        )
+
+        action = fallback_required_command_repair(
+            state,
+            ToolResult(tool="run_command", output="AssertionError: shared contract mismatch", exit_code=1, metadata={"command": "npm test"}),
+        )
+
+        self.assertEqual(successfully_inspected_source_files(state), ["src/first.ts", "src/second.ts"])
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.target_files, ["src/first.ts", "src/second.ts"])
+
+    def test_fallback_repair_includes_fixture_paths_named_by_failure(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Repair parser.py."))
+        state.task_contract = TaskContract(must_modify_files=["parser.py"], must_run_commands=["python checks/verify.py"])
+
+        action = fallback_required_command_repair(
+            state,
+            ToolResult(
+                tool="run_command",
+                output=(
+                    '  File "/workspace/parser.py", line 12, in load_records\n'
+                    '    load_records("fixtures/records.json")\n'
+                    "ValueError: record conversion failed\n"
+                ),
+                exit_code=1,
+                metadata={"command": "python checks/verify.py"},
+            ),
+        )
+
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.target_files, ["parser.py", "fixtures/records.json", "checks/verify.py"])
 
     async def test_specific_repair_planner_wins_over_generic_required_command_fallback(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2543,7 +2703,10 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(tools.files["calculator.py"], "def add(a, b):\n    return a + b\n")
             steps = await repo.list_steps(job.id)
             repair_steps = [step for step in steps if step.content.get("type") == "repair_action"]
-            self.assertEqual(repair_steps[0].content["repair_action"]["target_files"], ["calculator.py"])
+            self.assertEqual(
+                repair_steps[0].content["repair_action"]["target_files"],
+                ["calculator.py", "tests/test_calculator.py"],
+            )
             commands = [
                 step.content["args"]["command"]
                 for step in steps
@@ -2552,7 +2715,6 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(
                 commands,
                 [
-                    "python3 -m unittest discover -s tests",
                     "python3 -m unittest discover -s tests",
                     "python3 -m unittest discover -s tests",
                 ],
@@ -2647,7 +2809,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
         forced = targeted_repair_forced_tool(state, "read_file", {"path": "crawler.py"})
 
-        self.assertEqual(set(names), {"read_file", "write_file", "run_command", "git_status"})
+        self.assertEqual(set(names), {"run_command", "git_status"})
         self.assertIsNone(forced)
 
     def test_no_rerun_artifact_repair_is_satisfied_by_target_in_git_status(self) -> None:
@@ -2721,7 +2883,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         self.assertIn("read_file", names)
         self.assertIn("write_file", names)
-        self.assertIn("run_command", names)
+        self.assertNotIn("run_command", names)
         self.assertIsNone(forced)
         self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "crawler.py"}), "")
 
@@ -2775,7 +2937,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(state.active_repair_started_at, 2)
             self.assertIn("read_file", names)
             self.assertIn("write_file", names)
-            self.assertIn("run_command", names)
+            self.assertNotIn("run_command", names)
             self.assertEqual(targeted_repair_action_block(state, "write_file", {"path": "crawler.py"}), "")
             forced = targeted_repair_forced_tool(state, "write_file", {"path": "crawler.py", "content": "fixed"})
             self.assertIsNone(forced)
