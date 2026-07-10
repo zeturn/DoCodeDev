@@ -182,10 +182,14 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
         except (TypeError, ValueError, json.JSONDecodeError):
             return {}
         if isinstance(value, dict):
-            list_fields = {str(key): len(item) for key, item in value.items() if isinstance(item, list)}
+            list_fields = {
+                str(key): len(item)
+                for key, item in list(value.items())[:50]
+                if isinstance(item, list)
+            }
             cursor_fields = {
-                str(key): item
-                for key, item in value.items()
+                str(key): _safe_summary_value(str(key), item)
+                for key, item in list(value.items())[:50]
                 if isinstance(key, str) and any(token in key.lower() for token in ("cursor", "next", "page"))
             }
             return {
@@ -224,21 +228,34 @@ def _source_structure_summary(body: str, content_type: str) -> dict[str, Any]:
     }
 
 
+def _safe_summary_value(key: str, value: Any) -> Any:
+    lowered_key = key.lower()
+    sensitive_markers = ("password", "secret", "api_key", "apikey", "access_token", "refresh_token", "authorization", "cookie")
+    if any(marker in lowered_key for marker in sensitive_markers):
+        return "[redacted]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 200 else value[:200] + "...[truncated]"
+    if isinstance(value, list):
+        return {"type": "array", "length": len(value)}
+    if isinstance(value, dict):
+        return {"type": "object", "keys": [str(item) for item in list(value)[:20]]}
+    return type(value).__name__
+
+
 def _patch_source_tool_visibility(loop: Any) -> None:
     original_definitions = loop.allowed_tool_definitions_for_state
     original_repair_block = loop.repair_mode_tool_block
+    original_required_test_block = loop.required_test_tool_block
 
     def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> list[Any]:
         selected = list(original_definitions(definitions, state))
         if not loop.is_crawler_instruction(state.job.instruction):
             return selected
-        if loop.successful_source_inspection(state.messages, state.job.instruction) is None:
-            return selected
         status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
         snapshot = loop.workflow_snapshot(state, status_output)
-        if snapshot.phase == loop.WorkflowPhase.FINAL_READY:
-            return selected
-        if _unique_source_urls(state) >= MAX_UNIQUE_SOURCE_INSPECTIONS:
+        if not _source_inspection_continuation_allowed(loop, state, snapshot):
             return selected
         if any(getattr(definition, "name", None) == "inspect_source" for definition in selected):
             return selected
@@ -253,15 +270,35 @@ def _patch_source_tool_visibility(loop: Any) -> None:
     def repair_mode_tool_block(state: Any, tool_name: str) -> str:
         if (
             tool_name == "inspect_source"
-            and loop.is_crawler_instruction(state.job.instruction)
-            and loop.successful_source_inspection(state.messages, state.job.instruction) is not None
-            and _unique_source_urls(state) < MAX_UNIQUE_SOURCE_INSPECTIONS
+            and _source_inspection_continuation_allowed(loop, state)
         ):
             return ""
         return original_repair_block(state, tool_name)
 
+    def required_test_tool_block(state: Any, snapshot: Any, tool_name: str, args: dict[str, object]) -> str:
+        if (
+            tool_name == "inspect_source"
+            and _source_inspection_continuation_allowed(loop, state, snapshot)
+        ):
+            return ""
+        return original_required_test_block(state, snapshot, tool_name, args)
+
     loop.allowed_tool_definitions_for_state = allowed_tool_definitions_for_state
     loop.repair_mode_tool_block = repair_mode_tool_block
+    loop.required_test_tool_block = required_test_tool_block
+
+
+def _source_inspection_continuation_allowed(loop: Any, state: Any, snapshot: Any | None = None) -> bool:
+    if not loop.is_crawler_instruction(state.job.instruction):
+        return False
+    if loop.successful_source_inspection(state.messages, state.job.instruction) is None:
+        return False
+    if _unique_source_urls(state) >= MAX_UNIQUE_SOURCE_INSPECTIONS:
+        return False
+    if snapshot is None:
+        status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
+        snapshot = loop.workflow_snapshot(state, status_output)
+    return snapshot.phase != loop.WorkflowPhase.FINAL_READY
 
 
 def _unique_source_urls(state: Any) -> int:
@@ -335,7 +372,10 @@ def _url_origin(url: str) -> tuple[str, str, int] | None:
     parsed = urlparse(str(url or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return None
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
     return parsed.scheme.lower(), parsed.hostname.lower().rstrip("."), port
 
 

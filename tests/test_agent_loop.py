@@ -803,7 +803,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             result = await loop.run(job)
 
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
-            self.assertEqual(llm.calls, 2)
+            self.assertEqual(llm.calls, 1)
             self.assertEqual(tools.commands, ["python crawler.py --dry-run", heredoc])
             steps = await repo.list_steps(job.id)
             auto = next(step for step in steps if step.content.get("type") == "auto_final_candidate")
@@ -1929,7 +1929,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertIn("web_search", names)
         self.assertNotIn("write_file", names)
 
-    def test_crawler_after_successful_sandbox_inspection_unlocks_edit_and_hides_repeat_inspection(self) -> None:
+    def test_crawler_after_successful_sandbox_inspection_unlocks_edit_and_keeps_distinct_inspection_available(self) -> None:
         instruction = "build a crawler for https://example.test/feed.xml"
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=instruction))
         state.task_contract = TaskContract(must_modify_files=["crawler.py"])
@@ -1955,7 +1955,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
 
-        self.assertNotIn("inspect_source", names)
+        self.assertIn("inspect_source", names)
         self.assertIn("write_file", names)
         self.assertIn("run_command", names)
 
