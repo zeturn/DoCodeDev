@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest import TestCase
 
 from docode.agent.context import ContextManager
@@ -10,6 +11,48 @@ from docode.storage.models import CodingJob, new_id
 
 
 class ContextManagerTests(TestCase):
+    def test_source_inspection_body_is_shown_once_then_compacted(self) -> None:
+        instruction = "Build a collector for source https://example.test/feed.xml and update collector.py."
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction=instruction)
+        payload = {
+            "requested_url": "https://example.test/feed.xml",
+            "final_url": "https://example.test/feed.xml",
+            "status_code": 200,
+            "execution_scope": "sandbox",
+            "mode": "raw",
+            "body": "<rss><item><title>Observed title</title></item></rss>",
+        }
+        messages = [
+            {
+                "role": "tool",
+                "tool": "inspect_source",
+                "exit_code": 0,
+                "output": json.dumps(payload),
+                "metadata": {key: value for key, value in payload.items() if key != "body"},
+            }
+        ]
+        manager = ContextManager()
+        kwargs = {
+            "job": job,
+            "inspection": ProjectInspection(listing="collector.py\n"),
+            "messages": messages,
+            "git_status": ToolResult(tool="git_status", output=""),
+            "iteration": 1,
+            "tool_calls_count": 1,
+            "llm_tokens_used": 0,
+            "llm_cost_used": 0.0,
+            "task_contract": task_contract_from_instruction(instruction),
+        }
+
+        first = manager.build_pack(**kwargs, include_source_body=True)
+        later = manager.build_pack(**kwargs, include_source_body=False)
+
+        self.assertIn("Raw source excerpt (shown once)", first.source_inspection)
+        self.assertIn("Observed title", first.source_inspection)
+        self.assertNotIn("Observed title", later.source_inspection)
+        self.assertIn("raw body was already shown", later.source_inspection)
+        self.assertEqual(first.recent_messages[0]["output"], "<source body represented in Source Inspection>")
+
     def test_task_contract_does_not_require_natural_language_git_diff_check(self) -> None:
         contract = task_contract_from_instruction(
             "Make a minimal code change.\n\n"

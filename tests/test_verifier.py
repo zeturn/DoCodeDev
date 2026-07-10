@@ -1051,6 +1051,19 @@ class VerifierTests(IsolatedAsyncioTestCase):
         steps = [
             {
                 "type": "tool_result",
+                "tool": "inspect_source",
+                "exit_code": 0,
+                "metadata": {
+                    "requested_url": "http://127.0.0.1:8765/feed?cursor=",
+                    "final_url": "http://127.0.0.1:8765/feed?cursor=",
+                    "execution_scope": "sandbox",
+                    "mode": "json",
+                    "status_code": 200,
+                    "returned_bytes": 120,
+                },
+            },
+            {
+                "type": "tool_result",
                 "tool": "fetch_url",
                 "exit_code": 0,
                 "metadata": {"url": "https://example.test/docs", "goal": "api auth", "returned_bytes": 100, "status_code": 200},
@@ -1065,6 +1078,8 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertEqual(evidence.successful_fetch_urls, ["https://example.test/docs"])
         self.assertEqual(evidence.relevant_fetch_urls, ["https://example.test/docs"])
         self.assertEqual(evidence.successful_web_search_queries, ["example api docs"])
+        self.assertTrue(evidence.has_sandbox_source_evidence)
+        self.assertEqual(evidence.successful_source_inspections[0]["requested_url"], "http://127.0.0.1:8765/feed?cursor=")
 
     async def test_external_source_rejects_unrelated_fetch_url_evidence(self) -> None:
         result = await CodingVerifier().verify(

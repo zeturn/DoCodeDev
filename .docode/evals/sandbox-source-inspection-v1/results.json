@@ -1,0 +1,572 @@
+{
+  "evaluation": "sandbox-source-inspection-v1",
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "runs_per_case": 1,
+  "selected_cases": [
+    "opal_canopy",
+    "violet_prism",
+    "copper_orbit",
+    "cedar_signal"
+  ],
+  "generated_at": "2026-07-10T15:08:34.434242+00:00",
+  "runs": [
+    {
+      "case": "opal_canopy",
+      "title": "Build a standard-library HTML card collector.",
+      "language": "Python/HTTP",
+      "mode": "real_deepseek_real_dobox",
+      "run": 1,
+      "network_mode": "no_internet",
+      "status": "failed",
+      "failure_reason": "max_iterations_exceeded",
+      "iterations": 30,
+      "llm_decisions": 30,
+      "tool_calls": 24,
+      "commands_run": 7,
+      "successful_commands": 2,
+      "repair_actions": 5,
+      "successful_edits": 6,
+      "successful_reads": 17,
+      "final_candidate_attempted": false,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "verifier_result": null,
+      "quality_gate_result": null,
+      "artifact_export_result": true,
+      "changed_files": [
+        "aurora_index.py",
+        "aurora_records.json"
+      ],
+      "functionally_correct": false,
+      "required_commands_passed": false,
+      "required_command_evidence": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python aurora_index.py http://127.0.0.1:8765/aurora/cards aurora_records.json",
+          "exit_codes": [
+            0,
+            0
+          ],
+          "passed": true
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "passed": false
+        }
+      ],
+      "source_inspected_before_edit": true,
+      "strict_success": false,
+      "independent_failures": [
+        "payload mismatch: expected [{'sigil': 'VR-12', 'label': 'Pewter Bloom', 'group': 'delta', 'rank': 8, 'detail_url': 'http://127.0.0.1:8765/details/vr-12'}, {'sigil': 'VR-29', 'label': 'Cobalt Wren', 'group': 'gamma', 'rank': 19, 'detail_url': 'http://127.0.0.1:8765/details/vr-29'}, {'sigil': 'VR-44', 'label': 'Amber Flute', 'group': 'delta', 'rank': 2, 'detail_url': 'http://127.0.0.1:8765/details/vr-44'}], got []",
+        "request sequence mismatch: expected ['/aurora/cards?variant=2'], got None",
+        "request count mismatch: expected 1, got None"
+      ],
+      "independent_results": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python aurora_index.py 'http://127.0.0.1:8765/aurora/cards?variant=2' aurora_records.json",
+          "exit_code": 0,
+          "output": "Extracted 0 cards to aurora_records.json\r\n"
+        },
+        {
+          "check": "hidden_variant_payload_and_requests",
+          "failures": [
+            "payload mismatch: expected [{'sigil': 'VR-12', 'label': 'Pewter Bloom', 'group': 'delta', 'rank': 8, 'detail_url': 'http://127.0.0.1:8765/details/vr-12'}, {'sigil': 'VR-29', 'label': 'Cobalt Wren', 'group': 'gamma', 'rank': 19, 'detail_url': 'http://127.0.0.1:8765/details/vr-29'}, {'sigil': 'VR-44', 'label': 'Amber Flute', 'group': 'delta', 'rank': 2, 'detail_url': 'http://127.0.0.1:8765/details/vr-44'}], got []",
+            "request sequence mismatch: expected ['/aurora/cards?variant=2'], got None",
+            "request count mismatch: expected 1, got None"
+          ],
+          "metrics": {
+            "metrics_error": "OCI runtime exec failed: exec failed: unable to start container process: exec: \"python\": executable file not found in $PATH\r\n"
+          }
+        }
+      ],
+      "category": "repair_loop",
+      "short_reason": "max_iterations_exceeded",
+      "trace_path": ".docode/evals/sandbox-source-inspection-v1/traces/opal_canopy-run1-job_59d6893b865a4ea188825ca522645848.json",
+      "commands": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python aurora_index.py http://127.0.0.1:8765/aurora/cards aurora_records.json",
+          "exit_code": 0,
+          "summary": ""
+        },
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python aurora_index.py http://127.0.0.1:8765/aurora/cards aurora_records.json",
+          "exit_code": 0,
+          "summary": "Extracted 0 records to aurora_records.json"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        }
+      ],
+      "source_inspection_evidence": {
+        "auto_executions": 1,
+        "tool_results": 6,
+        "evidence_records": 1,
+        "first_source_step_index": 3,
+        "first_edit_step_index": 58,
+        "raw_excerpt_observations": 1,
+        "first_result_metadata": {
+          "requested_url": "http://127.0.0.1:8765/aurora/cards",
+          "final_url": "http://127.0.0.1:8765/aurora/cards",
+          "status_code": 200,
+          "content_type": "text/html; charset=utf-8",
+          "mode": "raw",
+          "original_bytes": 2065,
+          "returned_bytes": 2065,
+          "truncated": false,
+          "execution_scope": "sandbox",
+          "body_encoding": "utf-8",
+          "controller_owned": true
+        }
+      },
+      "llm_trace_evidence": {
+        "decision_count": 30,
+        "explicit_reasoning_count": 0
+      }
+    },
+    {
+      "case": "violet_prism",
+      "title": "Build a namespace-tolerant RSS collector.",
+      "language": "Python/HTTP",
+      "mode": "real_deepseek_real_dobox",
+      "run": 1,
+      "network_mode": "no_internet",
+      "status": "succeeded",
+      "failure_reason": null,
+      "iterations": 10,
+      "llm_decisions": 10,
+      "tool_calls": 11,
+      "commands_run": 3,
+      "successful_commands": 3,
+      "repair_actions": 0,
+      "successful_edits": 1,
+      "successful_reads": 1,
+      "final_candidate_attempted": true,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "verifier_result": true,
+      "quality_gate_result": true,
+      "artifact_export_result": true,
+      "changed_files": [
+        "prism_entries.json",
+        "prism_feed.py"
+      ],
+      "functionally_correct": false,
+      "required_commands_passed": true,
+      "required_command_evidence": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+          "exit_codes": [
+            0,
+            0
+          ],
+          "passed": true
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('prism_entries.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 7, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/prism/feed'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_codes": [
+            0
+          ],
+          "passed": true
+        }
+      ],
+      "source_inspected_before_edit": true,
+      "strict_success": false,
+      "independent_failures": [
+        "payload mismatch: expected [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00Z', 'source': 'Delta Wire', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00Z', 'source': 'Delta Wire', 'summary': None}], got [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00+00:00', 'source': 'Prism Dispatch', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00+00:00', 'source': 'Prism Dispatch', 'summary': ''}]",
+        "request sequence mismatch: expected ['/prism/feed?variant=2'], got None",
+        "request count mismatch: expected 1, got None"
+      ],
+      "independent_results": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py 'http://127.0.0.1:8765/prism/feed?variant=2' prism_entries.json",
+          "exit_code": 0,
+          "output": "Wrote 2 entries to prism_entries.json\r\n"
+        },
+        {
+          "check": "hidden_variant_payload_and_requests",
+          "failures": [
+            "payload mismatch: expected [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00Z', 'source': 'Delta Wire', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00Z', 'source': 'Delta Wire', 'summary': None}], got [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00+00:00', 'source': 'Prism Dispatch', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00+00:00', 'source': 'Prism Dispatch', 'summary': ''}]",
+            "request sequence mismatch: expected ['/prism/feed?variant=2'], got None",
+            "request count mismatch: expected 1, got None"
+          ],
+          "metrics": {
+            "metrics_error": "OCI runtime exec failed: exec failed: unable to start container process: exec: \"python\": executable file not found in $PATH\r\n"
+          }
+        }
+      ],
+      "category": "code_generation_failure",
+      "short_reason": "Completed the requested changes in prism_feed.py, prism_entries.json.",
+      "trace_path": ".docode/evals/sandbox-source-inspection-v1/traces/violet_prism-run1-job_6f190cba47da4f4a80466cbb441a1e90.json",
+      "commands": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+          "exit_code": 0,
+          "summary": ""
+        },
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+          "exit_code": 0,
+          "summary": "Wrote 7 entries to prism_entries.json"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('prism_entries.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 7, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/prism/feed'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 0,
+          "summary": "benchmark validation passed"
+        }
+      ],
+      "source_inspection_evidence": {
+        "auto_executions": 1,
+        "tool_results": 6,
+        "evidence_records": 1,
+        "first_source_step_index": 3,
+        "first_edit_step_index": 52,
+        "raw_excerpt_observations": 1,
+        "first_result_metadata": {
+          "requested_url": "http://127.0.0.1:8765/prism/feed",
+          "final_url": "http://127.0.0.1:8765/prism/feed",
+          "status_code": 200,
+          "content_type": "application/rss+xml; charset=utf-8",
+          "mode": "raw",
+          "original_bytes": 1496,
+          "returned_bytes": 1496,
+          "truncated": false,
+          "execution_scope": "sandbox",
+          "body_encoding": "utf-8",
+          "controller_owned": true
+        }
+      },
+      "llm_trace_evidence": {
+        "decision_count": 10,
+        "explicit_reasoning_count": 0
+      }
+    },
+    {
+      "case": "copper_orbit",
+      "title": "Complete a cursor-based JSON API collector.",
+      "language": "Python/HTTP",
+      "mode": "real_deepseek_real_dobox",
+      "run": 1,
+      "network_mode": "no_internet",
+      "status": "failed",
+      "failure_reason": "max_iterations_exceeded",
+      "iterations": 27,
+      "llm_decisions": 27,
+      "tool_calls": 27,
+      "commands_run": 7,
+      "successful_commands": 2,
+      "repair_actions": 5,
+      "successful_edits": 6,
+      "successful_reads": 14,
+      "final_candidate_attempted": false,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "verifier_result": null,
+      "quality_gate_result": null,
+      "artifact_export_result": true,
+      "changed_files": [
+        "orbit_cursor.py",
+        "diag.py",
+        "orbit_measurements.json"
+      ],
+      "functionally_correct": false,
+      "required_commands_passed": false,
+      "required_command_evidence": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python orbit_cursor.py http://127.0.0.1:8765/orbit/measurements?cursor= orbit_measurements.json",
+          "exit_codes": [
+            0,
+            0
+          ],
+          "passed": true
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "passed": false
+        }
+      ],
+      "source_inspected_before_edit": true,
+      "strict_success": false,
+      "independent_failures": [
+        "payload mismatch: expected [{'identity': 'NV1', 'title': 'Aster Dial', 'measure': 6, 'origin': 'http://127.0.0.1:8765/sensors/nv1'}, {'identity': 'NV2', 'title': 'Birch Gauge', 'measure': 71, 'origin': 'http://127.0.0.1:8765/sensors/nv2'}, {'identity': 'NV3', 'title': 'Coral Vane', 'measure': 9, 'origin': 'http://127.0.0.1:8765/sensors/nv3'}], got [{'identity': 'NV1', 'title': 'Aster Dial', 'measure': 6, 'origin': '/sensors/nv1'}, {'identity': 'NV2', 'title': 'Birch Gauge', 'measure': 71, 'origin': '/sensors/nv2'}, {'identity': 'AX1', 'title': 'Moss Dial', 'measure': 14, 'origin': '/sensors/ax1'}, {'identity': 'AX2', 'title': 'Reed Gauge', 'measure': 27, 'origin': '/sensors/ax2'}, {'identity': 'AX3', 'title': 'Stone Vane', 'measure': 5, 'origin': '/sensors/ax3'}, {'identity': 'AX4', 'title': 'Cloud Pin', 'measure': 103, 'origin': '/sensors/ax4'}, {'identity': 'AX5', 'title': 'Tern Ring', 'measure': 42, 'origin': '/sensors/ax5'}, {'identity': 'AX6', 'title': 'Fern Relay', 'measure': 8, 'origin': '/sensors/ax6'}]",
+        "request sequence mismatch: expected ['/orbit/measurements?cursor=&variant=2', '/orbit/measurements?cursor=phase-violet-2&variant=2'], got None",
+        "request count mismatch: expected 2, got None"
+      ],
+      "independent_results": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python orbit_cursor.py 'http://127.0.0.1:8765/orbit/measurements?cursor=&variant=2' orbit_measurements.json",
+          "exit_code": 0,
+          "output": "DEBUG: Request #1 to http://127.0.0.1:8765/orbit/measurements?cursor=&variant=2\r\nDEBUG: Raw response: {\"samples\": [{\"identity\": \"NV1\", \"title\": \"Aster Dial\", \"measure\": \"6\", \"origin\": \"/sensors/nv1\"}, {\"identity\": \"NV2\", \"title\": \"Birch Gauge\", \"measure\": 71, \"origin\": \"/sensors/nv2\"}], \"next_cursor\": \"phase-violet-2\"}\r\nDEBUG: Parsed keys: ['samples', 'next_cursor']\r\nDEBUG: Got 0 items from data key\r\nDEBUG: Found list under key 'samples' with 2 items\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: next_cursor = 'phase-violet-2'\r\nDEBUG: Request #2 to http://127.0.0.1:8765/orbit/measurements?cursor=&variant=2phase-violet-2\r\nDEBUG: Raw response: {\"samples\": [{\"identity\": \"AX1\", \"title\": \"Moss Dial\", \"measure\": 14, \"origin\": \"/sensors/ax1\"}, {\"identity\": \"AX2\", \"title\": \"Reed Gauge\", \"measure\": \"27\", \"origin\": \"/sensors/ax2\"}, {\"identity\": \"AX3\", \"title\": \"Stone Vane\", \"measure\": 5, \"origin\": \"/sensors/ax3\"}, {\"identity\": \"AX4\", \"title\": \"Cloud Pin\", \"measure\": \"103\", \"origin\": \"/sensors/ax4\"}, {\"identity\": \"AX5\", \"title\": \"Tern Ring\", \"measure\": 42, \"origin\": \"/sensors/ax5\"}, {\"identity\": \"AX6\", \"title\": \"Fern Relay\", \"measure\": \"8\", \"o\r\nDEBUG: Parsed keys: ['samples', 'next_cursor']\r\nDEBUG: Got 0 items from data key\r\nDEBUG: Found list under key 'samples' with 6 items\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: Item keys: ['identity', 'title', 'measure', 'origin']\r\nDEBUG: next_cursor = 'phase-amber-2'\r\nDEBUG: Total records: 8\r\n"
+        },
+        {
+          "check": "hidden_variant_payload_and_requests",
+          "failures": [
+            "payload mismatch: expected [{'identity': 'NV1', 'title': 'Aster Dial', 'measure': 6, 'origin': 'http://127.0.0.1:8765/sensors/nv1'}, {'identity': 'NV2', 'title': 'Birch Gauge', 'measure': 71, 'origin': 'http://127.0.0.1:8765/sensors/nv2'}, {'identity': 'NV3', 'title': 'Coral Vane', 'measure': 9, 'origin': 'http://127.0.0.1:8765/sensors/nv3'}], got [{'identity': 'NV1', 'title': 'Aster Dial', 'measure': 6, 'origin': '/sensors/nv1'}, {'identity': 'NV2', 'title': 'Birch Gauge', 'measure': 71, 'origin': '/sensors/nv2'}, {'identity': 'AX1', 'title': 'Moss Dial', 'measure': 14, 'origin': '/sensors/ax1'}, {'identity': 'AX2', 'title': 'Reed Gauge', 'measure': 27, 'origin': '/sensors/ax2'}, {'identity': 'AX3', 'title': 'Stone Vane', 'measure': 5, 'origin': '/sensors/ax3'}, {'identity': 'AX4', 'title': 'Cloud Pin', 'measure': 103, 'origin': '/sensors/ax4'}, {'identity': 'AX5', 'title': 'Tern Ring', 'measure': 42, 'origin': '/sensors/ax5'}, {'identity': 'AX6', 'title': 'Fern Relay', 'measure': 8, 'origin': '/sensors/ax6'}]",
+            "request sequence mismatch: expected ['/orbit/measurements?cursor=&variant=2', '/orbit/measurements?cursor=phase-violet-2&variant=2'], got None",
+            "request count mismatch: expected 2, got None"
+          ],
+          "metrics": {
+            "metrics_error": "OCI runtime exec failed: exec failed: unable to start container process: exec: \"python\": executable file not found in $PATH\r\n"
+          }
+        }
+      ],
+      "category": "repair_loop",
+      "short_reason": "max_iterations_exceeded",
+      "trace_path": ".docode/evals/sandbox-source-inspection-v1/traces/copper_orbit-run1-job_682eee9144c147bfab6243ba3d91639a.json",
+      "commands": [
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python orbit_cursor.py http://127.0.0.1:8765/orbit/measurements?cursor= orbit_measurements.json",
+          "exit_code": 0,
+          "summary": ""
+        },
+        {
+          "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python orbit_cursor.py http://127.0.0.1:8765/orbit/measurements?cursor= orbit_measurements.json",
+          "exit_code": 0,
+          "summary": "Wrote 0 records to orbit_measurements.json"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        }
+      ],
+      "source_inspection_evidence": {
+        "auto_executions": 1,
+        "tool_results": 5,
+        "evidence_records": 1,
+        "first_source_step_index": 3,
+        "first_edit_step_index": 63,
+        "raw_excerpt_observations": 1,
+        "first_result_metadata": {
+          "requested_url": "http://127.0.0.1:8765/orbit/measurements?cursor=",
+          "final_url": "http://127.0.0.1:8765/orbit/measurements?cursor=",
+          "status_code": 200,
+          "content_type": "application/json",
+          "mode": "raw",
+          "original_bytes": 557,
+          "returned_bytes": 557,
+          "truncated": false,
+          "execution_scope": "sandbox",
+          "body_encoding": "utf-8",
+          "controller_owned": true
+        }
+      },
+      "llm_trace_evidence": {
+        "decision_count": 27,
+        "explicit_reasoning_count": 0
+      }
+    },
+    {
+      "case": "cedar_signal",
+      "title": "Build a collector for the documented CNEOS news feed.",
+      "language": "Python/HTTP",
+      "mode": "real_deepseek_real_dobox",
+      "run": 1,
+      "network_mode": "project",
+      "status": "failed",
+      "failure_reason": "max_iterations_exceeded",
+      "iterations": 30,
+      "llm_decisions": 30,
+      "tool_calls": 26,
+      "commands_run": 7,
+      "successful_commands": 1,
+      "repair_actions": 6,
+      "successful_edits": 6,
+      "successful_reads": 21,
+      "final_candidate_attempted": false,
+      "read_before_edit": false,
+      "whole_file_rewrite": false,
+      "verifier_result": null,
+      "quality_gate_result": null,
+      "artifact_export_result": true,
+      "changed_files": [
+        "cedar_brief.json",
+        "cedar_digest.py"
+      ],
+      "functionally_correct": true,
+      "required_commands_passed": false,
+      "required_command_evidence": [
+        {
+          "command": "python cedar_digest.py https://cneos.jpl.nasa.gov/feed/news.xml cedar_brief.json",
+          "exit_codes": [
+            1,
+            0
+          ],
+          "passed": true
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "passed": false
+        }
+      ],
+      "source_inspected_before_edit": true,
+      "strict_success": false,
+      "independent_failures": [],
+      "independent_results": [
+        {
+          "command": "python cedar_digest.py https://cneos.jpl.nasa.gov/feed/news.xml cedar_brief.json",
+          "exit_code": 0,
+          "output": "Wrote 10 entries to cedar_brief.json\r\n"
+        },
+        {
+          "check": "live_structural_validation",
+          "record_count": 10,
+          "failures": []
+        }
+      ],
+      "category": "runtime_failed_after_functional_verification",
+      "short_reason": "max_iterations_exceeded",
+      "trace_path": ".docode/evals/sandbox-source-inspection-v1/traces/cedar_signal-run1-job_68b19f6f944d489186be13de4924fcf7.json",
+      "commands": [
+        {
+          "command": "python cedar_digest.py https://cneos.jpl.nasa.gov/feed/news.xml cedar_brief.json",
+          "exit_code": 1,
+          "summary": "  File \"/workspace/cedar_digest.py\", line 12\n    \"\"\"Parse RSS XML bytes into a list of entry dicts.\"\n    ^\nSyntaxError: unterminated triple-quoted string literal (detected at line 84)"
+        },
+        {
+          "command": "python cedar_digest.py https://cneos.jpl.nasa.gov/feed/news.xml cedar_brief.json",
+          "exit_code": 0,
+          "summary": "Warning: only 0 entries found\nWrote 0 entries to cedar_brief.json"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        },
+        {
+          "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('cedar_brief.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) >= 5, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\nprint('benchmark validation passed')\nPY",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+        }
+      ],
+      "source_inspection_evidence": {
+        "auto_executions": 1,
+        "tool_results": 2,
+        "evidence_records": 1,
+        "first_source_step_index": 3,
+        "first_edit_step_index": 14,
+        "raw_excerpt_observations": 1,
+        "first_result_metadata": {
+          "requested_url": "https://cneos.jpl.nasa.gov/feed/news.xml",
+          "final_url": "https://cneos.jpl.nasa.gov/feed/news.xml",
+          "status_code": 200,
+          "content_type": "text/xml",
+          "mode": "raw",
+          "original_bytes": 8346,
+          "returned_bytes": 8346,
+          "truncated": false,
+          "execution_scope": "sandbox",
+          "body_encoding": "utf-8",
+          "controller_owned": true
+        }
+      },
+      "llm_trace_evidence": {
+        "decision_count": 30,
+        "explicit_reasoning_count": 0
+      }
+    }
+  ],
+  "invalid_attempts": [
+    {
+      "case": "opal_canopy",
+      "run": 1,
+      "recorded_at": "2026-07-10T14:52:33.179564+00:00",
+      "excluded": true,
+      "reason": "post-run harness FileNotFoundError while writing an uncreated trace directory"
+    }
+  ],
+  "implementation_commits": [
+    "e1323c2",
+    "790165b"
+  ],
+  "metrics": {
+    "valid_runs": 4,
+    "invalid_harness_attempts": 1,
+    "source_inspected_before_first_edit": 4,
+    "source_inspection_rate": 1.0,
+    "strict_successes": 0,
+    "functionally_correct": 1,
+    "runtime_succeeded": 1,
+    "all_required_commands_passed": 1,
+    "llm_decisions": 97,
+    "explicit_reasoning_records": 0,
+    "full_trace_files": 4
+  }
+}

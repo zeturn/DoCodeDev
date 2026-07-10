@@ -1879,7 +1879,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertEqual(workflow.missing_commands, ["python crawler.py sample.json --output out.json"])
         self.assertFalse(await loop.maybe_activate_required_command_repair(state, workflow))
 
-    def test_edit_required_before_exploration_budget_keeps_search_tools_available(self) -> None:
+    def test_crawler_before_source_inspection_only_exposes_inspection_and_read_tools(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="crawl github trends from https://github.com/trending"))
         state.inspection = SimpleNamespace()
         state.task_contract = TaskContract(must_modify_files=["crawler.py"])
@@ -1890,6 +1890,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             NamedTool("read_file"),
             NamedTool("web_search"),
             NamedTool("fetch_url"),
+            NamedTool("inspect_source"),
             NamedTool("write_file"),
             NamedTool("git_status"),
             NamedTool("git_diff"),
@@ -1897,15 +1898,16 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
 
-        self.assertIn("fetch_url", names)
-        self.assertIn("write_file", names)
+        self.assertIn("inspect_source", names)
+        self.assertNotIn("fetch_url", names)
+        self.assertNotIn("write_file", names)
         self.assertNotIn("web_search", names)
-        self.assertNotIn("read_file", names)
-        self.assertNotIn("list_files", names)
-        self.assertNotIn("git_status", names)
+        self.assertIn("read_file", names)
+        self.assertIn("list_files", names)
+        self.assertIn("git_status", names)
         self.assertNotIn("git_diff", names)
 
-    def test_edit_required_after_explicit_fetch_allows_web_search_for_crawler(self) -> None:
+    def test_crawler_after_failed_sandbox_inspection_allows_supplemental_fetch_and_search(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="crawl github trends from https://github.com/trending"))
         state.inspection = SimpleNamespace()
         state.task_contract = TaskContract(must_modify_files=["crawler.py"])
@@ -1913,18 +1915,49 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         state.messages.append(
             {
                 "role": "tool",
-                "tool": "fetch_url",
+                "tool": "inspect_source",
                 "exit_code": 1,
-                "metadata": {"url": "https://github.com/trending"},
+                "metadata": {"requested_url": "https://github.com/trending", "execution_scope": "sandbox"},
             }
         )
-        definitions = [NamedTool("fetch_url"), NamedTool("web_search"), NamedTool("write_file")]
+        definitions = [NamedTool("inspect_source"), NamedTool("fetch_url"), NamedTool("web_search"), NamedTool("write_file")]
 
         names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
 
+        self.assertIn("inspect_source", names)
         self.assertIn("fetch_url", names)
         self.assertIn("web_search", names)
+        self.assertNotIn("write_file", names)
+
+    def test_crawler_after_successful_sandbox_inspection_unlocks_edit_and_hides_repeat_inspection(self) -> None:
+        instruction = "build a crawler for https://example.test/feed.xml"
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction=instruction))
+        state.task_contract = TaskContract(must_modify_files=["crawler.py"])
+        state.latest_git_status = ToolResult(tool="git_status", output="", exit_code=0)
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool": "inspect_source",
+                "exit_code": 0,
+                "output": json.dumps(
+                    {
+                        "requested_url": "https://example.test/feed.xml",
+                        "final_url": "https://example.test/feed.xml",
+                        "status_code": 200,
+                        "execution_scope": "sandbox",
+                        "mode": "raw",
+                        "body": "<rss />",
+                    }
+                ),
+            }
+        )
+        definitions = [NamedTool("inspect_source"), NamedTool("write_file"), NamedTool("run_command"), NamedTool("git_status")]
+
+        names = [tool.name for tool in allowed_tool_definitions_for_state(definitions, state)]
+
+        self.assertNotIn("inspect_source", names)
         self.assertIn("write_file", names)
+        self.assertIn("run_command", names)
 
     def test_crawler_instruction_with_public_url_skips_important_file_reads(self) -> None:
         self.assertTrue(should_skip_important_file_reads("crawl https://github.com/trending every two hours"))
