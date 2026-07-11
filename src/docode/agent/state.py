@@ -87,11 +87,14 @@ class AgentState:
             if self.repair_coordinator is not None and self.repair_mode == "targeted_repair":
                 self.targeted_repair_phase = self.repair_coordinator.record_edit().value
             if self.task_graph is not None:
-                path = str(metadata.get("path") or "").replace("\\", "/")
+                paths = [str(metadata.get("path") or "").replace("\\", "/")]
+                paths.extend(str(item).replace("\\", "/") for item in metadata.get("paths", []) if item)
+                paths = [path for path in paths if path]
                 implement = self.task_graph.nodes.get("implement")
                 targets = [item.replace("\\", "/") for item in (implement.target_files if implement else [])]
-                if implement is not None and path and (not targets or any(path == item or path.endswith("/" + item) for item in targets)):
-                    self.task_graph.set_status("implement", TaskStatus.DONE, reason="task-relevant edit succeeded", evidence_refs=[f"edit:{self.edit_epoch}:{path}"])
+                relevant = [path for path in paths if not targets or any(path == item or path.endswith("/" + item) for item in targets)]
+                if implement is not None and relevant:
+                    self.task_graph.set_status("implement", TaskStatus.DONE, reason="task-relevant edit succeeded", evidence_refs=[f"edit:{self.edit_epoch}:{path}" for path in relevant])
                 if "verify" in self.task_graph.nodes:
                     self.task_graph.set_status("verify", TaskStatus.PENDING)
                 if "review" in self.task_graph.nodes:

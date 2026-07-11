@@ -1488,6 +1488,15 @@ def enrich_tool_result_metadata(tool_name: str, args: dict[str, object], result:
         path = args.get("path")
         if path:
             metadata["path"] = str(path)
+    if tool_name == "apply_patch" and "paths" not in metadata:
+        patch = str(args.get("patch") or "")
+        paths = []
+        for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+)$", patch, flags=re.MULTILINE):
+            path = match.group(1).strip()
+            if path != "/dev/null" and path not in paths:
+                paths.append(path)
+        if paths:
+            metadata["paths"] = paths
     if tool_name == "read_file_range":
         metadata.setdefault("start_line", args.get("start_line", 1))
         metadata.setdefault("end_line", args.get("end_line", 120))

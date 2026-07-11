@@ -586,7 +586,7 @@ async def run_smoke_verification(
         if runnable:
             if plan.smoke_commands:
                 commands.extend(plan.smoke_commands)
-            elif not successful_command_covers_entrypoint(explicit_results, runnable):
+            elif not explicit_commands_all_succeeded(plan, explicit_results) and not successful_command_covers_entrypoint(explicit_results, runnable):
                 for path in runnable[:1]:
                     suffix = " --dry-run" if plan.require_crawler_artifacts and diff_file_contains(diff, path, "--dry-run") else ""
                     commands.append("python3 " + shlex.quote(path) + suffix)
@@ -773,6 +773,12 @@ def successful_command_covers_entrypoint(results: list[ToolResult], entrypoints:
         if any(path in command for path in entrypoints):
             return True
     return False
+
+
+def explicit_commands_all_succeeded(plan: VerificationPlan, results: list[ToolResult]) -> bool:
+    if not plan.explicit_commands:
+        return False
+    return len(results) == len(plan.explicit_commands) and all(result.exit_code == 0 for result in results)
 
 
 def extracted_file_contains_checks(instruction: str) -> dict[str, list[str]] | None:
@@ -1303,7 +1309,7 @@ def runnable_python_files(instruction: str, python_files: list[str]) -> list[str
 
 def runnable_python_entrypoints(python_files: list[str]) -> list[str]:
     excluded_parts = {"/test_", "/tests/", "\\test_", "\\tests\\"}
-    candidates = [path for path in python_files if not any(part in path for part in excluded_parts)]
+    candidates = [path for path in python_files if not any(part in path for part in excluded_parts) and not path.endswith("/__init__.py") and path != "__init__.py"]
     preferred = [path for path in candidates if path.endswith(("main.py", "cli.py", "app.py", "service.py"))]
     return preferred or candidates[:1]
 
