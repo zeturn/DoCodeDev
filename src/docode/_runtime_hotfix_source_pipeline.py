@@ -3,11 +3,27 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 
 MAX_UNIQUE_SOURCE_INSPECTIONS = 4
+MAX_OPTIONAL_PRE_EDIT_SOURCE_URLS = 2
+MAX_PRE_EDIT_MODEL_DECISIONS = 2
+SOURCE_TO_EDIT_TOOLS = {
+    "read_file",
+    "read_file_range",
+    "read_symbol",
+    "list_files",
+    "write_file",
+    "edit_file",
+    "replace_in_file",
+    "apply_patch",
+    "git_status",
+    "git_diff",
+}
 
 
 def apply_runtime_hotfix() -> None:
@@ -69,6 +85,18 @@ def _patch_inspect_source_cache(tools_cls: Any, tool_result_cls: Any) -> None:
     ) -> Any:
         normalized_url = str(url or "").strip()
         normalized_mode = str(mode or "raw").strip().lower()
+        if (
+            not isinstance(url, str)
+            or normalized_url != url
+            or normalized_mode not in {"raw", "text", "json", "headers"}
+            or isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1_024 <= max_bytes <= 200_000
+            or isinstance(timeout, bool)
+            or not isinstance(timeout, int)
+            or not 1 <= timeout <= 30
+        ):
+            return await original(self, url, mode, max_bytes, timeout)
         try:
             normalized_max_bytes = int(max_bytes)
         except (TypeError, ValueError):
@@ -78,19 +106,21 @@ def _patch_inspect_source_cache(tools_cls: Any, tool_result_cls: Any) -> None:
         except (TypeError, ValueError):
             normalized_timeout = 15
 
-        key = (normalized_url, normalized_mode)
+        key = _canonical_source_url(normalized_url) or normalized_url
         cache = getattr(self, "_docode_inspect_source_cache", None)
         if cache is None:
             cache = {}
             setattr(self, "_docode_inspect_source_cache", cache)
         cached = cache.get(key)
         if cached is not None and not _larger_refetch_needed(cached, normalized_max_bytes):
-            return _cached_source_result(cached, tool_result_cls)
+            return _cached_source_result(cached, tool_result_cls, normalized_mode)
 
+        # Fetch a reusable representation once. Crawler controller inspection
+        # uses raw mode, and later text/json/header views are derived locally.
         result = await original(
             self,
             normalized_url,
-            normalized_mode,
+            "raw",
             normalized_max_bytes,
             normalized_timeout,
         )
@@ -99,7 +129,9 @@ def _patch_inspect_source_cache(tools_cls: Any, tool_result_cls: Any) -> None:
 
         enriched = _enrich_source_result(result, tool_result_cls)
         cache[key] = enriched
-        return enriched
+        if normalized_mode == "raw":
+            return enriched
+        return _derived_source_result(enriched, tool_result_cls, normalized_mode, from_cache=False)
 
     tools_cls.inspect_source = inspect_source
 
@@ -115,16 +147,11 @@ def _larger_refetch_needed(cached: Any, requested_max_bytes: int) -> bool:
     return requested_max_bytes > returned
 
 
-def _cached_source_result(cached: Any, tool_result_cls: Any) -> Any:
+def _cached_source_result(cached: Any, tool_result_cls: Any, requested_mode: str) -> Any:
+    if requested_mode != "raw":
+        return _derived_source_result(cached, tool_result_cls, requested_mode, from_cache=True)
     metadata = dict(cached.metadata or {})
     metadata.update({"cached": True, "network_request_performed": False})
-    body_excerpt = ""
-    try:
-        cached_payload = json.loads(str(cached.output or ""))
-        if isinstance(cached_payload, dict) and isinstance(cached_payload.get("body"), str):
-            body_excerpt = cached_payload["body"][:4000]
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
     payload: dict[str, Any] = {
         "requested_url": metadata.get("requested_url") or metadata.get("url"),
         "final_url": metadata.get("final_url"),
@@ -135,8 +162,7 @@ def _cached_source_result(cached: Any, tool_result_cls: Any) -> Any:
         "network_request_performed": False,
         "truncated": bool(metadata.get("truncated") or cached.truncated),
         "structure_summary": metadata.get("structure_summary") or {},
-        "body_excerpt": body_excerpt,
-        "instruction": "This exact source was already inspected. Reuse this cached excerpt and edit or inspect a distinct same-origin page; do not request this URL again.",
+        "instruction": "This source is already available in Source Inspection memory. Do not inspect it again. Read or edit the implementation now.",
     }
     return tool_result_cls(
         tool="inspect_source",
@@ -145,6 +171,73 @@ def _cached_source_result(cached: Any, tool_result_cls: Any) -> Any:
         metadata=metadata,
         truncated=cached.truncated,
     )
+
+
+def _derived_source_result(source: Any, tool_result_cls: Any, requested_mode: str, *, from_cache: bool) -> Any:
+    try:
+        payload = json.loads(str(source.output or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return source
+    if not isinstance(payload, dict):
+        return source
+    body = str(payload.get("body") or "")
+    content_type = str(payload.get("content_type") or "").lower()
+    try:
+        if requested_mode == "json":
+            body = json.dumps(json.loads(body), ensure_ascii=False, separators=(",", ":"))
+        elif requested_mode == "text" and "html" in content_type:
+            parser = _CachedTextExtractor()
+            parser.feed(body)
+            body = unescape(parser.text())
+        elif requested_mode == "headers":
+            body = json.dumps({"content-type": payload.get("content_type") or ""}, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        payload["error"] = f"cached {requested_mode} conversion failed: {exc}"
+        body = ""
+    payload.update(
+        {
+            "mode": requested_mode,
+            "body": body,
+            "cached": from_cache,
+            "network_request_performed": not from_cache,
+        }
+    )
+    metadata = dict(source.metadata or {})
+    metadata.update({"mode": requested_mode, "cached": from_cache, "network_request_performed": not from_cache})
+    return tool_result_cls(
+        tool="inspect_source",
+        output=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        exit_code=source.exit_code if not payload.get("error") else 1,
+        metadata=metadata,
+        truncated=source.truncated,
+    )
+
+
+class _CachedTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        _ = attrs
+        if tag in {"script", "style", "noscript", "template"}:
+            self.skip += 1
+        elif not self.skip and tag in {"p", "br", "div", "section", "article", "li", "tr", "h1", "h2", "h3", "h4"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "template"} and self.skip:
+            self.skip -= 1
+        elif not self.skip and tag in {"p", "div", "li", "tr", "h1", "h2", "h3", "h4"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return "\n".join(compact for line in "".join(self.parts).splitlines() if (compact := " ".join(line.split())))
 
 
 def _enrich_source_result(result: Any, tool_result_cls: Any) -> Any:
@@ -248,11 +341,14 @@ def _patch_source_tool_visibility(loop: Any) -> None:
     original_definitions = loop.allowed_tool_definitions_for_state
     original_repair_block = loop.repair_mode_tool_block
     original_required_test_block = loop.required_test_tool_block
+    original_duplicate_edit_forced = loop.duplicate_inspection_edit_forced
 
     def allowed_tool_definitions_for_state(definitions: list[Any], state: Any) -> list[Any]:
         selected = list(original_definitions(definitions, state))
         if not loop.is_crawler_instruction(state.job.instruction):
             return selected
+        if _source_progress_forced(loop, state):
+            return [definition for definition in selected if getattr(definition, "name", None) in SOURCE_TO_EDIT_TOOLS]
         status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
         snapshot = loop.workflow_snapshot(state, status_output)
         if not _source_inspection_continuation_allowed(loop, state, snapshot):
@@ -283,9 +379,13 @@ def _patch_source_tool_visibility(loop: Any) -> None:
             return ""
         return original_required_test_block(state, snapshot, tool_name, args)
 
+    def duplicate_inspection_edit_forced(state: Any, snapshot: Any) -> bool:
+        return _source_progress_forced(loop, state) or original_duplicate_edit_forced(state, snapshot)
+
     loop.allowed_tool_definitions_for_state = allowed_tool_definitions_for_state
     loop.repair_mode_tool_block = repair_mode_tool_block
     loop.required_test_tool_block = required_test_tool_block
+    loop.duplicate_inspection_edit_forced = duplicate_inspection_edit_forced
 
 
 def _source_inspection_continuation_allowed(loop: Any, state: Any, snapshot: Any | None = None) -> bool:
@@ -293,6 +393,13 @@ def _source_inspection_continuation_allowed(loop: Any, state: Any, snapshot: Any
         return False
     if loop.successful_source_inspection(state.messages, state.job.instruction) is None:
         return False
+    if _source_progress_forced(loop, state):
+        return False
+    if not loop.successful_edit_tool_called(state):
+        if _optional_pre_edit_source_urls(state) >= MAX_OPTIONAL_PRE_EDIT_SOURCE_URLS:
+            return False
+        if _pre_edit_model_decisions(state) >= MAX_PRE_EDIT_MODEL_DECISIONS:
+            return False
     if _unique_source_urls(state) >= MAX_UNIQUE_SOURCE_INSPECTIONS:
         return False
     if snapshot is None:
@@ -304,15 +411,92 @@ def _source_inspection_continuation_allowed(loop: Any, state: Any, snapshot: Any
 def _unique_source_urls(state: Any) -> int:
     return len(
         {
-            str(metadata.get("requested_url") or metadata.get("url") or "")
+            identity
             for message in state.messages
             if message.get("role") == "tool"
             and message.get("tool") == "inspect_source"
             and int(message.get("exit_code") or 0) == 0
             and isinstance((metadata := message.get("metadata")), dict)
             and not metadata.get("cached")
-            and str(metadata.get("requested_url") or metadata.get("url") or "")
+            and (identity := _canonical_source_url(str(metadata.get("requested_url") or metadata.get("url") or "")))
         }
+    )
+
+
+def _successful_source_identities(state: Any) -> list[str]:
+    identities: list[str] = []
+    for message in state.messages:
+        if message.get("role") != "tool" or message.get("tool") != "inspect_source" or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        identity = _canonical_source_url(str(metadata.get("requested_url") or metadata.get("url") or ""))
+        if identity and identity not in identities:
+            identities.append(identity)
+    return identities
+
+
+def _optional_pre_edit_source_urls(state: Any) -> int:
+    identities = _successful_source_identities(state)
+    return max(0, len(identities) - 1)
+
+
+def _pre_edit_model_decisions(state: Any) -> int:
+    first_source_index = next(
+        (
+            index
+            for index, message in enumerate(state.messages)
+            if message.get("role") == "tool"
+            and message.get("tool") == "inspect_source"
+            and int(message.get("exit_code") or 0) == 0
+        ),
+        None,
+    )
+    if first_source_index is None:
+        return 0
+    decisions = 0
+    for message in state.messages[first_source_index + 1 :]:
+        if (
+            message.get("role") == "tool"
+            and message.get("tool") in {"write_file", "edit_file", "replace_in_file", "apply_patch"}
+            and int(message.get("exit_code") or 0) == 0
+        ):
+            return 0
+        if message.get("role") == "tool":
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            if not metadata.get("controller_owned"):
+                decisions += 1
+        elif message.get("kind") == "feedback":
+            decisions += 1
+    return decisions
+
+
+def _duplicate_source_inspection_attempted(state: Any) -> bool:
+    latest_edit = -1
+    for index, message in enumerate(state.messages):
+        if (
+            message.get("role") == "tool"
+            and message.get("tool") in {"write_file", "edit_file", "replace_in_file", "apply_patch"}
+            and int(message.get("exit_code") or 0) == 0
+        ):
+            latest_edit = index
+    return any(
+        message.get("kind") == "feedback" and "duplicate_source_inspection" in str(message.get("content") or "")
+        for message in state.messages[latest_edit + 1 :]
+    )
+
+
+def _source_progress_forced(loop: Any, state: Any) -> bool:
+    if not loop.is_crawler_instruction(state.job.instruction):
+        return False
+    if loop.successful_source_inspection(state.messages, state.job.instruction) is None:
+        return False
+    if _duplicate_source_inspection_attempted(state):
+        return True
+    if loop.successful_edit_tool_called(state):
+        return False
+    return (
+        _optional_pre_edit_source_urls(state) >= MAX_OPTIONAL_PRE_EDIT_SOURCE_URLS
+        or _pre_edit_model_decisions(state) >= MAX_PRE_EDIT_MODEL_DECISIONS
     )
 
 
@@ -326,6 +510,12 @@ def _patch_source_domain_policy(loop: Any) -> None:
             parsed = urlparse(raw_url)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 return "inspect_source requires an absolute HTTP or HTTPS URL."
+            identity = _canonical_source_url(raw_url)
+            if identity and identity in _successful_source_identities(state):
+                return (
+                    "duplicate_source_inspection: This source is already available in Source Inspection memory. "
+                    "Do not inspect it again or switch modes to refetch it. Read or edit the implementation now."
+                )
             allowed_origins = _allowed_source_origins(loop, state)
             if _url_origin(raw_url) in allowed_origins:
                 return ""
@@ -377,6 +567,23 @@ def _url_origin(url: str) -> tuple[str, str, int] | None:
     except ValueError:
         return None
     return parsed.scheme.lower(), parsed.hostname.lower().rstrip("."), port
+
+
+def _canonical_source_url(url: str) -> str | None:
+    parsed = urlparse(str(url or "").strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    host = parsed.hostname.lower().rstrip(".")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = 443 if scheme == "https" else 80
+    netloc = host if port is None or port == default_port else f"{host}:{port}"
+    return urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, ""))
 
 
 def _format_origin(origin: tuple[str, str, int]) -> str:

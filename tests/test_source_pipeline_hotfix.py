@@ -10,8 +10,49 @@ from docode.agent import loop
 from docode.agent.state import AgentState
 from docode.dobox.tools import ToolDefinition
 from docode.dobox.tools import DoBoxTools
-from docode.dobox.types import CommandResult
+from docode.dobox.types import CommandResult, ToolResult
 from docode.storage.models import CodingJob
+
+
+def crawler_state(*, url: str = "http://127.0.0.1:8765/feed") -> AgentState:
+    job = CodingJob(
+        id="job-source-progress",
+        user_id="test-user",
+        instruction=f"Build a crawler from {url}",
+        provider="test",
+        model="test",
+    )
+    state = AgentState(job=job)
+    state.inspection = SimpleNamespace()
+    state.task_contract = SimpleNamespace(must_run_commands=[], must_modify_files=[])
+    state.latest_git_status = ToolResult(tool="git_status", output="", exit_code=0)
+    state.messages.append(source_result_message(url, controller_owned=True))
+    return state
+
+
+def source_result_message(url: str, *, controller_owned: bool = False, cached: bool = False) -> dict[str, object]:
+    payload = {
+        "requested_url": url,
+        "final_url": url,
+        "status_code": 200,
+        "execution_scope": "sandbox",
+        "mode": "raw",
+        "body": '{"items":[],"next_cursor":"next"}',
+    }
+    return {
+        "role": "tool",
+        "tool": "inspect_source",
+        "exit_code": 0,
+        "output": json.dumps(payload),
+        "metadata": {
+            "requested_url": url,
+            "final_url": url,
+            "status_code": 200,
+            "execution_scope": "sandbox",
+            "controller_owned": controller_owned,
+            "cached": cached,
+        },
+    }
 
 
 class SourcePipelineHotfixImportTests(TestCase):
@@ -19,6 +60,14 @@ class SourcePipelineHotfixImportTests(TestCase):
         self.assertTrue(getattr(loop, "_source_pipeline_hotfix_v1_applied", False), getattr(docode, "__runtime_hotfix_error__", None))
         self.assertTrue(getattr(docode, "__runtime_hotfix_applied__", False), getattr(docode, "__runtime_hotfix_error__", None))
         self.assertIsNone(getattr(docode, "__runtime_hotfix_error__", None))
+
+    def test_controller_source_evidence_is_successful_before_edit(self) -> None:
+        state = crawler_state()
+
+        evidence = loop.successful_source_inspection(state.messages, state.job.instruction)
+
+        self.assertIsNotNone(evidence)
+        self.assertTrue(evidence.controller_owned)
 
     def test_same_origin_derived_source_is_allowed(self) -> None:
         state = SimpleNamespace(
@@ -82,6 +131,97 @@ class SourcePipelineHotfixImportTests(TestCase):
 
         self.assertEqual(blocked, "")
 
+    def test_duplicate_url_in_another_mode_is_rejected_before_tool_execution(self) -> None:
+        state = crawler_state(url="HTTP://Example.Test:80/feed?cursor=one#section")
+
+        blocked = loop.crawler_external_source_tool_block(
+            state,
+            "inspect_source",
+            {"url": "http://example.test/feed?cursor=one", "mode": "text"},
+        )
+
+        self.assertIn("duplicate_source_inspection", blocked)
+        self.assertIn("Read or edit", blocked)
+
+    def test_duplicate_feedback_hides_network_tools_but_keeps_read_and_edit_tools(self) -> None:
+        state = crawler_state()
+        state.add_feedback(
+            "duplicate_source_inspection: This source is already available in Source Inspection memory. Read or edit now."
+        )
+        definitions = [
+            ToolDefinition(name, "", {}, AsyncMock())
+            for name in (
+                "inspect_source",
+                "fetch_url",
+                "web_search",
+                "run_command",
+                "read_file",
+                "list_files",
+                "write_file",
+                "edit_file",
+                "git_status",
+            )
+        ]
+
+        selected = {item.name for item in loop.allowed_tool_definitions_for_state(definitions, state)}
+
+        self.assertEqual(state.consecutive_failures, 1)
+        self.assertNotIn("inspect_source", selected)
+        self.assertNotIn("fetch_url", selected)
+        self.assertNotIn("web_search", selected)
+        self.assertNotIn("run_command", selected)
+        self.assertTrue({"read_file", "list_files", "write_file", "edit_file", "git_status"} <= selected)
+        self.assertIsNotNone(loop.successful_source_inspection(state.messages, state.job.instruction))
+
+    def test_two_no_edit_decisions_force_source_to_edit_transition(self) -> None:
+        state = crawler_state()
+        state.messages.extend(
+            [
+                {"role": "tool", "tool": "read_file", "exit_code": 0, "metadata": {"path": "crawler.py"}},
+                {"role": "tool", "tool": "list_files", "exit_code": 0, "metadata": {"path": "."}},
+            ]
+        )
+        definitions = [
+            ToolDefinition(name, "", {}, AsyncMock())
+            for name in ("inspect_source", "read_file", "write_file", "run_command")
+        ]
+
+        selected = {item.name for item in loop.allowed_tool_definitions_for_state(definitions, state)}
+
+        self.assertEqual(selected, {"read_file", "write_file"})
+
+    def test_two_optional_source_urls_force_edit_but_successful_edit_resets_restriction(self) -> None:
+        state = crawler_state(url="http://127.0.0.1:8765/feed?cursor=")
+        state.task_contract = SimpleNamespace(must_run_commands=["python validate.py"], must_modify_files=[])
+        state.messages.extend(
+            [
+                source_result_message("http://127.0.0.1:8765/feed?cursor=two"),
+                source_result_message("http://127.0.0.1:8765/feed?cursor=three"),
+            ]
+        )
+        definitions = [
+            ToolDefinition(name, "", {}, AsyncMock())
+            for name in ("inspect_source", "read_file", "write_file")
+        ]
+
+        before_edit = {item.name for item in loop.allowed_tool_definitions_for_state(definitions, state)}
+        state.messages.append({"role": "tool", "tool": "write_file", "exit_code": 0, "metadata": {"path": "crawler.py"}})
+        state.latest_git_status = ToolResult(tool="git_status", output=" M crawler.py\n", exit_code=0)
+        after_edit = {item.name for item in loop.allowed_tool_definitions_for_state(definitions, state)}
+
+        self.assertNotIn("inspect_source", before_edit)
+        self.assertIn("write_file", before_edit)
+        self.assertIn("inspect_source", after_edit)
+
+    def test_distinct_same_origin_next_page_is_allowed_within_budget(self) -> None:
+        state = crawler_state(url="https://example.test/articles?page=1")
+
+        blocked = loop.crawler_external_source_tool_block(
+            state, "inspect_source", {"url": "https://example.test/articles?page=2", "mode": "raw"}
+        )
+
+        self.assertEqual(blocked, "")
+
 
 class InspectSourceCacheTests(IsolatedAsyncioTestCase):
     async def test_duplicate_source_inspection_uses_cache(self) -> None:
@@ -111,6 +251,31 @@ class InspectSourceCacheTests(IsolatedAsyncioTestCase):
         self.assertFalse(second.metadata.get("network_request_performed"))
         self.assertIn("pagination_fields", first.metadata.get("structure_summary", {}))
         self.assertNotIn('"body"', second.output)
+
+    async def test_different_mode_uses_same_canonical_url_response(self) -> None:
+        payload = {
+            "requested_url": "HTTP://Example.Test:80/feed#fragment",
+            "final_url": "http://example.test/feed",
+            "status_code": 200,
+            "content_type": "application/json",
+            "mode": "raw",
+            "body": '{"items":[1,2]}',
+            "original_bytes": 15,
+            "returned_bytes": 15,
+            "truncated": False,
+        }
+        client = SimpleNamespace(run_command=AsyncMock(return_value=CommandResult(output=json.dumps(payload), exit_code=0)))
+        tools = DoBoxTools(client, "project-1")
+
+        raw = await tools.inspect_source("HTTP://Example.Test:80/feed#fragment", mode="raw")
+        as_json = await tools.inspect_source("http://example.test/feed", mode="json")
+
+        self.assertTrue(raw.ok)
+        self.assertTrue(as_json.ok)
+        self.assertEqual(client.run_command.await_count, 1)
+        self.assertEqual(json.loads(as_json.output)["body"], '{"items":[1,2]}')
+        self.assertTrue(as_json.metadata["cached"])
+        self.assertFalse(as_json.metadata["network_request_performed"])
 
     async def test_different_same_origin_url_performs_another_request(self) -> None:
         def response(*args: object, **kwargs: object) -> CommandResult:
