@@ -20,7 +20,7 @@ class ArchitectureGuardTests(unittest.TestCase):
     def test_production_agent_has_no_historical_schema_leakage(self) -> None:
         root = Path(docode.__file__).parent
         targets = [root / "agent", root / "dobox"]
-        forbidden = ("parse_trending", "parse_repo_row", "stars_today", "github trending", "--preflight")
+        forbidden = ("parse_trending", "parse_repo_row", "stars_today", "github trending", "--preflight", "cisa", "cis benchmark", "cis control", "security advisory")
         for target in targets:
             for path in target.rglob("*.py"):
                 text = path.read_text(encoding="utf-8").lower()

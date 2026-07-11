@@ -424,7 +424,6 @@ class CodingAgentLoop:
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
-                tool_args = crawler_corrected_fetch_url_args(state, tool_name, tool_args) or tool_args
                 external_source_block = crawler_external_source_tool_block(state, tool_name, tool_args)
                 if external_source_block:
                     await self.record_rejected_decision(
@@ -2884,136 +2883,7 @@ def patch_paths(patch: str) -> list[str]:
 
 
 def crawler_external_source_tool_block(state: AgentState, tool_name: str, args: dict[str, object]) -> str:
-    policy_block = source_tool_block(state, tool_name, args)
-    if policy_block or tool_name == "inspect_source":
-        return policy_block
-    if tool_name in EDIT_TOOLS:
-        return ""
-    if not is_crawler_instruction(state.job.instruction):
-        return ""
-    allowed = instruction_source_domains(state.job.instruction)
-    if not allowed:
-        return ""
-    if tool_name == "inspect_source":
-        raw_url = str(args.get("url") or "")
-        candidates = instruction_source_urls(state.job.instruction)
-        if raw_url in candidates:
-            return ""
-        return (
-            "inspect_source must use a literal source candidate from the task without changing its query string: "
-            + ", ".join(candidates[:5])
-        )
-    if tool_name == "fetch_url":
-        raw_url = str(args.get("url") or "")
-        host = urlparse(raw_url).hostname or ""
-        if host and source_domain_allowed(host, allowed):
-            return ""
-        return (
-            f"fetch_url is blocked for {host or '<missing host>'}. "
-            f"This crawler task may only inspect the planned source domain(s): {', '.join(sorted(allowed))}."
-        )
-    if tool_name == "web_search":
-        query = str(args.get("query") or args.get("q") or "").lower()
-        blocked_terms = {"cisa.gov", "cisa", "cis benchmark", "cis control", "security advisory"}
-        if any(term in query for term in blocked_terms):
-            return (
-                "web_search is blocked because the query drifted to CISA/CIS security content. "
-                f"Keep research anchored to the planned source domain(s): {', '.join(sorted(allowed))}."
-            )
-    if tool_name in {"write_file", "edit_file", "replace_in_file"}:
-        content = str(args.get("content") or args.get("new_text") or args.get("replacement") or "")
-        blocked = blocked_domains_in_text(content, allowed)
-        if blocked:
-            return (
-                f"{tool_name} content references source domain(s) outside the plan: {', '.join(blocked)}. "
-                f"Rewrite the file for the planned source domain(s): {', '.join(sorted(allowed))}."
-            )
-    if tool_name == "apply_patch":
-        patch = str(args.get("patch") or "")
-        blocked = blocked_domains_in_text(patch, allowed)
-        if blocked:
-            return (
-                f"apply_patch content references source domain(s) outside the plan: {', '.join(blocked)}. "
-                f"Patch only for the planned source domain(s): {', '.join(sorted(allowed))}."
-            )
-    return ""
-
-
-def crawler_corrected_fetch_url_args(state: AgentState, tool_name: str, args: dict[str, object]) -> dict[str, object] | None:
-    if tool_name != "fetch_url" or not is_crawler_instruction(state.job.instruction):
-        return None
-    source_urls = instruction_source_urls(state.job.instruction)
-    allowed = instruction_source_domains(state.job.instruction)
-    if not source_urls or not allowed:
-        return None
-    raw_url = str(args.get("url") or "")
-    host = urlparse(raw_url).hostname or ""
-    if host and source_domain_allowed(host, allowed):
-        return None
-    corrected = dict(args)
-    corrected["url"] = source_urls[0]
-    corrected["goal"] = (
-        f"Inspect the planned crawler source {source_urls[0]} and derive selectors/fields for the requested target. "
-        "Ignore unrelated CIS/CISA/security-control interpretations."
-    )
-    return corrected
-
-
-def instruction_source_domains(instruction: str) -> set[str]:
-    domains: set[str] = set()
-    for url in instruction_source_urls(instruction):
-        host = urlparse(url).hostname
-        if host:
-            normalized = normalize_detected_host(host)
-            if normalized:
-                domains.add(normalized)
-    for match in re.finditer(r'"allowed_domains"\s*:\s*\[([^\]]+)\]', instruction or ""):
-        for domain in re.findall(r'"([^"]+)"', match.group(1)):
-            normalized = normalize_detected_host(domain)
-            if normalized:
-                domains.add(normalized)
-    return domains
-
-
-def normalize_detected_host(host: str) -> str:
-    normalized = host.lower().strip(".")
-    if "${" in normalized:
-        normalized = normalized.split("${", 1)[0].rstrip(".")
-    if "{" in normalized:
-        normalized = normalized.split("{", 1)[0].rstrip(".")
-    return normalized
-
-
-def source_domain_allowed(host: str, allowed: set[str]) -> bool:
-    normalized = normalize_detected_host(host)
-    if not normalized:
-        return False
-    return any(normalized == domain or normalized.endswith(f".{domain}") for domain in allowed)
-
-
-def blocked_domains_in_text(text: str, allowed: set[str]) -> list[str]:
-    blocked: list[str] = []
-    candidates: list[str] = []
-    for match in re.finditer(r"https?://[^\s'\"`)>]+", text.lower()):
-        host = urlparse(match.group(0).rstrip(".,;:")).hostname
-        if host:
-            candidates.append(host)
-    for match in re.finditer(r"\b(?:source_url|url|domain|host)\s*=\s*[\"']([^\"']+)[\"']", text.lower()):
-        value = match.group(1).strip()
-        host = urlparse(value).hostname or value
-        if "." in host:
-            candidates.append(host)
-    for host in candidates:
-        host = normalize_detected_host(host)
-        if not host:
-            continue
-        if source_domain_allowed(host, allowed):
-            continue
-        if host in {"example.com", "localhost"} or host.endswith(".example"):
-            continue
-        if host not in blocked:
-            blocked.append(host)
-    return blocked[:5]
+    return source_tool_block(state, tool_name, args)
 
 
 def latest_failed_required_command(state: AgentState) -> ToolResult | None:
