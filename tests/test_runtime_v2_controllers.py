@@ -1,6 +1,7 @@
 import unittest
 
 from docode.agent.failure_taxonomy import FailureCategory, TerminalResult
+from docode.agent.finalization_controller import FinalizationController, FinalizationState
 from docode.agent.repair_coordinator import RepairAction, RepairCoordinator, RepairPhase
 from docode.agent.verification_scheduler import VerificationScheduler
 
@@ -30,6 +31,17 @@ class RuntimeV2ControllerTests(unittest.TestCase):
         result = TerminalResult("failed", FailureCategory.HARNESS_FAILURE, "checker crashed", functionally_correct=None, harness_valid=False)
         self.assertFalse(result.to_dict()["harness_valid"])
         self.assertFalse(result.strict_success)
+
+    def test_finalization_rejects_stale_or_placeholder_patch(self) -> None:
+        state = FinalizationState(("src/app.py",), diff="+ # TODO placeholder", explicit_commands_fresh=False, summary="done", exporter_succeeded=True)
+        decision = FinalizationController().evaluate(state)
+        self.assertFalse(decision.ready)
+        self.assertIn("placeholder_or_debug_marker", decision.failures)
+        self.assertIn("explicit_commands_stale", decision.failures)
+
+    def test_finalization_accepts_fresh_reviewed_patch(self) -> None:
+        state = FinalizationState(("src/app.py",), ("src/app.py",), "+ return value", True, True, True, False, "Implemented and verified", True)
+        self.assertTrue(FinalizationController().evaluate(state).ready)
 
 
 if __name__ == "__main__":
