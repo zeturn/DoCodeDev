@@ -30,6 +30,8 @@ POST /v1/jobs
 
 ## Local Development
 
+Runtime V2 architecture is under integration on `release/runtime-v2`. It removes import-time runtime patches and introduces explicit profiles, semantic artifact contracts, verification scheduling, repair convergence, repository indexing, task graphs, and finalization gates. This is not yet a passed release; see `docs/evals/runtime-v2-release.md` for validated, experimental, and missing evidence.
+
 ```bash
 python -m pip install -e ".[dev]"
 uvicorn docode.main:app --reload --port 8110

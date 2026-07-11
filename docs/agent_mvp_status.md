@@ -116,3 +116,6 @@ DOCODE_REAL_LLM_SMOKE=1 PATH=/Users/henryzhao/Desktop/workplace/.venv/bin:$PATH 
 This suite is diagnostic only. It is intended to collect structured failure evidence across bounded realistic tasks before changing loop or repair behavior.
 
 The real LLM commands use the existing provider configuration. By default the optional real LLM helper resolves a DeepSeek model through BasaltPass/APICred when those environment variables are configured; direct OpenAI use requires the existing explicit direct OpenAI environment switches.
+# Runtime V2 status (2026-07-11)
+
+Runtime V2 architecture components and real DoBox/DeepSeek canary are experimental. The formal 8 crawler + 3 large-repository frozen evaluation has not run, so the Runtime V2 release gate is **FAILED**. See `docs/evals/runtime-v2-release.md`.
