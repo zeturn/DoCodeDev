@@ -277,7 +277,7 @@ class DiagnosticLocalTools:
 
     def snapshot_files(self) -> dict[str, str]:
         return {
-            file.relative_to(self.workspace).as_posix(): file.read_text(encoding="utf-8")
+            file.relative_to(self.workspace).as_posix(): file.read_text(encoding="utf-8", errors="surrogateescape")
             for file in self.workspace.rglob("*")
             if file.is_file() and "__pycache__" not in file.parts and not file.name.endswith(".pyc")
         }
