@@ -40,6 +40,8 @@ class RuntimeComponentsIntegrationTests(IsolatedAsyncioTestCase):
         command = state.verification_scheduler.next_command()
         state.add_tool_result(ToolResult("run_command", "ok", metadata={"command": command}))
         self.assertTrue(state.verification_scheduler.is_fresh_success(command))
+        validator = state.verification_scheduler.next_command()
+        self.assertEqual(validator, "python validate.py out.json")
 
 
 if __name__ == "__main__":

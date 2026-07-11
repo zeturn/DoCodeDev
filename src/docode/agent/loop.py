@@ -27,6 +27,8 @@ from docode.agent.reviewer import CodeReviewer, ReviewResult
 from docode.agent.runtime_components import RuntimeComponents, build_runtime_components
 from docode.agent.repository_index import build_remote_repository_index
 from docode.agent.workspace_reader import DoBoxWorkspaceReader
+from docode.agent.verification_scheduler import VerificationScheduler
+from docode.agent.profiles import select_task_profile
 from docode.agent.source_inspection import (
     attempted_source_urls,
     crawler_source_inspection_required,
@@ -761,6 +763,15 @@ class CodingAgentLoop:
                 state,
                 reason=gate.reason,
                 detail=gate.detail,
+                workflow_state=gate.snapshot.to_dict(),
+            )
+            return None
+        scheduled = state.verification_scheduler.next_command() if state.verification_scheduler is not None else None
+        if scheduled:
+            await self.record_rejected_decision(
+                state,
+                reason="verification_scheduler_stale",
+                detail=f"Verification evidence is stale or incomplete. Run the scheduler-selected command exactly: {display_command(scheduled)}",
                 workflow_state=gate.snapshot.to_dict(),
             )
             return None
@@ -2730,22 +2741,18 @@ def next_targeted_repair_rerun_command(state: AgentState) -> str:
 
 
 def controller_owned_required_command(state: AgentState, workflow: Any) -> str:
-    contract_commands = [
-        str(command)
-        for command in (state.task_contract.must_run_commands if state.task_contract is not None else [])
-        if str(command)
-    ]
-    if not contract_commands:
+    if state.verification_scheduler is None:
+        commands = [str(command) for command in (state.task_contract.must_run_commands if state.task_contract is not None else []) if str(command)]
+        state.verification_scheduler = VerificationScheduler.from_explicit_commands(commands)
+    scheduler = state.verification_scheduler
+    if not scheduler.commands:
         return ""
-
+    for node in scheduler.commands:
+        if command_was_run(state, node.command) and not scheduler.is_fresh_success(node.command):
+            scheduler.record(node.command, True)
     if state.active_repair_action:
         if state.repair_mode != "targeted_repair" or not targeted_repair_modified_target(state):
             return ""
-        if is_crawler_instruction(state.job.instruction):
-            command = next((item for item in contract_commands if not command_was_run(state, item)), "")
-        else:
-            rerun = next_targeted_repair_rerun_command(state)
-            command = next((item for item in contract_commands if commands_equivalent(item, rerun)), "")
     else:
         if state.repair_mode is not None or workflow.phase != WorkflowPhase.TEST_REQUIRED:
             return ""
@@ -2753,16 +2760,13 @@ def controller_owned_required_command(state: AgentState, workflow: Any) -> str:
             return ""
         if missing_must_modify_targets(state):
             return ""
-        missing = list(getattr(workflow, "missing_commands", None) or [])
-        command = str(missing[0]) if missing else ""
-
-    if not command or not any(commands_equivalent(command, item) for item in contract_commands):
+    command = scheduler.next_command() or ""
+    if not command:
         return ""
-    if is_crawler_instruction(state.job.instruction):
+    profile = state.profile or select_task_profile(state.job.instruction)
+    if profile.name == "crawler":
         return command
-    if "\n" not in command and heredoc_delimiter_from_command(command) is None:
-        return ""
-    return command
+    return command if "\n" in command or heredoc_delimiter_from_command(command) is not None else ""
 
 
 def targeted_repair_forced_tool(
