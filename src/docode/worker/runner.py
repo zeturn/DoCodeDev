@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from docode.agent.loop import CodingAgentLoop
+from docode.agent.runtime_components import build_runtime_components
 from docode.agent.reviewer import IndependentReviewer
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.tools import CompositeAgentTools
@@ -211,6 +212,7 @@ class JobRunnerService:
                 ),
                 usage_meter=runtime.usage_meter,
                 llm_decision_timeout_seconds=self.config.llm_decision_timeout_seconds,
+                runtime_components=build_runtime_components(job.instruction),
             )
             try:
                 completed = await asyncio.wait_for(loop.run(job), timeout=max(1, job.max_runtime_seconds))

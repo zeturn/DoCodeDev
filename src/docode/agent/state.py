@@ -7,6 +7,13 @@ from typing import Any
 from docode.agent.output import prompt_safe_output
 from docode.agent.inspector import ProjectInspection
 from docode.agent.task_contract import TaskContract
+from docode.agent.artifact_contract import ArtifactSemanticContract
+from docode.agent.failure_taxonomy import TerminalResult
+from docode.agent.finalization_controller import FinalizationController
+from docode.agent.profiles import TaskProfile
+from docode.agent.repair_coordinator import RepairCoordinator
+from docode.agent.task_graph import TaskGraph
+from docode.agent.verification_scheduler import VerificationScheduler
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
 
@@ -23,6 +30,15 @@ class AgentState:
     consecutive_failures: int = 0
     inspection: ProjectInspection | None = None
     task_contract: TaskContract | None = None
+    profile: TaskProfile | None = None
+    artifact_contract: ArtifactSemanticContract | None = None
+    verification_scheduler: VerificationScheduler | None = None
+    repair_coordinator: RepairCoordinator | None = None
+    repository_context: Any | None = None
+    task_graph: TaskGraph | None = None
+    finalization_controller: FinalizationController | None = None
+    terminal_result: TerminalResult | None = None
+    edit_epoch: int = 0
     latest_git_status: ToolResult | None = None
     repair_mode: str | None = None
     stuck_count: int = 0
@@ -64,6 +80,13 @@ class AgentState:
         )
         if result.tool in {"edit_file", "write_file", "replace_in_file", "apply_patch"} and result.ok:
             self.quality_gate_passed = False
+            self.edit_epoch += 1
+            if self.verification_scheduler is not None:
+                self.verification_scheduler.mark_edit()
+        if result.tool == "run_command" and self.verification_scheduler is not None:
+            command = str(metadata.get("command") or "")
+            if command:
+                self.verification_scheduler.record(command, result.ok)
         self.consecutive_failures = self.consecutive_failures + 1 if not result.ok else 0
 
     def add_feedback(self, content: str) -> None:

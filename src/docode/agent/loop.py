@@ -24,6 +24,7 @@ from docode.agent.repair_planner import (
     plan_repair_from_tool_result,
 )
 from docode.agent.reviewer import CodeReviewer, ReviewResult
+from docode.agent.runtime_components import RuntimeComponents, build_runtime_components
 from docode.agent.source_inspection import (
     attempted_source_urls,
     crawler_source_inspection_required,
@@ -103,6 +104,7 @@ class CodingAgentLoop:
         llm_max_attempts: int = 3,
         llm_retry_delays: tuple[float, ...] = (2.0, 5.0),
         llm_decision_timeout_seconds: float = 45.0,
+        runtime_components: RuntimeComponents | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -119,6 +121,7 @@ class CodingAgentLoop:
         self.llm_max_attempts = max(1, llm_max_attempts)
         self.llm_retry_delays = llm_retry_delays
         self.llm_decision_timeout_seconds = max(1.0, llm_decision_timeout_seconds)
+        self.runtime_components = runtime_components
 
     async def run(self, job: CodingJob) -> CodingJob:
         job = await self.repository.update_job(job.id, status=JobStatus.RUNNING)
@@ -959,7 +962,16 @@ class CodingAgentLoop:
         return None
 
     async def bootstrap(self, state: AgentState) -> None:
-        state.task_contract = task_contract_from_instruction(state.job.instruction)
+        components = self.runtime_components or build_runtime_components(state.job.instruction)
+        self.runtime_components = components
+        state.profile = components.profile
+        state.task_contract = components.task_contract
+        state.artifact_contract = components.artifact_contract
+        state.verification_scheduler = components.verification_scheduler
+        state.repair_coordinator = components.repair_coordinator
+        state.repository_context = components.repository_context
+        state.task_graph = components.task_graph
+        state.finalization_controller = components.finalization_controller
         inspection = await self.inspector.inspect(state.job.instruction, self.tools, state.task_contract)
         state.inspection = inspection
         await self.repository.add_step(
