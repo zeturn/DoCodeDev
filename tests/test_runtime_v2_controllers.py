@@ -1,6 +1,6 @@
 import unittest
 
-from docode.agent.failure_taxonomy import FailureCategory, TerminalResult
+from docode.agent.failure_taxonomy import FailureCategory, TerminalResult, category_for_reason
 from docode.agent.finalization_controller import FinalizationController, FinalizationState
 from docode.agent.repair_coordinator import RepairCoordinator, RepairPhase
 from docode.agent.repair_planner import RepairAction
@@ -32,6 +32,8 @@ class RuntimeV2ControllerTests(unittest.TestCase):
         result = TerminalResult("failed", FailureCategory.HARNESS_FAILURE, "checker crashed", functionally_correct=None, harness_valid=False)
         self.assertFalse(result.to_dict()["harness_valid"])
         self.assertFalse(result.strict_success)
+        self.assertEqual(category_for_reason("llm_auth_failed"), FailureCategory.PROVIDER_FAILURE)
+        self.assertEqual(category_for_reason("repair_non_convergent:x"), FailureCategory.REPAIR_NON_CONVERGENT)
 
     def test_finalization_rejects_stale_or_placeholder_patch(self) -> None:
         state = FinalizationState(("src/app.py",), diff="+ # TODO placeholder", explicit_commands_fresh=False, summary="done", exporter_succeeded=True)

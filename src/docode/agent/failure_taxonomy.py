@@ -36,3 +36,28 @@ class TerminalResult:
         value = asdict(self)
         value["category"] = self.category.value
         return value
+
+
+def category_for_reason(reason: str) -> FailureCategory:
+    lowered = (reason or "").lower()
+    if "non_convergent" in lowered or "repeated_zero_record" in lowered:
+        return FailureCategory.REPAIR_NON_CONVERGENT
+    if any(token in lowered for token in ("llm", "provider", "apicred", "auth_failed")):
+        return FailureCategory.PROVIDER_FAILURE
+    if any(token in lowered for token in ("sandbox", "dobox")):
+        return FailureCategory.SANDBOX_FAILURE
+    if "semantic" in lowered or "quality" in lowered:
+        return FailureCategory.SEMANTIC_FAILURE
+    if "verif" in lowered or "required_command" in lowered:
+        return FailureCategory.VERIFICATION_FAILURE
+    if "finalization" in lowered or "export" in lowered:
+        return FailureCategory.FINALIZATION_FAILURE
+    if "environment" in lowered or "workspace_inconsistent" in lowered:
+        return FailureCategory.ENVIRONMENT_FAILURE
+    if "source" in lowered and "unavailable" in lowered:
+        return FailureCategory.SOURCE_UNAVAILABLE
+    return FailureCategory.RUNTIME_FAILURE
+
+
+def failed_terminal_result(reason: str) -> dict[str, object]:
+    return TerminalResult("failed", category_for_reason(reason), reason).to_dict()

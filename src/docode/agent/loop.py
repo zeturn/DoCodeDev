@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from docode.agent.context import ContextManager, ContextPack, target_file_guidance
 from docode.agent.artifact_validator import ExecutionEvidence
 from docode.agent.finalization_controller import ExportCompletionState, FinalizationController, PreExportFinalizationState
+from docode.agent.failure_taxonomy import FailureCategory, TerminalResult, category_for_reason
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
@@ -932,6 +933,7 @@ class CodingAgentLoop:
             job.id,
             status=JobStatus.SUCCEEDED,
             result_summary=final_summary,
+            terminal_result=TerminalResult("succeeded", FailureCategory.SUCCESS, functionally_correct=True, strict_success=True).to_dict(),
             artifact_id=artifact_id,
         )
 
@@ -1106,9 +1108,11 @@ class CodingAgentLoop:
         return context_pack
 
     async def fail(self, job_id: str, reason: str) -> CodingJob:
+        terminal = TerminalResult("failed", category_for_reason(reason), reason)
+        await self.repository.add_step(job_id, "system", {"type": "terminal_result", **terminal.to_dict()})
         current = await self.repository.get_job(job_id)
         if current is None:
-            return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason)
+            return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason, terminal_result=terminal.to_dict())
         artifact_id = None
         try:
             git_diff = ""
@@ -1131,7 +1135,7 @@ class CodingAgentLoop:
             await self.repository.add_step(job_id, "system", {"type": "failure_artifacts_exported", "reason": reason, "artifact_id": artifact_id})
         except Exception as exc:
             await self.repository.add_step(job_id, "system", {"type": "failure_export_failed", "reason": reason, "error": str(exc)})
-        return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason, artifact_id=artifact_id)
+        return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason, terminal_result=terminal.to_dict(), artifact_id=artifact_id)
 
     async def record_model_failure(self, state: AgentState, reason: str, detail: str) -> None:
         self.sync_llm_usage(state)
