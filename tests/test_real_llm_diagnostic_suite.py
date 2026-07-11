@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import re
 import platform
 import shutil
 import subprocess
