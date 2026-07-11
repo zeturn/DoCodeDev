@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from docode.agent.task_contract import is_crawler_instruction, text_outside_verification_blocks
 
@@ -27,6 +27,13 @@ class SourceInspectionEvidence:
     message_index: int
     controller_owned: bool = False
     error: str = ""
+    canonical_url: str = ""
+    satisfies_initial_requirement: bool = False
+    usable: bool = False
+    source_role: str = "initial"
+    parent_url: str = ""
+    body_available: bool = False
+    structure_summary: dict[str, Any] | None = None
 
     def to_dict(self, *, include_body: bool = False) -> dict[str, Any]:
         payload = asdict(self)
@@ -107,14 +114,27 @@ def source_inspection_evidence(
         body = str(payload.get("body") or "")
         error = str(payload.get("error") or metadata.get("error") or "")
         source_identity_matches = not candidates or requested_url in candidates
-        successful = (
+        base_success = (
             int(message.get("exit_code") or 0) == 0
             and scope == "sandbox"
             and status_code is not None
             and 200 <= status_code < 400
-            and source_identity_matches
             and (bool(body) or mode == "headers")
         )
+        allowed_origins = {origin for candidate in candidates if (origin := source_origin(candidate)) is not None}
+        requested_origin = source_origin(requested_url)
+        same_origin_derived = bool(requested_origin and requested_origin in allowed_origins)
+        usable = base_success and (source_identity_matches or same_origin_derived or not candidates)
+        satisfies_initial = base_success and source_identity_matches
+        parent_url = next(
+            (
+                prior.requested_url
+                for prior in reversed(evidence)
+                if prior.usable and source_origin(prior.requested_url) == requested_origin
+            ),
+            "",
+        )
+        structure_summary = payload.get("structure_summary") or metadata.get("structure_summary")
         evidence.append(
             SourceInspectionEvidence(
                 requested_url=requested_url,
@@ -124,10 +144,17 @@ def source_inspection_evidence(
                 mode=mode,
                 body=body,
                 before_first_edit=index < first_edit,
-                successful=successful,
+                successful=usable,
                 message_index=index,
                 controller_owned=bool(metadata.get("controller_owned")),
                 error=error,
+                canonical_url=canonical_source_url(requested_url),
+                satisfies_initial_requirement=satisfies_initial,
+                usable=usable,
+                source_role="initial" if source_identity_matches else "derived",
+                parent_url=parent_url if not source_identity_matches else "",
+                body_available=bool(body) or mode == "headers",
+                structure_summary=structure_summary if isinstance(structure_summary, dict) else {},
             )
         )
     return evidence
@@ -135,9 +162,37 @@ def source_inspection_evidence(
 
 def successful_source_inspection(messages: list[dict[str, Any]], instruction: str) -> SourceInspectionEvidence | None:
     return next(
-        (item for item in source_inspection_evidence(messages, instruction) if item.successful and item.before_first_edit),
+        (
+            item
+            for item in source_inspection_evidence(messages, instruction)
+            if item.satisfies_initial_requirement and item.before_first_edit
+        ),
         None,
     )
+
+
+def source_origin(url: str) -> tuple[str, str, int] | None:
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        return None
+    return parsed.scheme.lower(), parsed.hostname.lower().rstrip("."), port
+
+
+def canonical_source_url(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    origin = source_origin(url)
+    if origin is None:
+        return ""
+    scheme, host, port = origin
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = 443 if scheme == "https" else 80
+    netloc = host if port == default_port else f"{host}:{port}"
+    return urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, ""))
 
 
 def attempted_source_urls(messages: list[dict[str, Any]]) -> set[str]:

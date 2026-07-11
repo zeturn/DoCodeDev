@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import posixpath
 import re
 import shlex
@@ -126,6 +127,8 @@ class CodingAgentLoop:
             cancelled = await self.cancelled_job(job.id)
             if cancelled is not None:
                 return cancelled
+            if state.terminal_repair_reason:
+                return await self.fail(job.id, state.terminal_repair_reason)
 
             self.sync_llm_usage(state)
             stop = self.stop_policy.evaluate(state)
@@ -242,14 +245,67 @@ class CodingAgentLoop:
                 current_tools = allowed_tool_definitions_for_state(self.tools.definitions(), state)
                 current_tool_names = {str(getattr(definition, "name", "")) for definition in current_tools}
                 if current_tool_names and tool_name not in current_tool_names:
+                    same_turn_retry = (
+                        is_crawler_instruction(state.job.instruction)
+                        and tool_name in {"inspect_source", "fetch_url", "web_search", *LOCAL_INSPECTION_TOOLS}
+                    )
                     await self.record_unavailable_tool_requested(
                         state,
                         requested_tool=tool_name,
                         requested_args=tool_args,
                         available_tools=sorted(current_tool_names),
                         workflow_state=current_workflow.to_dict(),
+                        increment_iteration=not same_turn_retry,
+                        reason="source_inspection_complete_edit_required" if tool_name == "inspect_source" else "tool_not_in_current_schema",
                     )
-                    continue
+                    if not same_turn_retry:
+                        continue
+                    await self.repository.add_step(
+                        job.id,
+                        "system",
+                        {
+                            "type": "llm_schema_repair_retry",
+                            "reason": "invalid_tool_same_turn_retry",
+                            "requested_tool": tool_name,
+                            "available_tools": sorted(current_tool_names),
+                        },
+                    )
+                    retry_observation = (
+                        observation
+                        + "\n\nThe requested tool is not available in this workflow phase. "
+                        "The source evidence is already present in Source Inspection memory. "
+                        "Choose exactly one available tool now. Read the target file once if needed, otherwise edit it. "
+                        "Do not request inspect_source, fetch_url, or web_search."
+                    )
+                    try:
+                        decision = await self.decide_with_transient_retries(state, retry_observation)
+                    except Exception as exc:
+                        await self.record_model_failure(state, "llm_schema_repair_retry_failed", str(exc))
+                        continue
+                    self.sync_llm_usage(state)
+                    await self.repository.add_step(job.id, "llm", decision_to_step(decision, self.usage_meter))
+                    if decision.type != "tool_call" or not decision.tool_name:
+                        await self.record_rejected_decision(
+                            state,
+                            reason="invalid_tool_same_turn_retry_unusable",
+                            detail="Schema-repair retry must choose exactly one currently available tool.",
+                            workflow_state=current_workflow.to_dict(),
+                        )
+                        continue
+                    tool_name = decision.tool_name
+                    tool_args = decision.args or {}
+                    current_tools = allowed_tool_definitions_for_state(self.tools.definitions(), state)
+                    current_tool_names = {str(getattr(definition, "name", "")) for definition in current_tools}
+                    if current_tool_names and tool_name not in current_tool_names:
+                        await self.record_unavailable_tool_requested(
+                            state,
+                            requested_tool=tool_name,
+                            requested_args=tool_args,
+                            available_tools=sorted(current_tool_names),
+                            workflow_state=current_workflow.to_dict(),
+                            reason="invalid_tool_same_turn_retry_exhausted",
+                        )
+                        continue
                 source_tool_block = source_inspection_required_tool_block(state, tool_name)
                 if source_tool_block:
                     await self.record_rejected_decision(
@@ -421,6 +477,7 @@ class CodingAgentLoop:
                     result = tool_exception_result(tool_name, exc)
                 result = enrich_tool_result_metadata(tool_name, tool_args, result)
                 state.add_tool_result(result)
+                reset_parser_mismatch_convergence(state, result)
                 note_targeted_repair_tool_result(state, result)
                 await self.repository.add_step(
                     job.id,
@@ -458,7 +515,9 @@ class CodingAgentLoop:
             continue
 
     async def plan_targeted_repair_from_failure(self, state: AgentState, result: ToolResult) -> None:
-        action = plan_repair_from_tool_result(tool=result.tool, output=result.output, metadata=result.metadata or {})
+        action = parser_source_mismatch_repair(state, result)
+        if action is None:
+            action = plan_repair_from_tool_result(tool=result.tool, output=result.output, metadata=result.metadata or {})
         if action is None:
             action = fallback_required_command_repair(state, result)
         if action is None:
@@ -496,6 +555,7 @@ class CodingAgentLoop:
             result = tool_exception_result("run_command", exc)
         result = enrich_tool_result_metadata("run_command", args, result)
         state.add_tool_result(result)
+        reset_parser_mismatch_convergence(state, result)
         note_targeted_repair_tool_result(state, result)
         await self.repository.add_step(
             state.job.id,
@@ -817,6 +877,23 @@ class CodingAgentLoop:
         count = state.failure_signatures.get(action.signature, 0) + 1
         state.failure_signatures[action.signature] = count
         state.repair_action_attempts = count
+        if action.failure_class == "parser_source_mismatch" and count >= 3:
+            state.terminal_repair_reason = "repeated_zero_record_parser_failure"
+            state.add_feedback(
+                "non_convergent_repair: The same zero-record parser failure remained after two evidence-backed edits. "
+                "Stopping instead of continuing blind rewrites."
+            )
+            await self.repository.add_step(
+                state.job.id,
+                "system",
+                {
+                    "type": "non_convergent_repair",
+                    "reason": state.terminal_repair_reason,
+                    "signature": action.signature,
+                    "repeated_count": count,
+                },
+            )
+            return
         action_payload = repair_action_contract(action, state)
         state.active_repair_action = action_payload
         state.active_repair_started_at = repair_action_start_index(state, result)
@@ -918,7 +995,7 @@ class CodingAgentLoop:
             },
         )
         workflow = workflow_snapshot(state, status.output)
-        include_source_body = not state.source_inspection_excerpt_presented
+        include_source_body = not successful_edit_tool_called(state)
         context_pack = self.context_manager.build_pack(
             job=state.job,
             inspection=state.inspection,
@@ -935,9 +1012,6 @@ class CodingAgentLoop:
             workflow_phase=workflow.phase.value if hasattr(workflow.phase, "value") else str(workflow.phase),
             include_source_body=include_source_body,
         )
-        source_evidence = source_inspection_evidence(state.messages, state.job.instruction)
-        if include_source_body and source_evidence and source_evidence[-1].body:
-            state.source_inspection_excerpt_presented = True
         return context_pack
 
     async def fail(self, job_id: str, reason: str) -> CodingJob:
@@ -1083,13 +1157,14 @@ class CodingAgentLoop:
         requested_args: dict[str, object],
         available_tools: list[str],
         workflow_state: dict[str, object] | None = None,
+        increment_iteration: bool = True,
+        reason: str = "tool_not_in_current_schema",
     ) -> None:
         self.sync_llm_usage(state)
         edit_pressure = duplicate_inspection_edit_forced(
             state,
             workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else ""),
         )
-        reason = "tool_not_in_current_schema"
         payload: dict[str, object] = {
             "type": "unavailable_tool_requested",
             "requested_tool": requested_tool,
@@ -1101,7 +1176,16 @@ class CodingAgentLoop:
             payload["workflow_state"] = workflow_state
         await self.repository.add_step(state.job.id, "system", payload)
 
-        if requested_tool in LOCAL_INSPECTION_TOOLS and edit_pressure:
+        if requested_tool == "inspect_source" and reason == "source_inspection_complete_edit_required":
+            edit_tools = ", ".join(tool for tool in ("write_file", "edit_file", "replace_in_file", "apply_patch") if tool in available_tools)
+            target_files = target_candidates_for_edit_pressure(state)
+            target = target_files[0] if target_files else "the most likely target file"
+            feedback = (
+                "source_inspection_complete_edit_required: Source evidence is already retained in Source Inspection memory.\n"
+                f"Available editing tools: {edit_tools or ', '.join(available_tools)}.\n"
+                f"Read {target} once if necessary, otherwise you must edit it now."
+            )
+        elif requested_tool in {"inspect_source", *LOCAL_INSPECTION_TOOLS} and edit_pressure:
             edit_tools = ", ".join(tool for tool in ("write_file", "edit_file", "replace_in_file", "apply_patch") if tool in available_tools)
             target_files = target_candidates_for_edit_pressure(state)
             target = target_files[0] if target_files else "the most likely target file"
@@ -1116,7 +1200,8 @@ class CodingAgentLoop:
                 f"Available tools: {', '.join(available_tools)}."
             )
         state.add_feedback(feedback)
-        state.iteration += 1
+        if increment_iteration:
+            state.iteration += 1
 
     def sync_llm_usage(self, state: AgentState) -> None:
         if self.usage_meter is not None:
@@ -1414,6 +1499,110 @@ def fallback_required_command_repair(state: AgentState, result: ToolResult) -> R
         exploration_forbidden=False,
         initial_inspection_budget=2,
     )
+
+
+ZERO_RECORD_RE = re.compile(r"\b(?:wrote|collected|parsed|produced|found)?\s*0\s+(?:records?|cards?|entries?|items?|rows?)\b", re.IGNORECASE)
+
+
+def parser_source_mismatch_repair(state: AgentState, result: ToolResult) -> RepairAction | None:
+    if not is_crawler_instruction(state.job.instruction) or result.tool != "run_command":
+        return None
+    if not re.search(r"AssertionError:\s*0\b|\bempty\s+(?:payload|records?|list)\b", result.output, re.IGNORECASE):
+        return None
+    commands = list(state.task_contract.must_run_commands if state.task_contract is not None else [])
+    if len(commands) < 2:
+        return None
+    producer = str(commands[0])
+    producer_result = next(
+        (
+            message
+            for message in reversed(state.messages)
+            if message.get("role") == "tool"
+            and message.get("tool") == "run_command"
+            and int(message.get("exit_code") or 0) == 0
+            and commands_equivalent(str((message.get("metadata") or {}).get("command") or ""), producer)
+        ),
+        None,
+    )
+    if producer_result is None or not ZERO_RECORD_RE.search(str(producer_result.get("output") or "")):
+        return None
+    targets = list(state.task_contract.must_modify_files if state.task_contract is not None else [])
+    if not targets:
+        targets = [token.strip("'\"") for token in producer.split() if token.strip("'\"").endswith(".py")][:1]
+    target = targets[0] if targets else "main.py"
+    diagnosis = source_parser_diagnosis(state, target)
+    signature = f"parser_source_mismatch:{normalize_workspace_relative_path(target)}:zero_records"
+    return RepairAction(
+        category="parser_source_mismatch",
+        signature=signature,
+        reason="The collector executed successfully but matched zero records.",
+        target_files=[target],
+        allowed_tools=["read_file", "read_file_range", "read_symbol", "edit_file", "write_file", "replace_in_file", "apply_patch", "run_command", "git_status", "git_diff"],
+        forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
+        rerun_commands=[producer, *[str(command) for command in commands[1:]]],
+        instruction=(
+            "The collector executed successfully but matched zero records. The current parser assumptions likely do not match "
+            "the inspected source structure.\n\n"
+            f"Latest producer output:\n{truncate_text(str(producer_result.get('output') or ''), 800)}\n\n"
+            f"Validator assertion:\n{truncate_text(result.output, 800)}\n\n"
+            f"Evidence-backed source/parser diagnosis:\n{diagnosis}\n\n"
+            "Re-read the retained representative source excerpt, update the parser generically, then rerun the producer before the validator."
+        ),
+        initial_inspection_budget=1,
+        failure_class="parser_source_mismatch",
+        producer_semantic_result="zero_records",
+    )
+
+
+def source_parser_diagnosis(state: AgentState, target: str) -> str:
+    evidence = [item for item in source_inspection_evidence(state.messages, state.job.instruction) if item.usable]
+    observed: list[str] = []
+    summaries: list[str] = []
+    for item in evidence:
+        summary = item.structure_summary or {}
+        summaries.append(json.dumps(summary, ensure_ascii=False))
+        for key in ("top_level_keys", "sample_keys", "class_names", "data_attributes"):
+            observed.extend(str(value) for value in summary.get(key) or [])
+        observed.extend(str(entry.get("tag")) for entry in summary.get("repeated_tags") or [] if isinstance(entry, dict))
+        observed.extend(str(key) for key in (summary.get("list_fields") or {}))
+        observed.extend(str(key) for key in (summary.get("pagination_fields") or {}))
+    target_normalized = normalize_workspace_relative_path(target)
+    code_text = ""
+    for message in reversed(state.messages):
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if path == target_normalized and message.get("tool") in {"read_file", "read_file_range", "read_symbol", "write_file", "edit_file"}:
+            code_text = str(message.get("output") or "")
+            if code_text:
+                break
+    references = sorted(
+        {
+            match.group(1)
+            for match in re.finditer(r"['\"]([A-Za-z_][A-Za-z0-9_.:-]{1,48})['\"]", code_text)
+        }
+    )[:30]
+    observed_set = {value.lower() for value in observed}
+    absent = [value for value in references if value.lower() not in observed_set][:15]
+    excerpt = next((item.body for item in evidence if item.body), "")
+    return (
+        f"Usable source count: {len(evidence)}\n"
+        f"Observed source summaries: {truncate_text(' | '.join(summaries), 1800)}\n"
+        f"Current parser references: {', '.join(references) or '<not recovered from prior reads/edits>'}\n"
+        f"Parser identifiers absent from observed structure: {', '.join(absent) or '<none detected>'}\n"
+        f"Representative source excerpt: {truncate_text(excerpt, 1500)}"
+    )
+
+
+def reset_parser_mismatch_convergence(state: AgentState, result: ToolResult) -> None:
+    if result.tool != "run_command" or result.exit_code != 0 or ZERO_RECORD_RE.search(result.output):
+        return
+    commands = list(state.task_contract.must_run_commands if state.task_contract is not None else [])
+    observed = str((result.metadata or {}).get("command") or "")
+    if not commands or not commands_equivalent(observed, str(commands[0])):
+        return
+    for signature in list(state.failure_signatures):
+        if signature.startswith("parser_source_mismatch:"):
+            state.failure_signatures.pop(signature, None)
 
 
 SOURCE_FILE_EXTENSIONS = {
@@ -2368,9 +2557,7 @@ def duplicate_inspection_pressure_tool_block(state: AgentState, workflow: Any, t
 
 
 def duplicate_inspection_required_command_retarget(state: AgentState, workflow: Any) -> str:
-    if getattr(workflow, "diff_exists", False):
-        return ""
-    if successful_edit_tool_called(state) or edit_tool_attempted(state):
+    if workflow.phase != WorkflowPhase.TEST_REQUIRED or not getattr(workflow, "diff_exists", False):
         return ""
     contract = state.task_contract
     commands = list(contract.must_run_commands if contract is not None else [])

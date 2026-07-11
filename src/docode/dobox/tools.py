@@ -266,8 +266,30 @@ class DoBoxTools:
         path_error = workspace_path_error(path)
         if path_error:
             return rejected_tool_result("read_file", path_error, {"path": path})
-        file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+        try:
+            file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+        except Exception as exc:
+            return ToolResult(
+                tool="read_file",
+                output=f"unable to read {path}: {type(exc).__name__}: {exc}",
+                exit_code=1,
+                metadata={"path": path, "error": "path_not_readable", "suggestion": "Use list_files for directories."},
+            )
         if isinstance(file_result, FileResult):
+            expected = normalized_workspace_absolute_path(path)
+            resolved = normalized_workspace_absolute_path(file_result.path or path)
+            if file_result.path and resolved != expected:
+                return ToolResult(
+                    tool="read_file",
+                    output=f"{path} is a directory; use list_files instead.",
+                    exit_code=1,
+                    metadata={
+                        "path": path,
+                        "resolved_path": file_result.path,
+                        "error": "path_is_directory",
+                        "suggestion": "list_files",
+                    },
+                )
             metadata: dict[str, Any] = {"path": path}
             if file_result.path is not None:
                 metadata["resolved_path"] = file_result.path
@@ -601,6 +623,15 @@ def workspace_path_error(path: str, *, label: str = "path") -> str | None:
     if normalized == ".." or normalized.startswith("../"):
         return f"{label} must stay under {WORKSPACE_ROOT}"
     return None
+
+
+def normalized_workspace_absolute_path(path: str) -> str:
+    normalized = posixpath.normpath(str(path or "").strip())
+    if normalized == WORKSPACE_ROOT:
+        return WORKSPACE_ROOT
+    if normalized.startswith(WORKSPACE_ROOT + "/"):
+        return normalized
+    return posixpath.normpath(posixpath.join(WORKSPACE_ROOT, normalized))
 
 
 def rejected_tool_result(tool: str, reason: str, metadata: dict[str, Any]) -> ToolResult:

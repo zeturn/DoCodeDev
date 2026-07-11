@@ -39,6 +39,7 @@ class AgentState:
     last_failed_command: str | None = None
     source_inspection_auto_attempted_urls: set[str] = field(default_factory=set)
     source_inspection_excerpt_presented: bool = False
+    terminal_repair_reason: str | None = None
 
     def add_observation(self, content: str) -> None:
         self.messages.append({"role": "system", "kind": "observation", "content": content})

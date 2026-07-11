@@ -109,7 +109,7 @@ class ContextManager:
             repo_map=clip_text(repo_map, 700 if compact_mode else section_bytes),
             working_memory=clip_text(working_memory, 900 if compact_mode else section_bytes),
             file_memory=clip_text(file_memory, 700 if compact_mode else (3_000 if repair_active else section_bytes)),
-            source_inspection=clip_text(source_inspection, 2_600 if include_source_body else 1_000),
+            source_inspection=clip_text(source_inspection, 6_000 if include_source_body else 3_500),
             action_summary=clip_text(action_summary, 900 if compact_mode else 1_600),
             latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else (8_000 if repair_active else section_bytes)),
             recent_messages=recent_messages,
@@ -236,26 +236,39 @@ class ContextManager:
                 ]
             )
             return "\n".join(lines)
-        latest = evidence[-1]
+        usable = [item for item in evidence if item.usable]
+        excerpt_total = 0
         lines.extend(
             [
-                f"Status: {'successful' if latest.successful else 'failed'}",
-                f"Requested URL: {latest.requested_url}",
-                f"Final URL: {latest.final_url}",
-                f"HTTP status: {latest.status_code}",
-                f"Execution scope: {latest.execution_scope or '<missing>'}",
-                f"Mode: {latest.mode}",
-                f"Before first edit: {latest.before_first_edit}",
+                f"Status: {'usable' if usable else 'failed'}",
+                "source_memory_included: true",
+                f"usable_source_count: {len(usable)}",
             ]
         )
-        if latest.error:
-            lines.append(f"Error: {latest.error}")
-        if include_body and latest.body:
-            lines.extend(["Raw source excerpt (shown once):", clip_text(latest.body, 1_800)])
-        elif latest.successful:
-            lines.append("The raw body was already shown; use this evidence without requesting the same URL again.")
-        else:
-            lines.append("Do not guess a parser. inspect_source may try a different literal candidate; fetch/search may supplement diagnosis.")
+        for number, item in enumerate(usable, start=1):
+            limit = (2_500 if item.source_role == "initial" else 1_500) if include_body else (900 if item.source_role == "initial" else 600)
+            excerpt = clip_text(item.body, limit) if item.body else ""
+            excerpt_total += len(excerpt.encode("utf-8"))
+            lines.extend(
+                [
+                    "",
+                    f"Source {number} — {item.source_role}",
+                    f"URL: {item.requested_url}",
+                    f"Final URL: {item.final_url}",
+                    "Status: usable",
+                    f"HTTP status: {item.status_code}",
+                    f"Content type: {(item.structure_summary or {}).get('kind', '<unknown>')}",
+                    f"Structure summary: {json.dumps(item.structure_summary or {}, ensure_ascii=False)}",
+                ]
+            )
+            if item.parent_url:
+                lines.append(f"Parent URL: {item.parent_url}")
+            if excerpt:
+                lines.extend(["Retained source excerpt:", excerpt])
+        failed = [item for item in evidence if not item.usable]
+        if failed:
+            lines.append(f"Optional failed inspections: {len(failed)} (successful source memory above remains usable).")
+        lines.append(f"source_excerpt_bytes: {excerpt_total}")
         return "\n".join(lines)
 
     def action_summary(

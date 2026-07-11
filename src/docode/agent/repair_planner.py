@@ -37,6 +37,8 @@ class RepairAction:
     rerun_commands: list[str] = field(default_factory=list)
     exploration_forbidden: bool = True
     initial_inspection_budget: int = 2
+    failure_class: str = ""
+    producer_semantic_result: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +52,8 @@ class RepairAction:
             "rerun_commands": self.rerun_commands,
             "exploration_forbidden": self.exploration_forbidden,
             "initial_inspection_budget": self.initial_inspection_budget,
+            "failure_class": self.failure_class,
+            "producer_semantic_result": self.producer_semantic_result,
         }
 
 
@@ -640,6 +644,10 @@ def format_repair_action(action: RepairAction, repeated_count: int = 1) -> str:
         "",
         action.instruction,
     ]
+    if action.failure_class:
+        lines.append(f"Failure class: {action.failure_class}")
+    if action.producer_semantic_result:
+        lines.append(f"Producer semantic result: {action.producer_semantic_result}")
     if repeated_count >= 2:
         lines.extend(
             [
