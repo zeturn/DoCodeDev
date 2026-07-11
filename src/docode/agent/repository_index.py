@@ -5,8 +5,9 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from .workspace_reader import WorkspaceReader
 
-IGNORED_PARTS = {".git", ".docode", "node_modules", "vendor", "dist", "build", "__pycache__", ".venv", "venv"}
+IGNORED_PARTS = {".git", ".docode", "node_modules", "vendor", "dist", "build", "coverage", "__pycache__", ".venv", "venv", "target", ".generated", ".cache"}
 MANIFEST_NAMES = {"pyproject.toml", "setup.py", "package.json", "go.mod", "cargo.toml", "requirements.txt", "dockerfile"}
 ENTRYPOINT_NAMES = {"main.py", "app.py", "cli.py", "main.go", "index.js", "index.ts", "server.js", "server.ts"}
 
@@ -30,6 +31,71 @@ class RepositoryMap:
     entrypoints: list[str] = field(default_factory=list)
     test_directories: list[str] = field(default_factory=list)
     top_level_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class IndexLimits:
+    maximum_files: int = 2500
+    maximum_file_bytes: int = 256_000
+    maximum_total_bytes: int = 8_000_000
+    maximum_symbols: int = 20_000
+    maximum_depth: int = 12
+
+
+@dataclass(slots=True)
+class RepositoryContext:
+    repository_map: RepositoryMap
+    files: list[str]
+    symbols: list[SymbolRecord]
+    parse_failures: list[str] = field(default_factory=list)
+    total_bytes: int = 0
+    truncated: bool = False
+
+
+async def build_remote_repository_index(reader: WorkspaceReader, limits: IndexLimits | None = None) -> RepositoryContext:
+    limits = limits or IndexLimits()
+    entries = await reader.list_files(".")
+    files: list[str] = []
+    symbols: list[SymbolRecord] = []
+    failures: list[str] = []
+    total = 0
+    extensions: Counter[str] = Counter()
+    for entry in entries:
+        path = entry.path.strip("./").replace("\\", "/")
+        parts = path.split("/")
+        if not entry.is_file or len(parts) > limits.maximum_depth or any(part in IGNORED_PARTS for part in parts):
+            continue
+        if path.endswith((".min.js", ".min.css", ".lock", "package-lock.json")):
+            continue
+        if len(files) >= limits.maximum_files or total >= limits.maximum_total_bytes:
+            break
+        text = await reader.read_file(path, limits.maximum_file_bytes)
+        if not text or "\x00" in text:
+            continue
+        size = len(text.encode("utf-8"))
+        if total + size > limits.maximum_total_bytes:
+            break
+        files.append(path)
+        total += size
+        extensions[Path(path).suffix.lower() or "[no extension]"] += 1
+        before = len(symbols)
+        if path.endswith(".py"):
+            symbols.extend(_python_symbols(text, path))
+        elif Path(path).suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            symbols.extend(_regex_symbols(text, path, r"^\s*(?:export\s+)?(?:async\s+)?(function|class)\s+([A-Za-z_$][\w$]*)"))
+        elif path.endswith(".go"):
+            symbols.extend(_regex_symbols(text, path, r"^\s*(func|type)\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)"))
+        if Path(path).suffix in {".py", ".js", ".jsx", ".ts", ".tsx", ".go"} and len(symbols) == before and text.strip():
+            failures.append(path)
+        if len(symbols) >= limits.maximum_symbols:
+            symbols = symbols[: limits.maximum_symbols]
+            break
+    manifests = [path for path in files if Path(path).name.lower() in MANIFEST_NAMES]
+    entrypoints = [path for path in files if Path(path).name.lower() in ENTRYPOINT_NAMES]
+    tests = sorted({str(Path(path).parent).replace("\\", "/") for path in files if Path(path).name.startswith("test_") or "test" in Path(path).parent.name.lower()})
+    top = Counter(path.split("/", 1)[0] for path in files)
+    repo_map = RepositoryMap("/workspace", dict(extensions), manifests, entrypoints, tests, dict(top))
+    return RepositoryContext(repo_map, files, symbols, failures, total, len(files) < len(entries))
 
 
 class RepositoryIndex:
