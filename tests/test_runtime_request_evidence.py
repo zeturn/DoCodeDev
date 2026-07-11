@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from docode.agent.artifact_contract import ArtifactSemanticContract
 from docode.agent.artifact_validator import ExecutionEvidence, validate_remote_artifact
 from docode.runtime.execution_evidence import RecordedRequest, RequestEvidencePolicy, RuntimeRequestEvidence, validate_runtime_requests
+from tests.runtime_v2_release_eval.fixture_service import RequestLogStore
 
 
 def request(run_id: str, request_id: str, path: str, query: str = "", cursor: str | None = None) -> RecordedRequest:
@@ -38,6 +39,19 @@ class RuntimeRequestEvidenceTests(unittest.TestCase):
         reader = SimpleNamespace(read_file=lambda path, limit: async_value("[]"))
         result = asyncio.run(validate_remote_artifact(reader, "out.json", contract, ExecutionEvidence(request_paths=("/feed",))))
         self.assertIn("runtime_request_evidence_missing", result.failures)
+
+    def test_fixture_log_is_isolated_by_case_and_run(self) -> None:
+        store = RequestLogStore()
+        store.reset("html", "run-1")
+        store.reset("html", "run-2")
+        store.record(case_id="html", run_id="run-1", method="GET", path="/page", raw_query="page=1", headers={"Authorization": "secret", "User-Agent": "crawler"})
+        self.assertEqual(1, len(store.requests("html", "run-1")))
+        self.assertEqual(0, len(store.requests("html", "run-2")))
+        self.assertNotIn("authorization", store.requests("html", "run-1")[0].headers_subset)
+
+    def test_fixture_log_rejects_uninitialized_run(self) -> None:
+        with self.assertRaises(KeyError):
+            RequestLogStore().record(case_id="html", run_id="unknown", method="GET", path="/")
 
 
 async def async_value(value: str) -> str:
