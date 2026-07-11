@@ -30,10 +30,13 @@ class RuntimeComponentsIntegrationTests(IsolatedAsyncioTestCase):
         self.assertIs(state.verification_scheduler, loop.runtime_components.verification_scheduler)
         self.assertIs(state.repair_coordinator, loop.runtime_components.repair_coordinator)
         self.assertEqual(set(state.task_graph.nodes), {"understand", "plan", "implement", "verify", "review"})
+        bootstrap = loop.repository.add_step.await_args.args[2]
+        self.assertEqual(bootstrap["runtime_components"]["profile"], "crawler")
 
         state.add_tool_result(ToolResult("write_file", "ok", metadata={"path": "producer.py"}))
         self.assertEqual(state.edit_epoch, 1)
         self.assertEqual(state.verification_scheduler.edit_epoch, 1)
+        self.assertEqual(state.task_graph.nodes["implement"].status, TaskStatus.DONE)
         command = state.verification_scheduler.next_command()
         state.add_tool_result(ToolResult("run_command", "ok", metadata={"command": command}))
         self.assertTrue(state.verification_scheduler.is_fresh_success(command))

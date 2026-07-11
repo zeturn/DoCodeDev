@@ -19,6 +19,7 @@ from docode.storage.models import CodingJob
 @dataclass(frozen=True, slots=True)
 class ContextPack:
     task_contract: str
+    runtime_context: str
     repo_map: str
     working_memory: str
     file_memory: str
@@ -30,6 +31,7 @@ class ContextPack:
     def render(self) -> str:
         sections = [
             ("Task Contract", self.task_contract),
+            ("Runtime Profile and Task Graph", self.runtime_context),
             ("Repo Map", self.repo_map),
             ("Working Memory", self.working_memory),
             ("File Memory", self.file_memory),
@@ -62,6 +64,9 @@ class ContextManager:
         targeted_repair_phase: str | None = None,
         workflow_phase: str | None = None,
         include_source_body: bool = True,
+        profile: Any | None = None,
+        repository_context: Any | None = None,
+        task_graph: Any | None = None,
     ) -> ContextPack:
         repair_active = repair_mode == "targeted_repair" and active_repair_action is not None
         compact_mode = (workflow_phase in {"EDIT_REQUIRED", "TEST_REQUIRED", "FINAL_READY"}) and not repair_active
@@ -106,6 +111,7 @@ class ContextManager:
         ]
         return ContextPack(
             task_contract=clip_text(task_contract_text, 1_600 if compact_mode else section_bytes),
+            runtime_context=clip_text(self.runtime_context(profile, repository_context, task_graph), 2_400),
             repo_map=clip_text(repo_map, 700 if compact_mode else section_bytes),
             working_memory=clip_text(working_memory, 900 if compact_mode else section_bytes),
             file_memory=clip_text(file_memory, 700 if compact_mode else (3_000 if repair_active else section_bytes)),
@@ -114,6 +120,38 @@ class ContextManager:
             latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else (8_000 if repair_active else section_bytes)),
             recent_messages=recent_messages,
         )
+
+    def runtime_context(self, profile: Any | None, repository_context: Any | None, task_graph: Any | None) -> str:
+        parts: list[str] = []
+        if profile is not None:
+            parts.append(
+                "Active Profile:\n"
+                f"- name: {profile.name}\n"
+                f"- source_inspection_required: {profile.source_inspection_required}\n"
+                f"- allowed_source_schemes: {', '.join(profile.allowed_source_schemes) or 'none'}\n"
+                f"- source_request_limit: {profile.budget_policy.maximum_source_requests}\n"
+                f"- identical_failure_limit: {profile.repair_policy.maximum_identical_failures}"
+            )
+        if repository_context is not None:
+            repo_map = repository_context.repository_map
+            parts.append(
+                "Repository Summary:\n"
+                f"- files_indexed: {len(repository_context.files)}\n"
+                f"- symbols_indexed: {len(repository_context.symbols)}\n"
+                f"- languages: {json.dumps(repo_map.languages, sort_keys=True)}\n"
+                f"- entrypoints: {', '.join(repo_map.entrypoints[:12]) or 'none'}\n"
+                f"- manifests: {', '.join(repo_map.manifests[:12]) or 'none'}\n"
+                "Relevant Symbols:\n"
+                + "\n".join(f"- {item.kind} {item.symbol} ({item.file}:{item.start_line})" for item in repository_context.symbols[:20])
+            )
+        if task_graph is not None:
+            ready = {node.id for node in task_graph.ready()}
+            lines = []
+            for node in task_graph.nodes.values():
+                marker = "current/ready" if node.id in ready else node.status.value
+                lines.append(f"- {node.id}: {marker}; goal={node.goal}; verification={', '.join(node.verification) or 'none'}")
+            parts.append("Task Graph:\n" + "\n".join(lines))
+        return "\n\n".join(parts)
 
     def task_contract(
         self,

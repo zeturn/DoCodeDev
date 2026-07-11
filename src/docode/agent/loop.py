@@ -25,6 +25,8 @@ from docode.agent.repair_planner import (
 )
 from docode.agent.reviewer import CodeReviewer, ReviewResult
 from docode.agent.runtime_components import RuntimeComponents, build_runtime_components
+from docode.agent.repository_index import build_remote_repository_index
+from docode.agent.workspace_reader import DoBoxWorkspaceReader
 from docode.agent.source_inspection import (
     attempted_source_urls,
     crawler_source_inspection_required,
@@ -972,6 +974,9 @@ class CodingAgentLoop:
         state.repository_context = components.repository_context
         state.task_graph = components.task_graph
         state.finalization_controller = components.finalization_controller
+        if state.profile.context_policy.use_repository_index and all(hasattr(self.tools, name) for name in ("list_files", "read_file", "search")):
+            state.repository_context = await build_remote_repository_index(DoBoxWorkspaceReader(self.tools))
+            components.repository_context = state.repository_context
         inspection = await self.inspector.inspect(state.job.instruction, self.tools, state.task_contract)
         state.inspection = inspection
         await self.repository.add_step(
@@ -989,6 +994,13 @@ class CodingAgentLoop:
                     "must_modify_files": state.task_contract.must_modify_files,
                     "must_run_commands": state.task_contract.must_run_commands,
                     "forbidden_finish_conditions": state.task_contract.forbidden_finish_conditions,
+                },
+                "runtime_components": {
+                    "profile": state.profile.name,
+                    "repository_files": len(state.repository_context.files) if state.repository_context is not None else 0,
+                    "repository_symbols": len(state.repository_context.symbols) if state.repository_context is not None else 0,
+                    "task_nodes": list(state.task_graph.nodes) if state.task_graph is not None else [],
+                    "verification_commands": [node.command for node in state.verification_scheduler.commands],
                 },
             },
         )
@@ -1025,6 +1037,9 @@ class CodingAgentLoop:
             targeted_repair_phase=state.targeted_repair_phase,
             workflow_phase=workflow.phase.value if hasattr(workflow.phase, "value") else str(workflow.phase),
             include_source_body=include_source_body,
+            profile=state.profile,
+            repository_context=state.repository_context,
+            task_graph=state.task_graph,
         )
         return context_pack
 

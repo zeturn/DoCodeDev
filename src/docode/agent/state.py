@@ -13,6 +13,7 @@ from docode.agent.finalization_controller import FinalizationController
 from docode.agent.profiles import TaskProfile
 from docode.agent.repair_coordinator import RepairCoordinator
 from docode.agent.task_graph import TaskGraph
+from docode.agent.task_graph import TaskStatus
 from docode.agent.verification_scheduler import VerificationScheduler
 from docode.dobox.types import ToolResult
 from docode.storage.models import CodingJob
@@ -83,10 +84,29 @@ class AgentState:
             self.edit_epoch += 1
             if self.verification_scheduler is not None:
                 self.verification_scheduler.mark_edit()
+            if self.task_graph is not None:
+                if "understand" in self.task_graph.nodes:
+                    self.task_graph.set_status("understand", TaskStatus.DONE)
+                if "plan" in self.task_graph.nodes:
+                    self.task_graph.set_status("plan", TaskStatus.DONE)
+                if "implement" in self.task_graph.nodes:
+                    self.task_graph.set_status("implement", TaskStatus.DONE)
+                if "verify" in self.task_graph.nodes:
+                    self.task_graph.set_status("verify", TaskStatus.PENDING)
+                if "review" in self.task_graph.nodes:
+                    self.task_graph.set_status("review", TaskStatus.PENDING)
+        elif result.tool in {"read_file", "read_file_range", "read_symbol", "search"} and result.ok and self.task_graph is not None:
+            if "understand" in self.task_graph.nodes:
+                self.task_graph.set_status("understand", TaskStatus.DONE)
+            if "plan" in self.task_graph.nodes:
+                self.task_graph.set_status("plan", TaskStatus.DONE)
         if result.tool == "run_command" and self.verification_scheduler is not None:
             command = str(metadata.get("command") or "")
             if command:
                 self.verification_scheduler.record(command, result.ok)
+                if self.task_graph is not None and "verify" in self.task_graph.nodes:
+                    complete = self.verification_scheduler.next_command() is None
+                    self.task_graph.set_status("verify", TaskStatus.DONE if complete else (TaskStatus.PENDING if result.ok else TaskStatus.BLOCKED))
         self.consecutive_failures = self.consecutive_failures + 1 if not result.ok else 0
 
     def add_feedback(self, content: str) -> None:
