@@ -36,6 +36,20 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install build
       - run: python -m build --wheel
+      - run: python -m venv /tmp/docode-wheel
+      - run: /tmp/docode-wheel/bin/pip install dist/*.whl
+      - run: /tmp/docode-wheel/bin/python -c "import docode; assert docode.__version__ == '0.2.0'"
+      - run: /tmp/docode-wheel/bin/docode --help
+
+  integration-lite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[dev]"
+      - run: PYTHONPATH=src python -m unittest tests.test_runtime_components_integration tests.test_runner_e2e
 
   eval-smoke:
     runs-on: ubuntu-latest
