@@ -1304,7 +1304,7 @@ def runnable_python_files(instruction: str, python_files: list[str]) -> list[str
 def runnable_python_entrypoints(python_files: list[str]) -> list[str]:
     excluded_parts = {"/test_", "/tests/", "\\test_", "\\tests\\"}
     candidates = [path for path in python_files if not any(part in path for part in excluded_parts)]
-    preferred = [path for path in candidates if path.endswith(("main.py", "cli.py", "crawler.py", "scraper.py"))]
+    preferred = [path for path in candidates if path.endswith(("main.py", "cli.py", "app.py", "service.py"))]
     return preferred or candidates[:1]
 
 

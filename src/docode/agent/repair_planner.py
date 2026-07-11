@@ -83,15 +83,8 @@ INVALID_INT_LITERAL_RE = re.compile(
 )
 
 FIELD_DEFAULT_HINTS = {
-    "language": '""',
-    "description": '""',
-    "repository": '""',
     "url": '"https://..."',
-    "stars": "0",
-    "forks": "0",
-    "stars_today": "0",
     "name": '""',
-    "owner": '""',
     "id": '""',
     "title": '""',
     "status": '""',
@@ -293,7 +286,7 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
             "5. Do not call web_search or fetch_url for this repair.\n"
             f"6. Rerun exactly: `{rerun}`."
         ),
-        initial_inspection_budget=0 if field in {"stars_today", "stars", "forks", "total_stars", "owner", "repository", "repository_name"} else 1,
+        initial_inspection_budget=1,
     )
 
 
@@ -524,15 +517,11 @@ def plan_json_semantic_failure(*, output: str, command: str) -> RepairAction | N
     markers = (
         "json_required_field_empty",
         "json_url_invalid",
-        "json_github_url_invalid",
         "json_records_empty",
         "json_repository_invalid",
         "json_repository_invalid_format",
         "json_repository_url_mismatch",
         "required field",
-        "repository is empty",
-        "repository has invalid format",
-        "does not match url",
         "url is empty",
     )
     if not any(marker in lowered for marker in markers):

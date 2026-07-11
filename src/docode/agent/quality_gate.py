@@ -4,7 +4,9 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlparse
 
+from docode.agent.artifact_contract import extract_artifact_contract
 from docode.agent.task_contract import TaskContract
 from docode.agent.verifier import changed_paths_from_status, meaningful_change_path
 from docode.dobox.tools import DoBoxTools
@@ -238,14 +240,12 @@ THIRD_PARTY_IMPORTS = {
 }
 
 
-GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 JSON_PRODUCER_ISSUE_CODES = {
     "json_artifact_unexpected_shape",
     "json_records_empty",
     "json_record_not_object",
     "json_required_field_empty",
     "json_required_field_dirty",
-    "json_github_url_invalid",
     "json_repository_invalid_format",
     "json_repository_url_mismatch",
 }
@@ -404,7 +404,8 @@ def inspect_json_records(records: list[Any], path: str, instruction: str, *, pro
             )
         ]
     issues: list[QualityIssue] = []
-    required_fields = inferred_required_json_fields(instruction)
+    contract = extract_artifact_contract(instruction)
+    required_fields = list(dict.fromkeys([*contract.required_fields, *contract.non_empty_fields]))
     for index, row in enumerate(records[:10]):
         if not isinstance(row, dict):
             issues.append(
@@ -418,9 +419,9 @@ def inspect_json_records(records: list[Any], path: str, instruction: str, *, pro
             )
             continue
         for field in required_fields:
-            value = github_repository_value(row) if field == "__github_repository__" else row.get(field)
+            value = row.get(field)
             if value is None or value == "":
-                label = "repository_name/repository/name" if field == "__github_repository__" else field
+                label = field
                 issues.append(
                     json_producer_issue(
                         code="json_required_field_empty",
@@ -431,7 +432,7 @@ def inspect_json_records(records: list[Any], path: str, instruction: str, *, pro
                     )
                 )
             elif isinstance(value, str) and dirty_required_value(value):
-                label = "repository_name/repository/name" if field == "__github_repository__" else field
+                label = field
                 issues.append(
                     json_producer_issue(
                         code="json_required_field_dirty",
@@ -441,42 +442,19 @@ def inspect_json_records(records: list[Any], path: str, instruction: str, *, pro
                         repair_hint=f"Do not hand-edit the JSON output. Fix the parser/fetcher so it normalizes {label}; derive stable identifiers from URLs or structured attributes instead of raw text.",
                     )
                 )
-        url = row.get("url")
-        repository = github_repository_value(row)
-        if "github" in instruction.lower():
-            if isinstance(url, str) and not url.startswith("https://github.com/"):
+        for field in contract.absolute_url_fields:
+            value = row.get(field)
+            parsed = urlparse(str(value or ""))
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 issues.append(
                     json_producer_issue(
-                        code="json_github_url_invalid",
+                        code="json_url_invalid",
                         artifact_path=path,
                         producer_path=producer_path,
-                        message=f"JSON artifact {path} row {index} has invalid GitHub URL: {url}",
-                        repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher to build absolute GitHub repository URLs from the repository heading href, then rerun the command that writes the artifact.",
+                        message=f"JSON artifact {path} row {index} has non-absolute URL field {field}: {value}",
+                        repair_hint=f"Do not hand-edit the JSON output. Fix the producer to resolve {field} against source final URL, then rerun the producer command.",
                     )
                 )
-            if isinstance(repository, str) and repository:
-                if not GITHUB_REPO_RE.match(repository):
-                    issues.append(
-                        json_producer_issue(
-                            code="json_repository_invalid_format",
-                            artifact_path=path,
-                            producer_path=producer_path,
-                            message=f"JSON artifact {path} row {index} repository identifier has invalid format, got {preview(repository)}",
-                            repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher to derive the repository owner and name from the same href used for the URL.",
-                        )
-                    )
-                elif isinstance(url, str) and url.startswith("https://github.com/"):
-                    expected_url = f"https://github.com/{repository}"
-                    if url.rstrip("/") != expected_url:
-                        issues.append(
-                            json_producer_issue(
-                                code="json_repository_url_mismatch",
-                                artifact_path=path,
-                                producer_path=producer_path,
-                                message=f"JSON artifact {path} row {index} repository {repository!r} does not match url {url!r}",
-                                repair_hint="Do not hand-edit the JSON output. Fix the parser/fetcher so repository and url are derived from the same source href.",
-                            )
-                        )
     return dedupe_issues(issues)
 
 
@@ -501,16 +479,8 @@ def json_producer_issue(
 
 
 def inferred_required_json_fields(instruction: str) -> list[str]:
-    lowered = instruction.lower()
-    if github_repository_json_task(lowered):
-        return ["__github_repository__", "url"]
-    return []
-
-
-def github_repository_json_task(lowered_instruction: str) -> bool:
-    return "github" in lowered_instruction and any(
-        keyword in lowered_instruction for keyword in ("trending", "repository", "repositories", "repo")
-    )
+    contract = extract_artifact_contract(instruction)
+    return list(dict.fromkeys([*contract.required_fields, *contract.non_empty_fields]))
 
 
 def json_path_explicitly_requested(path: str, instruction: str) -> bool:
@@ -519,21 +489,6 @@ def json_path_explicitly_requested(path: str, instruction: str) -> bool:
         if match.strip("./").replace("\\", "/").lower() == normalized:
             return True
     return False
-
-
-def github_repository_value(row: dict[str, Any]) -> Any:
-    for key in ("repository", "name"):
-        value = row.get(key)
-        if value not in {None, ""}:
-            return value
-    owner = row.get("owner")
-    name = row.get("repository_name") or row.get("repo") or row.get("project")
-    if owner and name:
-        return f"{owner}/{name}"
-    value = row.get("repository_name")
-    if value not in {None, ""}:
-        return value
-    return None
 
 
 def dirty_required_value(value: str) -> bool:

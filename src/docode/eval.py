@@ -646,18 +646,18 @@ def default_eval_scenarios() -> list[EvalScenario]:
             category="crawler",
             instruction="Build a small crawler that parses fixtures/source.html and writes data/output.json with at least 2 records.",
             files={
-                "crawler.py": "from pathlib import Path\n\nSOURCE = Path('fixtures/source.html')\nOUTPUT = Path('data/output.json')\n\ndef main():\n    OUTPUT.parent.mkdir(exist_ok=True)\n    OUTPUT.write_text('[]\\n', encoding='utf-8')\n\nif __name__ == '__main__':\n    main()\n",
+                "collector.py": "from pathlib import Path\n\nSOURCE = Path('fixtures/source.html')\nOUTPUT = Path('data/output.json')\n\ndef main():\n    OUTPUT.parent.mkdir(exist_ok=True)\n    OUTPUT.write_text('[]\\n', encoding='utf-8')\n\nif __name__ == '__main__':\n    main()\n",
                 "fixtures/source.html": "<html><body><ul><li data-name='alpha'>Alpha</li><li data-name='beta'>Beta</li></ul></body></html>\n",
                 "README.md": "# Crawler Fixture\n",
             },
             expected_checks=[
-                EvalCheck(type="command", command="python3 crawler.py"),
+                EvalCheck(type="command", command="python3 collector.py"),
                 EvalCheck(type="json_len_at_least", path="data/output.json", min_len=2),
             ],
             hints={
-                "target_files": ["crawler.py"],
+                "target_files": ["collector.py"],
                 "expected_behavior": "data/output.json should contain at least two records parsed from fixtures/source.html.",
-                "suggested_commands": ["python3 crawler.py", "python3 -c \"import json; assert len(json.load(open('data/output.json'))) >= 2\""],
+                "suggested_commands": ["python3 collector.py", "python3 -c \"import json; assert len(json.load(open('data/output.json'))) >= 2\""],
             },
         ),
         EvalScenario(

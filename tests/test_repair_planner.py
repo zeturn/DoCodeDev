@@ -255,7 +255,7 @@ def test_key_error_missing_required_field_repair() -> None:
     assert action.target_files == ["main.py"]
     assert "forks" in action.instruction
     assert "parser function itself" in action.instruction
-    assert "forks: default 0" in action.instruction
+    assert "forks" in action.instruction
     assert action.rerun_commands == ["python3 -m unittest discover -s tests"]
 
 
@@ -269,7 +269,7 @@ def test_assertion_not_found_missing_required_field_repair() -> None:
     assert action is not None
     assert action.category == "missing_required_field"
     assert "language" in action.instruction
-    assert "language: default \"\"" in action.instruction
+    assert "language" in action.instruction
 
 
 def test_missing_required_field_merges_multiple_fields() -> None:
@@ -353,7 +353,7 @@ def test_empty_actual_value_mismatch_repair() -> None:
     assert "Expected value: `owner`" in action.instruction
 
 
-def test_stars_today_mismatch_forces_direct_repair() -> None:
+def test_field_mismatch_keeps_bounded_inspection() -> None:
     action = plan_repair_from_tool_result(
         tool="run_command",
         output=(
@@ -369,7 +369,7 @@ def test_stars_today_mismatch_forces_direct_repair() -> None:
     assert action is not None
     assert action.category == "parsed_value_mismatch"
     assert "Field under test: `stars_today`" in action.instruction
-    assert action.initial_inspection_budget == 0
+    assert action.initial_inspection_budget == 1
 
 
 def test_fixture_owner_sample_mismatch_targets_fixture_first() -> None:

@@ -50,7 +50,7 @@ def extract_artifact_contract(instruction: str) -> ArtifactSemanticContract:
         contract.non_empty_fields.append(match.group(1))
     for match in re.finditer(r"\bnullable\s+([a-z_][\w]*)|\b([a-z_][\w]*)\s+(?:may be null|is nullable)\b", lowered):
         contract.nullable_fields.append(next(group for group in match.groups() if group))
-    for match in re.finditer(r"\b(?:absolute\s+)?([a-z_][\w]*(?:url|uri|link))\s+(?:must be\s+)?absolute\b|\babsolute\s+([a-z_][\w]*(?:url|uri|link))\b", lowered):
+    for match in re.finditer(r"\b([a-z_][\w]*)\s+(?:must be\s+)?absolute\b|\babsolute\s+([a-z_][\w]*)\b", lowered):
         contract.absolute_url_fields.append(next(group for group in match.groups() if group))
     unique = re.search(r"\b(?:deduplicate|unique)\s+(?:by|on)\s+([a-z_][\w]*)", lowered)
     if unique:

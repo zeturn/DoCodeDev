@@ -584,7 +584,7 @@ Expected behavior:
 - support `--output` to write JSON results
 - support `--dry-run` for a one-shot verification run
 """,
-    "crawler.py": """from __future__ import annotations
+    "collector.py": """from __future__ import annotations
 
 import argparse
 import json
@@ -677,7 +677,7 @@ async def bootstrap_task_workspace(
                 "git init && "
                 "git config user.email 'dev@docode.ai' && "
                 "git config user.name 'Docode' && "
-                "git add README.md crawler.py fixtures/sample_source.html && "
+                "git add README.md collector.py fixtures/sample_source.html && "
                 "git commit -m 'Initialize crawler scaffold'"
             ),
         ],
