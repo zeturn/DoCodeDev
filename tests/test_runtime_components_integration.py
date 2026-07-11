@@ -43,6 +43,26 @@ class RuntimeComponentsIntegrationTests(IsolatedAsyncioTestCase):
         validator = state.verification_scheduler.next_command()
         self.assertEqual(validator, "python validate.py out.json")
 
+    async def test_unrelated_read_and_edit_do_not_complete_task_nodes(self) -> None:
+        job = CodingJob(id="runtime-v2-evidence", user_id="test", instruction="Modify producer.py")
+        state = AgentState(job)
+        from docode.agent.runtime_components import build_runtime_components
+        components = build_runtime_components(job.instruction)
+        state.task_graph = components.task_graph
+        state.verification_scheduler = components.verification_scheduler
+
+        state.add_tool_result(ToolResult("read_file", "docs", metadata={"path": "README.md"}))
+        state.add_tool_result(ToolResult("write_file", "ok", metadata={"path": "notes.txt"}))
+
+        self.assertEqual(state.task_graph.nodes["understand"].status, TaskStatus.PENDING)
+        self.assertEqual(state.task_graph.nodes["implement"].status, TaskStatus.PENDING)
+
+    async def test_task_node_cannot_be_forced_done_without_evidence(self) -> None:
+        from docode.agent.runtime_components import build_runtime_components
+        graph = build_runtime_components("Modify producer.py").task_graph
+        with self.assertRaises(ValueError):
+            graph.set_status("implement", TaskStatus.DONE)
+
 
 if __name__ == "__main__":
     import unittest

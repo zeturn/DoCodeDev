@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from .artifact_contract import ArtifactSemanticContract
 from .workspace_reader import WorkspaceReader
+from docode.runtime.execution_evidence import RuntimeRequestEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class ExecutionEvidence:
     validator_epoch: int | None = None
     validator_sequence: int | None = None
     request_paths: tuple[str, ...] = ()
+    runtime_requests: RuntimeRequestEvidence | None = None
 
 
 def validate_artifact(path: str | Path, contract: ArtifactSemanticContract) -> ArtifactValidationResult:
@@ -52,10 +54,13 @@ async def validate_remote_artifact(reader: WorkspaceReader, path: str, contract:
         failures.append("validator_stale")
     if execution.validator_sequence is not None and execution.producer_sequence is not None and execution.validator_sequence <= execution.producer_sequence:
         failures.append("validator_before_producer")
-    if contract.expected_request_count is not None and len(execution.request_paths) != contract.expected_request_count:
-        failures.append(f"request_count:{len(execution.request_paths)}!={contract.expected_request_count}")
+    request_paths = tuple(item.path_with_query for item in execution.runtime_requests.requests) if execution.runtime_requests is not None else ()
+    if contract.expected_request_count is not None and execution.runtime_requests is None:
+        failures.append("runtime_request_evidence_missing")
+    elif contract.expected_request_count is not None and len(request_paths) != contract.expected_request_count:
+        failures.append(f"request_count:{len(request_paths)}!={contract.expected_request_count}")
     for expected in contract.expected_request_paths:
-        if expected not in execution.request_paths:
+        if execution.runtime_requests is None or expected not in request_paths:
             failures.append(f"request_path_missing:{expected}")
     return ArtifactValidationResult(not failures, tuple(dict.fromkeys(failures)), result.sample, result.record_count)
 

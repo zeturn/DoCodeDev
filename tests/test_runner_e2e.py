@@ -283,7 +283,7 @@ class RunnerE2ETests(IsolatedAsyncioTestCase):
 
             completed = await repo.get_job(job.id)
             assert completed is not None
-            self.assertEqual(completed.status, JobStatus.SUCCEEDED)
+            self.assertEqual(completed.status, JobStatus.SUCCEEDED, completed.failure_reason)
             self.assertEqual(completed.dobox_project_id, "project-1")
             self.assertEqual(completed.dobox_agent_session_id, "7")
             self.assertIn("DOCODE_RESULT.md", fake_dobox.files)

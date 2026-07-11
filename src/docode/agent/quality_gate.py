@@ -26,6 +26,12 @@ class QualityIssue:
     message: str
     path: str | None = None
     repair_hint: str | None = None
+    producer_targets: tuple[str, ...] = ()
+    producer_command_id: str | None = None
+    producer_command: str | None = None
+    validator_id: str | None = None
+    evidence_refs: tuple[str, ...] = ()
+    artifact_ownership: Literal["generated", "source_owned"] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +40,12 @@ class QualityIssue:
             "message": self.message,
             "path": self.path,
             "repair_hint": self.repair_hint,
+            "producer_targets": list(self.producer_targets),
+            "producer_command_id": self.producer_command_id,
+            "producer_command": self.producer_command,
+            "validator_id": self.validator_id,
+            "evidence_refs": list(self.evidence_refs),
+            "artifact_ownership": self.artifact_ownership,
         }
 
 
@@ -116,7 +128,14 @@ class QualityGate:
                 semantic = await validate_remote_artifact(reader, path, semantic_contract, evidence)
                 if not semantic.passed:
                     issues.extend(
-                        QualityIssue("blocker", "artifact_semantic_failure", f"Artifact semantic invariant failed: {failure}", path, "Fix the producer source, rerun the producer, then rerun dependent validation.")
+                        QualityIssue(
+                            "blocker", "artifact_semantic_failure", f"Artifact semantic invariant failed: {failure}", path,
+                            "Fix the producer source, rerun the producer, then rerun dependent validation.",
+                            producer_targets=tuple(task_contract.must_modify_files if task_contract else ()),
+                            producer_command=next((node.command for node in getattr(execution_evidence, "commands", ()) if getattr(node, "kind", "") == "producer"), None),
+                            validator_id="artifact_semantic_validator",
+                            evidence_refs=(f"artifact:{path}",), artifact_ownership="generated",
+                        )
                         for failure in semantic.failures
                     )
 

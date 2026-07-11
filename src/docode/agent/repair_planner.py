@@ -39,6 +39,13 @@ class RepairAction:
     initial_inspection_budget: int = 2
     failure_class: str = ""
     producer_semantic_result: str = ""
+    artifact_path: str | None = None
+    artifact_ownership: str | None = None
+    producer_command_id: str | None = None
+    producer_command: str | None = None
+    validator_id: str | None = None
+    failure_details: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +61,13 @@ class RepairAction:
             "initial_inspection_budget": self.initial_inspection_budget,
             "failure_class": self.failure_class,
             "producer_semantic_result": self.producer_semantic_result,
+            "artifact_path": self.artifact_path,
+            "artifact_ownership": self.artifact_ownership,
+            "producer_command_id": self.producer_command_id,
+            "producer_command": self.producer_command,
+            "validator_id": self.validator_id,
+            "failure_details": self.failure_details,
+            "evidence_refs": self.evidence_refs,
         }
 
 

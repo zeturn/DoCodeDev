@@ -87,21 +87,21 @@ class AgentState:
             if self.repair_coordinator is not None and self.repair_mode == "targeted_repair":
                 self.targeted_repair_phase = self.repair_coordinator.record_edit().value
             if self.task_graph is not None:
-                if "understand" in self.task_graph.nodes:
-                    self.task_graph.set_status("understand", TaskStatus.DONE)
-                if "plan" in self.task_graph.nodes:
-                    self.task_graph.set_status("plan", TaskStatus.DONE)
-                if "implement" in self.task_graph.nodes:
-                    self.task_graph.set_status("implement", TaskStatus.DONE)
+                path = str(metadata.get("path") or "").replace("\\", "/")
+                implement = self.task_graph.nodes.get("implement")
+                targets = [item.replace("\\", "/") for item in (implement.target_files if implement else [])]
+                if implement is not None and path and (not targets or any(path == item or path.endswith("/" + item) for item in targets)):
+                    self.task_graph.set_status("implement", TaskStatus.DONE, reason="task-relevant edit succeeded", evidence_refs=[f"edit:{self.edit_epoch}:{path}"])
                 if "verify" in self.task_graph.nodes:
                     self.task_graph.set_status("verify", TaskStatus.PENDING)
                 if "review" in self.task_graph.nodes:
                     self.task_graph.set_status("review", TaskStatus.PENDING)
         elif result.tool in {"read_file", "read_file_range", "read_symbol", "search"} and result.ok and self.task_graph is not None:
-            if "understand" in self.task_graph.nodes:
-                self.task_graph.set_status("understand", TaskStatus.DONE)
-            if "plan" in self.task_graph.nodes:
-                self.task_graph.set_status("plan", TaskStatus.DONE)
+            path = str(metadata.get("path") or metadata.get("file") or "").replace("\\", "/")
+            understand = self.task_graph.nodes.get("understand")
+            targets = [item.replace("\\", "/") for item in (understand.target_files if understand else [])]
+            if understand is not None and path and targets and any(path == item or path.endswith("/" + item) for item in targets):
+                self.task_graph.set_status("understand", TaskStatus.DONE, reason="relevant repository target inspected", evidence_refs=[f"read:{path}"])
         if result.tool == "run_command" and self.verification_scheduler is not None:
             command = str(metadata.get("command") or "")
             if command:
@@ -114,7 +114,9 @@ class AgentState:
                         self.targeted_repair_phase = self.repair_coordinator.record_validator(result.ok).value
                 if self.task_graph is not None and "verify" in self.task_graph.nodes:
                     complete = self.verification_scheduler.next_command() is None
-                    self.task_graph.set_status("verify", TaskStatus.DONE if complete else (TaskStatus.PENDING if result.ok else TaskStatus.BLOCKED))
+                    status = TaskStatus.DONE if complete else (TaskStatus.PENDING if result.ok else TaskStatus.BLOCKED)
+                    refs = [f"command:{self.edit_epoch}:{command}"] if status == TaskStatus.DONE else []
+                    self.task_graph.set_status("verify", status, reason="scheduler command result", evidence_refs=refs)
         self.consecutive_failures = self.consecutive_failures + 1 if not result.ok else 0
 
     def add_feedback(self, content: str) -> None:

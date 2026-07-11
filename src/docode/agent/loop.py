@@ -844,8 +844,8 @@ class CodingAgentLoop:
             state.add_feedback(verification_repair_feedback(verification, state.task_contract))
             state.iteration += 1
             return None
-        if state.task_graph is not None and "verify" in state.task_graph.nodes:
-            state.task_graph.set_status("verify", TaskStatus.DONE)
+        if state.task_graph is not None and "verify" in state.task_graph.nodes and state.verification_scheduler is not None and state.verification_scheduler.next_command() is None:
+            state.task_graph.set_status("verify", TaskStatus.DONE, reason="verification passed with fresh scheduler evidence", evidence_refs=[f"verification:{state.edit_epoch}"])
         await self.repository.add_step(
             job.id,
             "system",
@@ -873,14 +873,18 @@ class CodingAgentLoop:
                     state.add_feedback(review_repair_feedback(review))
                 state.iteration += 1
                 return None
-        if state.task_graph is not None:
-            for node in state.task_graph.nodes.values():
-                node.status = TaskStatus.DONE
+        if state.task_graph is not None and "review" in state.task_graph.nodes and quality.passed and (review is None or review.passed):
+            state.task_graph.set_status("review", TaskStatus.DONE, reason="quality gate and independent review passed", evidence_refs=[f"review:{state.edit_epoch}"])
         if state.repair_coordinator is not None and state.active_repair_action is None and state.repair_mode is None:
-            state.repair_coordinator.phase = RepairPhase.RESOLVED
+            state.repair_coordinator.resolve_if_verified(
+                scheduler_fresh=state.verification_scheduler is None or state.verification_scheduler.next_command() is None,
+                quality_passed=quality.passed,
+                review_passed=review is None or review.passed,
+                edit_epoch=state.edit_epoch,
+            )
         controller = state.finalization_controller or FinalizationController()
         state.finalization_controller = controller
-        graph_complete = state.task_graph is None or all(node.status == TaskStatus.DONE for node in state.task_graph.nodes.values())
+        graph_complete = state.task_graph is None or state.task_graph.complete()
         final_diff = quality.git_diff or verification.git_diff
         if not final_diff:
             final_diff = (await self.tools.git_diff()).output
@@ -1043,6 +1047,24 @@ class CodingAgentLoop:
             components.repository_context = state.repository_context
         inspection = await self.inspector.inspect(state.job.instruction, self.tools, state.task_contract)
         state.inspection = inspection
+        if state.task_graph is not None:
+            relevant_files = list(state.task_contract.must_modify_files or inspection.important_files)
+            understand_node = state.task_graph.nodes.get("understand")
+            if understand_node is not None and not understand_node.target_files:
+                understand_node.target_files = list(relevant_files)
+            implement_node = state.task_graph.nodes.get("implement")
+            if implement_node is not None and not implement_node.target_files and state.task_contract.must_modify_files:
+                implement_node.target_files = list(state.task_contract.must_modify_files)
+            understand = state.task_graph.nodes.get("understand")
+            if understand is not None:
+                understand_refs = [f"inspection:{path}" for path in relevant_files] or ["inspection:workspace-scan"]
+                state.task_graph.set_status("understand", TaskStatus.DONE, reason="bootstrap workspace inspection completed", evidence_refs=understand_refs)
+            plan = state.task_graph.nodes.get("plan")
+            concrete_plan = list(inspection.plan) or [f"modify {path}" for path in relevant_files]
+            if not concrete_plan and understand is not None and understand.status == TaskStatus.DONE:
+                concrete_plan = ["implement the requested change in the inspected workspace"]
+            if plan is not None and concrete_plan and understand is not None and understand.status == TaskStatus.DONE:
+                state.task_graph.set_status("plan", TaskStatus.DONE, reason="repository-specific implementation plan recorded", evidence_refs=[f"plan:{item}" for item in concrete_plan])
         await self.repository.add_step(
             state.job.id,
             "system",
@@ -1334,22 +1356,13 @@ def artifact_execution_evidence(state: AgentState) -> ExecutionEvidence:
                 producer = evidence
             elif node.kind == "validator":
                 validator = evidence
-    request_paths: list[str] = []
-    for message in state.messages:
-        if message.get("role") != "tool" or message.get("tool") != "inspect_source" or int(message.get("exit_code") or 0) != 0:
-            continue
-        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        if metadata.get("cached"):
-            continue
-        parsed = urlparse(str(metadata.get("final_url") or metadata.get("requested_url") or ""))
-        request_paths.append(parsed.path + (f"?{parsed.query}" if parsed.query else ""))
     return ExecutionEvidence(
         edit_epoch=state.edit_epoch,
         producer_epoch=producer.edit_epoch if producer else None,
         producer_sequence=producer.sequence if producer else None,
         validator_epoch=validator.edit_epoch if validator else None,
         validator_sequence=validator.sequence if validator else None,
-        request_paths=tuple(request_paths),
+        request_paths=(),
     )
 
 
@@ -1860,17 +1873,32 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
     target_files: list[str] = []
     rerun_commands: list[str] = []
     lines = ["Quality gate blocked finalization. Modify the listed target file(s) before running commands again."]
+    generated_without_producer: QualityIssue | None = None
     for issue in blockers:
         path = str(issue.path or "").strip()
         code = str(issue.code or "quality_blocker")
-        repair_path = quality_gate_repair_target(path, code)
-        if repair_path and repair_path not in target_files:
-            target_files.append(repair_path)
+        candidates = list(issue.producer_targets) if issue.artifact_ownership == "generated" else [quality_gate_repair_target(path, code)]
+        for repair_path in candidates:
+            if repair_path and repair_path not in target_files:
+                target_files.append(repair_path)
         where = f" ({path})" if path else ""
         lines.append(f"- [{code}] {issue.message}{where}")
+        if issue.artifact_ownership == "generated" and not issue.producer_targets:
+            generated_without_producer = issue
+            lines.append("  Required phase: locate the producer; do not edit the generated artifact.")
         if issue.repair_hint:
             lines.append(f"  Repair hint: {issue.repair_hint}")
     if not target_files:
+        if generated_without_producer is not None:
+            issue = generated_without_producer
+            return RepairAction(
+                category="artifact_producer_repair", signature="quality:" + str(abs(hash(f"{issue.code}:{issue.message}:{issue.path}")))[:12],
+                reason="locate_artifact_producer", target_files=[], allowed_tools=["search", "read_file", "read_file_range", "read_symbol", "git_diff", "git_status"],
+                forbidden_tools=["edit_file", "write_file", "replace_in_file", "apply_patch", "run_command"], instruction="\n".join(lines),
+                artifact_path=issue.path, artifact_ownership="generated", producer_command_id=issue.producer_command_id,
+                producer_command=issue.producer_command, validator_id=issue.validator_id, failure_details=issue.message,
+                evidence_refs=list(issue.evidence_refs),
+            )
         issue_text = "\n".join(f"{issue.code}: {issue.message}" for issue in blockers)
         return plan_repair_from_tool_result(
             tool="run_command",
@@ -1878,6 +1906,7 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
             metadata={},
         )
     signature_source = "|".join(f"{issue.code}:{issue.message}:{issue.path}" for issue in blockers)
+    primary = blockers[0]
     return RepairAction(
         category="quality_gate_repair",
         signature="quality:" + str(abs(hash(signature_source)))[:12],
@@ -1899,6 +1928,13 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
         rerun_commands=rerun_commands,
         exploration_forbidden=True,
         initial_inspection_budget=1,
+        artifact_path=primary.path,
+        artifact_ownership=primary.artifact_ownership,
+        producer_command_id=primary.producer_command_id,
+        producer_command=primary.producer_command,
+        validator_id=primary.validator_id,
+        failure_details=primary.message,
+        evidence_refs=list(primary.evidence_refs),
     )
 
 

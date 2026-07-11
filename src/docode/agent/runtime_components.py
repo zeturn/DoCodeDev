@@ -31,11 +31,11 @@ def build_runtime_components(instruction: str) -> RuntimeComponents:
     scheduler = VerificationScheduler.from_explicit_commands(task_contract.must_run_commands)
     graph = TaskGraph(
         [
-            TaskNode("understand", "Understand relevant repository interfaces and constraints"),
-            TaskNode("plan", "Plan the minimal dependency-aware change", dependencies=["understand"]),
-            TaskNode("implement", "Implement the requested change", dependencies=["plan"]),
-            TaskNode("verify", "Run required verification", dependencies=["implement"], verification=list(task_contract.must_run_commands)),
-            TaskNode("review", "Review the changed-file impact", dependencies=["verify"]),
+            TaskNode("understand", "Understand relevant repository interfaces and constraints", target_files=list(task_contract.must_modify_files), acceptance_criteria=["relevant repository evidence collected"]),
+            TaskNode("plan", "Plan the minimal dependency-aware change", dependencies=["understand"], acceptance_criteria=["repository-specific plan recorded"]),
+            TaskNode("implement", "Implement the requested change", target_files=list(task_contract.must_modify_files), dependencies=["plan"], acceptance_criteria=["task-relevant target modified"]),
+            TaskNode("verify", "Run required verification", dependencies=["implement"], verification=list(task_contract.must_run_commands), acceptance_criteria=["all required commands fresh at current edit epoch"]),
+            TaskNode("review", "Review the changed-file impact", dependencies=["verify"], acceptance_criteria=["quality and semantic review passed"]),
         ]
     )
     return RuntimeComponents(
