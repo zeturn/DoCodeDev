@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from docode.agent.context import ContextManager, ContextPack, target_file_guidance
 from docode.agent.artifact_validator import ExecutionEvidence
+from docode.agent.finalization_controller import ExportCompletionState, FinalizationController, PreExportFinalizationState
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
@@ -31,6 +32,7 @@ from docode.agent.workspace_reader import DoBoxWorkspaceReader
 from docode.agent.verification_scheduler import VerificationScheduler
 from docode.agent.profiles import select_task_profile
 from docode.agent.repair_coordinator import RepairPhase
+from docode.agent.task_graph import TaskStatus
 from docode.agent.source_inspection import (
     attempted_source_urls,
     crawler_source_inspection_required,
@@ -841,6 +843,8 @@ class CodingAgentLoop:
             state.add_feedback(verification_repair_feedback(verification, state.task_contract))
             state.iteration += 1
             return None
+        if state.task_graph is not None and "verify" in state.task_graph.nodes:
+            state.task_graph.set_status("verify", TaskStatus.DONE)
         await self.repository.add_step(
             job.id,
             "system",
@@ -868,6 +872,38 @@ class CodingAgentLoop:
                     state.add_feedback(review_repair_feedback(review))
                 state.iteration += 1
                 return None
+        if state.task_graph is not None:
+            for node in state.task_graph.nodes.values():
+                node.status = TaskStatus.DONE
+        if state.repair_coordinator is not None and state.active_repair_action is None and state.repair_mode is None:
+            state.repair_coordinator.phase = RepairPhase.RESOLVED
+        controller = state.finalization_controller or FinalizationController()
+        state.finalization_controller = controller
+        graph_complete = state.task_graph is None or all(node.status == TaskStatus.DONE for node in state.task_graph.nodes.values())
+        final_diff = quality.git_diff or verification.git_diff
+        if not final_diff:
+            final_diff = (await self.tools.git_diff()).output
+        changed_files = tuple(dict.fromkeys([*changed_paths_from_status(status.output), *changed_files_from_diff(final_diff)]))
+        changed_files = tuple(dict.fromkeys([*changed_files, *successful_edit_paths(state)]))
+        required_files = tuple(state.task_contract.must_modify_files if state.task_contract is not None else [])
+        pre_export = controller.evaluate_pre_export(
+            PreExportFinalizationState(
+                changed_files=changed_files,
+                required_files=required_files,
+                diff=final_diff,
+                explicit_commands_fresh=state.verification_scheduler is None or state.verification_scheduler.next_command() is None,
+                semantic_contract_passed=quality.passed,
+                repair_cleared=state.repair_coordinator is None or state.repair_coordinator.phase in {RepairPhase.INSPECT_ALLOWED, RepairPhase.RESOLVED},
+                stale_verification=state.verification_scheduler is not None and state.verification_scheduler.next_command() is not None,
+                task_graph_complete=graph_complete,
+                review_passed=review is None or review.passed,
+                summary=final_summary,
+            )
+        )
+        await self.repository.add_step(job.id, "system", {"type": "pre_export_finalization", "passed": pre_export.ready, "failures": list(pre_export.failures)})
+        if not pre_export.ready:
+            await self.record_rejected_decision(state, reason="pre_export_finalization_failed", detail="; ".join(pre_export.failures))
+            return None
         await self.repository.add_step(
             job.id,
             "system",
@@ -883,6 +919,10 @@ class CodingAgentLoop:
             )
             raise
         artifact_id = terminal_artifact_id(artifacts)
+        export_completion = controller.evaluate_export(ExportCompletionState(artifact_id, len(artifacts)))
+        await self.repository.add_step(job.id, "system", {"type": "export_completion", "passed": export_completion.ready, "failures": list(export_completion.failures), "artifact_id": artifact_id})
+        if not export_completion.ready:
+            return await self.fail(job.id, "finalization_export_incomplete")
         await self.repository.add_step(
             job.id,
             "system",
@@ -1263,6 +1303,18 @@ class CodingAgentLoop:
         if not state.messages:
             return []
         return [compact_llm_message(message) for message in state.messages[-4:]]
+
+
+def successful_edit_paths(state: AgentState) -> list[str]:
+    paths: list[str] = []
+    for message in state.messages:
+        if message.get("role") != "tool" or message.get("tool") not in EDIT_TOOLS or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if path and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def artifact_execution_evidence(state: AgentState) -> ExecutionEvidence:
