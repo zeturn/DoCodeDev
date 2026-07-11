@@ -246,6 +246,7 @@ JSON_PRODUCER_ISSUE_CODES = {
     "json_record_not_object",
     "json_required_field_empty",
     "json_required_field_dirty",
+    "json_url_invalid",
     "json_repository_invalid_format",
     "json_repository_url_mismatch",
 }

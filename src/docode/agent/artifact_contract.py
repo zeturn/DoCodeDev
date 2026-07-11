@@ -42,10 +42,17 @@ def extract_artifact_contract(instruction: str) -> ArtifactSemanticContract:
         contract.exact_record_count = int(exact.group(1))
     if minimum:
         contract.minimum_record_count = int(minimum.group(1))
-    field_match = re.search(r"\b(?:with|fields?[:=]|containing)\s+([a-z_][\w]*(?:\s*,\s*[a-z_][\w]*)+(?:\s*(?:,?\s*and)\s*[a-z_][\w]*)?)", lowered)
+    field_match = re.search(r"\b(?:with|fields?\s*[:=]|containing)\s+([^.;\n]+)", lowered)
     if field_match:
-        fields = re.split(r"\s*,\s*|\s+(?:and)\s+", field_match.group(1))
-        contract.required_fields = list(dict.fromkeys(field.strip() for field in fields if field.strip()))
+        fields: list[str] = []
+        for item in re.split(r"\s*,\s*|\s+(?:and)\s+", field_match.group(1)):
+            words = re.findall(r"[a-z_][\w]*", item)
+            words = [word for word in words if word not in {"field", "fields"}]
+            if words and words[0] in {"integer", "int", "string", "text", "numeric", "number", "boolean", "bool", "nullable"}:
+                words = words[1:]
+            if len(words) == 1:
+                fields.append(words[0])
+        contract.required_fields = list(dict.fromkeys(fields))
     for match in re.finditer(r"\b([a-z_][\w]*)\s+(?:must be\s+)?(?:non[- ]empty|required and non[- ]empty)\b", lowered):
         contract.non_empty_fields.append(match.group(1))
     for match in re.finditer(r"\bnullable\s+([a-z_][\w]*)|\b([a-z_][\w]*)\s+(?:may be null|is nullable)\b", lowered):
