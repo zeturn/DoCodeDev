@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from docode.agent.context import ContextManager, ContextPack, target_file_guidance
+from docode.agent.artifact_validator import ExecutionEvidence
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
@@ -776,7 +777,13 @@ class CodingAgentLoop:
                 workflow_state=gate.snapshot.to_dict(),
             )
             return None
-        quality = await self.quality_gate.run(tools=self.tools, task_contract=state.task_contract, instruction=job.instruction)
+        quality_kwargs: dict[str, Any] = {"tools": self.tools, "task_contract": state.task_contract, "instruction": job.instruction}
+        quality_parameters = inspect.signature(self.quality_gate.run).parameters
+        if "artifact_contract" in quality_parameters:
+            quality_kwargs["artifact_contract"] = state.artifact_contract
+        if "execution_evidence" in quality_parameters:
+            quality_kwargs["execution_evidence"] = artifact_execution_evidence(state)
+        quality = await self.quality_gate.run(**quality_kwargs)
         state.quality_gate_attempts += 1
         state.last_quality_gate = quality.to_dict()
         await self.repository.add_step(job.id, "system", quality.to_dict())
@@ -1257,6 +1264,38 @@ class CodingAgentLoop:
         if not state.messages:
             return []
         return [compact_llm_message(message) for message in state.messages[-4:]]
+
+
+def artifact_execution_evidence(state: AgentState) -> ExecutionEvidence:
+    scheduler = state.verification_scheduler
+    producer = None
+    validator = None
+    if scheduler is not None:
+        for node in scheduler.commands:
+            evidence = scheduler.evidence.get(node.command)
+            if evidence is None or not evidence.passed:
+                continue
+            if node.kind == "producer":
+                producer = evidence
+            elif node.kind == "validator":
+                validator = evidence
+    request_paths: list[str] = []
+    for message in state.messages:
+        if message.get("role") != "tool" or message.get("tool") != "inspect_source" or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if metadata.get("cached"):
+            continue
+        parsed = urlparse(str(metadata.get("final_url") or metadata.get("requested_url") or ""))
+        request_paths.append(parsed.path + (f"?{parsed.query}" if parsed.query else ""))
+    return ExecutionEvidence(
+        edit_epoch=state.edit_epoch,
+        producer_epoch=producer.edit_epoch if producer else None,
+        producer_sequence=producer.sequence if producer else None,
+        validator_epoch=validator.edit_epoch if validator else None,
+        validator_sequence=validator.sequence if validator else None,
+        request_paths=tuple(request_paths),
+    )
 
 
 def verification_to_dict(result: VerificationResult) -> dict[str, object]:

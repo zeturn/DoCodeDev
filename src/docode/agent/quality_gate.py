@@ -7,6 +7,9 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from docode.agent.artifact_contract import extract_artifact_contract
+from docode.agent.artifact_contract import ArtifactSemanticContract
+from docode.agent.artifact_validator import ExecutionEvidence, validate_remote_artifact
+from docode.agent.workspace_reader import DoBoxWorkspaceReader
 from docode.agent.task_contract import TaskContract
 from docode.agent.verifier import changed_paths_from_status, meaningful_change_path
 from docode.dobox.tools import DoBoxTools
@@ -79,6 +82,8 @@ class QualityGate:
         tools: DoBoxTools,
         task_contract: TaskContract | None,
         instruction: str,
+        artifact_contract: ArtifactSemanticContract | None = None,
+        execution_evidence: ExecutionEvidence | None = None,
     ) -> QualityGateResult:
         await safe_optional_tool_call("run_command", tools, "git add -N . >/dev/null 2>&1 || true", "/workspace")
         status_result = await safe_tool_call("git_status", tools.git_status)
@@ -103,6 +108,17 @@ class QualityGate:
         issues.extend(artifact_issues)
         samples.extend(artifact_samples)
         issues.extend(await inspect_markdown_artifacts(tools, task_contract))
+        semantic_contract = artifact_contract or extract_artifact_contract(instruction)
+        if semantic_contract.artifact_paths:
+            reader = DoBoxWorkspaceReader(tools)
+            evidence = execution_evidence or ExecutionEvidence()
+            for path in semantic_contract.artifact_paths:
+                semantic = await validate_remote_artifact(reader, path, semantic_contract, evidence)
+                if not semantic.passed:
+                    issues.extend(
+                        QualityIssue("blocker", "artifact_semantic_failure", f"Artifact semantic invariant failed: {failure}", path, "Fix the producer source, rerun the producer, then rerun dependent validation.")
+                        for failure in semantic.failures
+                    )
 
         blockers = [issue for issue in issues if issue.severity == "blocker"]
         return QualityGateResult(

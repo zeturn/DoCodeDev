@@ -22,6 +22,7 @@ class CommandEvidence:
     command: str
     edit_epoch: int
     passed: bool
+    sequence: int = 0
 
 
 class VerificationScheduler:
@@ -29,6 +30,7 @@ class VerificationScheduler:
         self.commands = commands
         self.edit_epoch = 0
         self.evidence: dict[str, CommandEvidence] = {}
+        self.sequence = 0
 
     @classmethod
     def from_explicit_commands(cls, commands: list[str]) -> "VerificationScheduler":
@@ -48,7 +50,8 @@ class VerificationScheduler:
         self.edit_epoch += 1
 
     def record(self, command: str, passed: bool) -> None:
-        self.evidence[command] = CommandEvidence(command, self.edit_epoch, passed)
+        self.sequence += 1
+        self.evidence[command] = CommandEvidence(command, self.edit_epoch, passed, self.sequence)
 
     def is_fresh_success(self, command: str) -> bool:
         evidence = self.evidence.get(command)

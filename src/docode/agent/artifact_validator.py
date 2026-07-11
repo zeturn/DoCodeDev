@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .artifact_contract import ArtifactSemanticContract
+from .workspace_reader import WorkspaceReader
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,15 +18,54 @@ class ArtifactValidationResult:
     record_count: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionEvidence:
+    edit_epoch: int = 0
+    producer_epoch: int | None = None
+    producer_sequence: int | None = None
+    validator_epoch: int | None = None
+    validator_sequence: int | None = None
+    request_paths: tuple[str, ...] = ()
+
+
 def validate_artifact(path: str | Path, contract: ArtifactSemanticContract) -> ArtifactValidationResult:
     artifact = Path(path)
     failures: list[str] = []
     if not artifact.is_file():
         return ArtifactValidationResult(False, (f"artifact_missing:{artifact}",))
     try:
-        value = json.loads(artifact.read_text(encoding="utf-8")) if artifact.suffix.lower() == ".json" else artifact.read_text(encoding="utf-8")
+        content = artifact.read_text(encoding="utf-8")
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return ArtifactValidationResult(False, (f"artifact_unparseable:{type(exc).__name__}:{exc}",))
+    return validate_artifact_content(content, str(artifact), contract)
+
+
+async def validate_remote_artifact(reader: WorkspaceReader, path: str, contract: ArtifactSemanticContract, execution: ExecutionEvidence) -> ArtifactValidationResult:
+    content = await reader.read_file(path, 2_000_000)
+    if not content:
+        return ArtifactValidationResult(False, (f"artifact_missing_or_empty:{path}",))
+    result = validate_artifact_content(content, path, contract)
+    failures = list(result.failures)
+    if execution.producer_epoch is not None and execution.producer_epoch != execution.edit_epoch:
+        failures.append("producer_stale")
+    if execution.validator_epoch is not None and execution.validator_epoch != execution.edit_epoch:
+        failures.append("validator_stale")
+    if execution.validator_sequence is not None and execution.producer_sequence is not None and execution.validator_sequence <= execution.producer_sequence:
+        failures.append("validator_before_producer")
+    if contract.expected_request_count is not None and len(execution.request_paths) != contract.expected_request_count:
+        failures.append(f"request_count:{len(execution.request_paths)}!={contract.expected_request_count}")
+    for expected in contract.expected_request_paths:
+        if expected not in execution.request_paths:
+            failures.append(f"request_path_missing:{expected}")
+    return ArtifactValidationResult(not failures, tuple(dict.fromkeys(failures)), result.sample, result.record_count)
+
+
+def validate_artifact_content(content: str, path: str, contract: ArtifactSemanticContract) -> ArtifactValidationResult:
+    try:
+        value = json.loads(content) if path.lower().endswith(".json") else content
+    except json.JSONDecodeError as exc:
+        return ArtifactValidationResult(False, (f"artifact_unparseable:{type(exc).__name__}:{exc}",))
+    failures: list[str] = []
     if contract.container_type == "list" and not isinstance(value, list):
         failures.append("container_type:list")
     elif contract.container_type == "object" and not isinstance(value, dict):

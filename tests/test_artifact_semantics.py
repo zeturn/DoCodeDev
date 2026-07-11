@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from docode.agent.artifact_contract import ArtifactSemanticContract, extract_artifact_contract
-from docode.agent.artifact_validator import validate_artifact
+from docode.agent.artifact_validator import ExecutionEvidence, validate_artifact, validate_remote_artifact
+from docode.agent.workspace_reader import WorkspaceEntry
 
 
 class ArtifactSemanticTests(unittest.TestCase):
@@ -35,6 +36,20 @@ class ArtifactSemanticTests(unittest.TestCase):
             path.write_text('[{"score": 1.5}, {"score": null}]', encoding="utf-8")
             result = validate_artifact(path, contract)
         self.assertTrue(result.passed, result.failures)
+
+
+class RemoteArtifactSemanticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_validation_checks_semantics_requests_and_freshness(self) -> None:
+        class Reader:
+            async def read_file(self, path: str, max_bytes: int = 256_000) -> str:
+                return '[{"id":"a","url":"/relative"},{"id":"a","url":"https://example.test/b"}]'
+        contract = ArtifactSemanticContract(artifact_paths=["out.json"], container_type="list", exact_record_count=2, absolute_url_fields=["url"], unique_by=["id"], expected_request_count=2, expected_request_paths=["/page/2"])
+        evidence = ExecutionEvidence(edit_epoch=2, producer_epoch=1, producer_sequence=2, validator_epoch=2, validator_sequence=1, request_paths=("/page/1",))
+        result = await validate_remote_artifact(Reader(), "out.json", contract, evidence)
+        self.assertFalse(result.passed)
+        self.assertTrue({"producer_stale", "validator_before_producer", "request_count:1!=2", "request_path_missing:/page/2"} <= set(result.failures))
+        self.assertTrue(any(item.startswith("absolute_url") for item in result.failures))
+        self.assertTrue(any(item.startswith("duplicate") for item in result.failures))
 
 
 if __name__ == "__main__":
