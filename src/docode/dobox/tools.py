@@ -4,6 +4,7 @@ import inspect
 import posixpath
 import difflib
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -404,13 +405,15 @@ class DoBoxTools:
             path = match.group(1).strip()
             if path != "/dev/null" and path not in paths:
                 paths.append(path)
+        metadata = {"patch_bytes": len(patch.encode("utf-8"))}
+        if paths:
+            metadata["paths"] = paths
         return ToolResult(
             tool="apply_patch",
             output=result.output,
             exit_code=result.exit_code,
-            metadata={"patch_bytes": len(patch.encode("utf-8"))},
+            metadata=metadata,
             truncated=result.truncated,
-            metadata={"paths": paths},
         )
 
     async def list_files(self, path: str = ".") -> ToolResult:
