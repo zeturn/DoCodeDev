@@ -55,11 +55,11 @@ def source_result_message(url: str, *, controller_owned: bool = False, cached: b
     }
 
 
-class SourcePipelineHotfixImportTests(TestCase):
-    def test_hotfix_is_installed(self) -> None:
-        self.assertTrue(getattr(loop, "_source_pipeline_hotfix_v1_applied", False), getattr(docode, "__runtime_hotfix_error__", None))
-        self.assertTrue(getattr(docode, "__runtime_hotfix_applied__", False), getattr(docode, "__runtime_hotfix_error__", None))
-        self.assertIsNone(getattr(docode, "__runtime_hotfix_error__", None))
+class SourcePipelineCoreTests(TestCase):
+    def test_package_import_has_no_runtime_patch_state(self) -> None:
+        self.assertEqual(docode.__version__, "0.2.0")
+        self.assertFalse(hasattr(docode, "__runtime_hotfix_applied__"))
+        self.assertFalse(hasattr(loop, "_source_pipeline_hotfix_v1_applied"))
 
     def test_controller_source_evidence_is_successful_before_edit(self) -> None:
         state = crawler_state()
@@ -419,9 +419,9 @@ class VerificationOrderHotfixTests(TestCase):
         self.assertEqual(loop.controller_owned_required_command(state, snapshot), command)
 
     def test_mixed_xml_namespaces_summary_does_not_crash(self) -> None:
-        from docode._runtime_hotfix_source_pipeline import _source_structure_summary
+        from docode.dobox.source_cache import source_structure_summary
 
-        summary = _source_structure_summary(
+        summary = source_structure_summary(
             '<rss xmlns="urn:x" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>x</dc:title></rss>',
             "application/xml",
         )

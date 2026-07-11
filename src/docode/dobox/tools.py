@@ -19,6 +19,7 @@ from .source_inspection import (
     inspect_source_error_payload,
     inspect_source_validation_error,
 )
+from .source_cache import SourceResponseCache, cached_source_result
 from .types import FileResult, ToolResult
 from docode.git_changes import filter_diff_output, filter_status_output
 
@@ -107,6 +108,7 @@ class DoBoxTools:
         self.command_timeout_seconds = command_timeout_seconds
         self.output_limit_bytes = output_limit_bytes
         self.command_overrides = dict(command_overrides or {})
+        self.source_cache = SourceResponseCache()
 
     def set_detected_command(self, name: str, command: str | None) -> None:
         if command:
@@ -211,7 +213,12 @@ class DoBoxTools:
                 metadata={**payload, "rejected": True},
             )
 
-        config = compact_json({"url": normalized_url, "mode": normalized_mode, "max_bytes": max_bytes, "timeout": timeout})
+        cached = self.source_cache.get(normalized_url, normalized_mode, max_bytes)
+        if cached is not None:
+            return cached
+
+        # Fetch a reusable raw response once; text/json/header modes are local views.
+        config = compact_json({"url": normalized_url, "mode": "raw", "max_bytes": max_bytes, "timeout": timeout})
         command = [*INSPECT_SOURCE_COMMAND, INSPECT_SOURCE_PROGRAM, config]
         output_limit = min(1_250_000, max(self.output_limit_bytes, max_bytes * 6 + 16_384))
         try:
@@ -254,13 +261,15 @@ class DoBoxTools:
 
         payload["execution_scope"] = "sandbox"
         metadata = {key: value for key, value in payload.items() if key != "body"}
-        return ToolResult(
+        raw_result = ToolResult(
             tool="inspect_source",
             output=compact_json(payload),
             exit_code=result.exit_code,
             metadata=metadata,
             truncated=bool(payload.get("truncated")),
         )
+        stored = self.source_cache.put(normalized_url, raw_result)
+        return stored if normalized_mode == "raw" else cached_source_result(stored, normalized_mode, cached=False)
 
     async def read_file(self, path: str) -> ToolResult:
         path_error = workspace_path_error(path)
@@ -376,7 +385,6 @@ class DoBoxTools:
             metadata=result.metadata,
             truncated=result.truncated,
         )
-
     async def apply_patch(self, patch: str) -> ToolResult:
         if not isinstance(patch, str) or not patch.strip():
             return ToolResult(tool="apply_patch", output="patch must be a non-empty unified diff string", exit_code=2)

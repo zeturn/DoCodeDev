@@ -32,6 +32,7 @@ from docode.agent.source_inspection import (
     successful_source_inspection,
 )
 from docode.agent.state import AgentState
+from docode.agent.source_policy import continuation_allowed, source_progress_forced, source_tool_block
 from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.task_contract import TaskContract, heredoc_delimiter_from_command, is_crawler_instruction, task_contract_from_instruction
@@ -39,6 +40,7 @@ from docode.agent.verifier import CodingVerifier, VerificationResult, changed_fi
 from docode.agent.workflow import (
     WorkflowPhase,
     changed_paths_from_status,
+    command_was_run,
     commands_equivalent,
     display_command,
     final_candidate_gate,
@@ -1910,10 +1912,15 @@ def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) ->
 
 def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState) -> list[Any]:
     refresh_targeted_repair_phase(state)
-    if successful_source_inspection(state.messages, state.job.instruction) is not None:
+    source_continuation = continuation_allowed(state)
+    if successful_source_inspection(state.messages, state.job.instruction) is not None and not source_continuation:
         definitions = [definition for definition in definitions if getattr(definition, "name", None) != "inspect_source"]
+    if source_progress_forced(state):
+        return [definition for definition in definitions if getattr(definition, "name", None) in (EDIT_TOOLS | LOCAL_INSPECTION_TOOLS)]
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         allowed = targeted_repair_allowed_tools_for_phase(state) - targeted_repair_hard_forbidden_tools(state)
+        if source_continuation:
+            allowed.add("inspect_source")
         return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     workflow = workflow_snapshot(state, status_output)
@@ -1938,6 +1945,8 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState
 
 def repair_mode_tool_block(state: AgentState, tool_name: str) -> str:
     refresh_targeted_repair_phase(state)
+    if tool_name == "inspect_source" and continuation_allowed(state):
+        return ""
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         if tool_name in targeted_repair_hard_forbidden_tools(state):
             return repair_mode_forbidden_detail(state, tool_name)
@@ -2484,6 +2493,8 @@ def normalize_workspace_path(path: str) -> str:
 
 
 def required_test_tool_block(state: AgentState, workflow: Any, tool_name: str, args: dict[str, object]) -> str:
+    if tool_name == "inspect_source" and continuation_allowed(state, getattr(workflow, "phase", None)):
+        return ""
     if workflow.phase != WorkflowPhase.TEST_REQUIRED:
         return ""
     missing = getattr(workflow, "missing_commands", None) or []
@@ -2621,6 +2632,8 @@ def cached_read_excerpt(state: AgentState, index: int | None, *, max_lines: int 
 
 
 def duplicate_inspection_edit_forced(state: AgentState, workflow: Any) -> bool:
+    if source_progress_forced(state):
+        return True
     if workflow.phase != WorkflowPhase.EDIT_REQUIRED or getattr(workflow, "diff_exists", False):
         return False
     return not successful_edit_tool_called(state) and duplicate_inspection_rejection_count(state) > 0
@@ -2701,8 +2714,11 @@ def controller_owned_required_command(state: AgentState, workflow: Any) -> str:
     if state.active_repair_action:
         if state.repair_mode != "targeted_repair" or not targeted_repair_modified_target(state):
             return ""
-        rerun = next_targeted_repair_rerun_command(state)
-        command = next((item for item in contract_commands if commands_equivalent(item, rerun)), "")
+        if is_crawler_instruction(state.job.instruction):
+            command = next((item for item in contract_commands if not command_was_run(state, item)), "")
+        else:
+            rerun = next_targeted_repair_rerun_command(state)
+            command = next((item for item in contract_commands if commands_equivalent(item, rerun)), "")
     else:
         if state.repair_mode is not None or workflow.phase != WorkflowPhase.TEST_REQUIRED:
             return ""
@@ -2715,6 +2731,8 @@ def controller_owned_required_command(state: AgentState, workflow: Any) -> str:
 
     if not command or not any(commands_equivalent(command, item) for item in contract_commands):
         return ""
+    if is_crawler_instruction(state.job.instruction):
+        return command
     if "\n" not in command and heredoc_delimiter_from_command(command) is None:
         return ""
     return command
@@ -2791,6 +2809,11 @@ def patch_paths(patch: str) -> list[str]:
 
 
 def crawler_external_source_tool_block(state: AgentState, tool_name: str, args: dict[str, object]) -> str:
+    policy_block = source_tool_block(state, tool_name, args)
+    if policy_block or tool_name == "inspect_source":
+        return policy_block
+    if tool_name in EDIT_TOOLS:
+        return ""
     if not is_crawler_instruction(state.job.instruction):
         return ""
     allowed = instruction_source_domains(state.job.instruction)
