@@ -428,3 +428,101 @@ class VerificationOrderHotfixTests(TestCase):
 
         self.assertEqual(summary["kind"], "xml")
         self.assertEqual(summary["namespace_prefixes"], ["dc", "default"])
+
+
+class EvidenceBackedRepairTests(IsolatedAsyncioTestCase):
+    def repair_state(self) -> AgentState:
+        state = crawler_state(url="http://127.0.0.1:8765/feed")
+        state.task_contract = SimpleNamespace(
+            must_run_commands=["python collector.py source out.json", "python validate.py"],
+            must_modify_files=["collector.py"],
+        )
+        state.messages.extend(
+            [
+                {
+                    "role": "tool",
+                    "tool": "write_file",
+                    "exit_code": 0,
+                    "output": "+ collection = payload.get('items', [])",
+                    "metadata": {"path": "collector.py"},
+                },
+                {
+                    "role": "tool",
+                    "tool": "run_command",
+                    "exit_code": 0,
+                    "output": "wrote 0 records",
+                    "metadata": {"command": "python collector.py source out.json"},
+                },
+            ]
+        )
+        return state
+
+    def test_zero_record_validator_failure_creates_source_backed_parser_mismatch(self) -> None:
+        state = self.repair_state()
+        result = ToolResult(
+            tool="run_command",
+            output="Traceback\nAssertionError: 0",
+            exit_code=1,
+            metadata={"command": "python validate.py"},
+        )
+
+        action = loop.parser_source_mismatch_repair(state, result)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.failure_class, "parser_source_mismatch")
+        self.assertEqual(action.producer_semantic_result, "zero_records")
+        self.assertIn("source/parser diagnosis", action.instruction)
+        self.assertIn("next_cursor", action.instruction)
+        self.assertEqual(action.rerun_commands[0], "python collector.py source out.json")
+
+    async def test_third_identical_parser_mismatch_becomes_non_convergent(self) -> None:
+        state = self.repair_state()
+        result = ToolResult(
+            tool="run_command",
+            output="AssertionError: 0",
+            exit_code=1,
+            metadata={"command": "python validate.py"},
+        )
+        action = loop.parser_source_mismatch_repair(state, result)
+        agent = object.__new__(loop.CodingAgentLoop)
+        agent.repository = SimpleNamespace(add_step=AsyncMock())
+
+        await agent.activate_targeted_repair(state, action, result)
+        await agent.activate_targeted_repair(state, action, result)
+        await agent.activate_targeted_repair(state, action, result)
+
+        self.assertEqual(state.terminal_repair_reason, "repeated_zero_record_parser_failure")
+        self.assertEqual(state.failure_signatures[action.signature], 3)
+
+    def test_non_empty_producer_resets_parser_mismatch_convergence(self) -> None:
+        state = self.repair_state()
+        state.failure_signatures["parser_source_mismatch:collector.py:zero_records"] = 2
+        result = ToolResult(
+            tool="run_command",
+            output="wrote 4 records",
+            exit_code=0,
+            metadata={"command": "python collector.py source out.json"},
+        )
+
+        loop.reset_parser_mismatch_convergence(state, result)
+
+        self.assertEqual(state.failure_signatures, {})
+
+    async def test_invalid_source_tool_feedback_can_be_recorded_without_outer_iteration_increment(self) -> None:
+        state = crawler_state()
+        agent = object.__new__(loop.CodingAgentLoop)
+        agent.repository = SimpleNamespace(add_step=AsyncMock())
+        agent.usage_meter = None
+
+        await agent.record_unavailable_tool_requested(
+            state,
+            requested_tool="inspect_source",
+            requested_args={"url": "http://127.0.0.1:8765/feed"},
+            available_tools=["read_file", "write_file"],
+            workflow_state={"phase": "EDIT_REQUIRED"},
+            increment_iteration=False,
+            reason="source_inspection_complete_edit_required",
+        )
+
+        self.assertEqual(state.iteration, 0)
+        self.assertIn("must edit", state.messages[-1]["content"])

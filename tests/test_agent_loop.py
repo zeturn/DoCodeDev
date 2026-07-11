@@ -1692,7 +1692,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
         self.assertEqual(allowed, {"read_file", "edit_file", "write_file", "git_status"})
         self.assertEqual(block, "")
 
-    async def test_duplicate_read_with_required_command_retargets_to_run_command(self) -> None:
+    async def test_duplicate_read_with_clean_diff_does_not_retarget_to_required_command(self) -> None:
         with TemporaryDirectory() as tmp:
             repo = InMemoryJobRepository()
             job = await repo.create_job(
@@ -1716,11 +1716,7 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
 
         steps = await repo.list_steps(job.id)
         retargeted = [step for step in steps if step.content.get("type") == "decision_retargeted"]
-        self.assertTrue(retargeted)
-        self.assertEqual(retargeted[0].content["reason"], "inspection_loop_requires_test_evidence")
-        self.assertEqual(retargeted[0].content["from_tool"], "read_file")
-        self.assertEqual(retargeted[0].content["to_tool"], "run_command")
-        self.assertEqual(retargeted[0].content["command"], "echo checked")
+        self.assertFalse(retargeted)
         run_results = [
             step
             for step in steps
@@ -1728,9 +1724,19 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             and step.content.get("tool") == "run_command"
             and (step.content.get("metadata") or {}).get("command") == "echo checked"
         ]
-        self.assertTrue(run_results)
+        self.assertFalse(run_results)
         rejected = [step for step in steps if step.content.get("type") == "decision_rejected"]
         self.assertFalse(any(step.content.get("reason") == "duplicate_inspection_after_edit_pressure" for step in rejected))
+
+    def test_duplicate_read_may_retarget_only_when_test_required_with_diff(self) -> None:
+        state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))
+        state.task_contract = TaskContract(must_modify_files=["app.py"], must_run_commands=["python validate.py"])
+        state.messages.append({"role": "tool", "tool": "edit_file", "exit_code": 0, "metadata": {"path": "app.py"}})
+        workflow = SimpleNamespace(phase=WorkflowPhase.TEST_REQUIRED, diff_exists=True)
+
+        command = duplicate_inspection_required_command_retarget(state, workflow)
+
+        self.assertEqual(command, "python validate.py")
 
     def test_duplicate_read_without_required_command_returns_cached_result_without_failure(self) -> None:
         state = AgentState(job=CodingJob(id=new_id("job"), user_id="u1", instruction="Fix app.py"))

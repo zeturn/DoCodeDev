@@ -365,6 +365,25 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
             {"path": "large.txt", "resolved_path": "/workspace/large.txt", "file_name": "large.txt", "bytes": 7},
         )
 
+    async def test_read_file_directory_result_is_structured_and_never_returns_nested_git_file(self) -> None:
+        class DirectoryClient(FakeDoBoxClient):
+            async def read_file(self, project_id, path, agent_session_id=None):
+                return FileResult(
+                    content="commit message",
+                    path="/workspace/.git/COMMIT_EDITMSG" if path == "/workspace" else "/workspace/pkg/module.py",
+                    file_name="COMMIT_EDITMSG",
+                )
+
+        tools = DoBoxTools(DirectoryClient(), "p1")
+
+        root = await tools.read_file("/workspace")
+        nested = await tools.read_file("pkg")
+
+        self.assertEqual(root.exit_code, 1)
+        self.assertEqual(nested.exit_code, 1)
+        self.assertEqual(root.metadata["error"], "path_is_directory")
+        self.assertNotIn("commit message", root.output)
+
     async def test_tool_calls_include_agent_session_id(self) -> None:
         client = FakeDoBoxClient()
         tools = DoBoxTools(client, "project-123", agent_session_id="session-7")

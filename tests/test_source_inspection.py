@@ -105,6 +105,33 @@ Verification commands:
 
         self.assertFalse(source_inspection_evidence(messages, instruction)[0].before_first_edit)
 
+    def test_same_origin_derived_source_is_usable_but_does_not_satisfy_initial_gate(self) -> None:
+        instruction = "crawl http://127.0.0.1:8765/items?cursor="
+        derived = {
+            "role": "tool",
+            "tool": "inspect_source",
+            "exit_code": 0,
+            "output": json.dumps(
+                {
+                    "requested_url": "http://127.0.0.1:8765/items?cursor=two",
+                    "final_url": "http://127.0.0.1:8765/items?cursor=two",
+                    "status_code": 200,
+                    "execution_scope": "sandbox",
+                    "mode": "raw",
+                    "body": '{"items":[2]}',
+                    "structure_summary": {"kind": "json_object", "top_level_keys": ["items"]},
+                }
+            ),
+        }
+
+        evidence = source_inspection_evidence([derived], instruction)[0]
+
+        self.assertTrue(evidence.usable)
+        self.assertTrue(evidence.successful)
+        self.assertEqual(evidence.source_role, "derived")
+        self.assertFalse(evidence.satisfies_initial_requirement)
+        self.assertIsNone(successful_source_inspection([derived], instruction))
+
 
 class ControllerSourceInspectionTests(IsolatedAsyncioTestCase):
     async def test_controller_inspects_primary_source_once_and_records_evidence(self) -> None:
