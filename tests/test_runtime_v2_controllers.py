@@ -2,7 +2,8 @@ import unittest
 
 from docode.agent.failure_taxonomy import FailureCategory, TerminalResult
 from docode.agent.finalization_controller import FinalizationController, FinalizationState
-from docode.agent.repair_coordinator import RepairAction, RepairCoordinator, RepairPhase
+from docode.agent.repair_coordinator import RepairCoordinator, RepairPhase
+from docode.agent.repair_planner import RepairAction
 from docode.agent.verification_scheduler import VerificationScheduler
 
 
@@ -22,7 +23,7 @@ class RuntimeV2ControllerTests(unittest.TestCase):
 
     def test_third_identical_repair_is_non_convergent(self) -> None:
         coordinator = RepairCoordinator()
-        action = RepairAction("semantic_failure", "same", ["producer.py"], ["out.json"])
+        action = RepairAction("semantic_failure", "same", "semantic failure", ["producer.py"])
         self.assertEqual(coordinator.activate(action), RepairPhase.EDIT_REQUIRED)
         self.assertEqual(coordinator.activate(action), RepairPhase.EDIT_REQUIRED)
         self.assertEqual(coordinator.activate(action), RepairPhase.NON_CONVERGENT)

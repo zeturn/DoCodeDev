@@ -29,6 +29,7 @@ from docode.agent.repository_index import build_remote_repository_index
 from docode.agent.workspace_reader import DoBoxWorkspaceReader
 from docode.agent.verification_scheduler import VerificationScheduler
 from docode.agent.profiles import select_task_profile
+from docode.agent.repair_coordinator import RepairPhase
 from docode.agent.source_inspection import (
     attempted_source_urls,
     crawler_source_inspection_required,
@@ -892,13 +893,17 @@ class CodingAgentLoop:
         command = str((result.metadata or {}).get("command") or "") if result is not None else ""
         if command:
             state.last_failed_command = command
-        count = state.failure_signatures.get(action.signature, 0) + 1
-        state.failure_signatures[action.signature] = count
+        if state.repair_coordinator is None:
+            components = getattr(self, "runtime_components", None)
+            state.repair_coordinator = components.repair_coordinator if components is not None else build_runtime_components(state.job.instruction).repair_coordinator
+        phase = state.repair_coordinator.activate(action)
+        count = state.repair_coordinator.attempt_count(action.signature)
+        state.failure_signatures = {action.signature: count}
         state.repair_action_attempts = count
-        if action.failure_class == "parser_source_mismatch" and count >= 3:
-            state.terminal_repair_reason = "repeated_zero_record_parser_failure"
+        if phase == RepairPhase.NON_CONVERGENT:
+            state.terminal_repair_reason = "repeated_zero_record_parser_failure" if action.failure_class == "parser_source_mismatch" else f"repair_non_convergent:{action.signature}"
             state.add_feedback(
-                "non_convergent_repair: The same zero-record parser failure remained after two evidence-backed edits. "
+                "non_convergent_repair: The same failure signature remained after the configured maximum attempts. "
                 "Stopping instead of continuing blind rewrites."
             )
             await self.repository.add_step(
@@ -915,7 +920,7 @@ class CodingAgentLoop:
         action_payload = repair_action_contract(action, state)
         state.active_repair_action = action_payload
         state.active_repair_started_at = repair_action_start_index(state, result)
-        state.targeted_repair_phase = "inspect_allowed"
+        state.targeted_repair_phase = phase.value
         state.targeted_repair_inspections = 0
         state.targeted_repair_edits = 0
         state.repair_mode = "targeted_repair"

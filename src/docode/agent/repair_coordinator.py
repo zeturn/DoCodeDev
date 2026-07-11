@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import Enum
+from docode.agent.repair_planner import RepairAction
 
 
 class RepairPhase(str, Enum):
@@ -13,20 +13,6 @@ class RepairPhase(str, Enum):
     NON_CONVERGENT = "non_convergent"
 
 
-@dataclass(slots=True)
-class RepairAction:
-    failure_class: str
-    signature: str
-    target_files: list[str]
-    evidence_files: list[str]
-    artifact_path: str = ""
-    producer_command: str = ""
-    validator_command: str = ""
-    instruction: str = ""
-    attempt: int = 1
-    maximum_attempts: int = 3
-
-
 class RepairCoordinator:
     def __init__(self, maximum_attempts: int = 3) -> None:
         self.maximum_attempts = maximum_attempts
@@ -36,10 +22,11 @@ class RepairCoordinator:
     def activate(self, action: RepairAction) -> RepairPhase:
         attempt = self._attempts.get(action.signature, 0) + 1
         self._attempts[action.signature] = attempt
-        action.attempt = attempt
-        action.maximum_attempts = self.maximum_attempts
         self.phase = RepairPhase.NON_CONVERGENT if attempt >= self.maximum_attempts else RepairPhase.EDIT_REQUIRED
         return self.phase
+
+    def attempt_count(self, signature: str) -> int:
+        return self._attempts.get(signature, 0)
 
     def record_edit(self) -> RepairPhase:
         if self.phase != RepairPhase.NON_CONVERGENT:

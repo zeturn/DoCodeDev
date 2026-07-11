@@ -84,6 +84,8 @@ class AgentState:
             self.edit_epoch += 1
             if self.verification_scheduler is not None:
                 self.verification_scheduler.mark_edit()
+            if self.repair_coordinator is not None and self.repair_mode == "targeted_repair":
+                self.targeted_repair_phase = self.repair_coordinator.record_edit().value
             if self.task_graph is not None:
                 if "understand" in self.task_graph.nodes:
                     self.task_graph.set_status("understand", TaskStatus.DONE)
@@ -104,6 +106,12 @@ class AgentState:
             command = str(metadata.get("command") or "")
             if command:
                 self.verification_scheduler.record(command, result.ok)
+                if self.repair_coordinator is not None and self.repair_mode == "targeted_repair":
+                    node = next((item for item in self.verification_scheduler.commands if item.command == command), None)
+                    if node is not None and node.kind == "producer":
+                        self.targeted_repair_phase = self.repair_coordinator.record_producer(result.ok).value
+                    elif node is not None and node.kind == "validator":
+                        self.targeted_repair_phase = self.repair_coordinator.record_validator(result.ok).value
                 if self.task_graph is not None and "verify" in self.task_graph.nodes:
                     complete = self.verification_scheduler.next_command() is None
                     self.task_graph.set_status("verify", TaskStatus.DONE if complete else (TaskStatus.PENDING if result.ok else TaskStatus.BLOCKED))
