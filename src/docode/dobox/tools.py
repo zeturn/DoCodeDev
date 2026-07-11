@@ -399,12 +399,18 @@ class DoBoxTools:
         result = await self.run_command(command, "/workspace")
         if result.exit_code != 0:
             await self.run_command(f"rm -f {patch_path}", "/workspace")
+        paths = []
+        for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+)$", patch, flags=re.MULTILINE):
+            path = match.group(1).strip()
+            if path != "/dev/null" and path not in paths:
+                paths.append(path)
         return ToolResult(
             tool="apply_patch",
             output=result.output,
             exit_code=result.exit_code,
             metadata={"patch_bytes": len(patch.encode("utf-8"))},
             truncated=result.truncated,
+            metadata={"paths": paths},
         )
 
     async def list_files(self, path: str = ".") -> ToolResult:

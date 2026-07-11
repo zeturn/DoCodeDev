@@ -197,7 +197,12 @@ class DiagnosticLocalTools:
             capture_output=True,
             check=False,
         )
-        return ToolResult(tool="apply_patch", output=completed.stdout + completed.stderr, exit_code=completed.returncode)
+        paths = []
+        for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+)$", patch, flags=re.MULTILINE):
+            path = match.group(1).strip()
+            if path != "/dev/null" and path not in paths:
+                paths.append(path)
+        return ToolResult(tool="apply_patch", output=completed.stdout + completed.stderr, exit_code=completed.returncode, metadata={"paths": paths})
 
     async def search(self, query: str, path: str = ".") -> ToolResult:
         root = safe_workspace_path(self.workspace, normalize_path(path) or ".")
