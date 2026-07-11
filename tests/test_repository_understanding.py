@@ -26,7 +26,7 @@ class RepositoryUnderstandingTests(unittest.TestCase):
             (root / "config.py").write_text("def load_config(): pass", encoding="utf-8")
             graph = RepositoryPlanner(RepositoryIndex(root)).initial_graph("migrate config", ["python -m unittest"])
         self.assertEqual([node.id for node in graph.ready()], ["understand"])
-        graph.set_status("understand", TaskStatus.DONE)
+        graph.set_status("understand", TaskStatus.DONE, reason="ranked repository target inspected", evidence_refs=["read:config.py"])
         self.assertEqual([node.id for node in graph.ready()], ["implement"])
         graph.add_or_update(TaskNode("impact", "Check references", dependencies=["implement"]))
         self.assertIn("impact", graph.nodes)

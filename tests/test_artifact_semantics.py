@@ -6,6 +6,7 @@ from pathlib import Path
 from docode.agent.artifact_contract import ArtifactSemanticContract, extract_artifact_contract
 from docode.agent.artifact_validator import ExecutionEvidence, validate_artifact, validate_remote_artifact
 from docode.agent.workspace_reader import WorkspaceEntry
+from docode.runtime.execution_evidence import RecordedRequest, RuntimeRequestEvidence
 
 
 class ArtifactSemanticTests(unittest.TestCase):
@@ -44,7 +45,9 @@ class RemoteArtifactSemanticTests(unittest.IsolatedAsyncioTestCase):
             async def read_file(self, path: str, max_bytes: int = 256_000) -> str:
                 return '[{"id":"a","url":"/relative"},{"id":"a","url":"https://example.test/b"}]'
         contract = ArtifactSemanticContract(artifact_paths=["out.json"], container_type="list", exact_record_count=2, absolute_url_fields=["url"], unique_by=["id"], expected_request_count=2, expected_request_paths=["/page/2"])
-        evidence = ExecutionEvidence(edit_epoch=2, producer_epoch=1, producer_sequence=2, validator_epoch=2, validator_sequence=1, request_paths=("/page/1",))
+        request = RecordedRequest.create(case_id="pages", run_id="run-1", request_id="request-1", method="GET", path="/page/1")
+        runtime = RuntimeRequestEvidence("pages", "run-1", (request,), "producer-1", 0)
+        evidence = ExecutionEvidence(edit_epoch=2, producer_epoch=1, producer_sequence=2, validator_epoch=2, validator_sequence=1, runtime_requests=runtime)
         result = await validate_remote_artifact(Reader(), "out.json", contract, evidence)
         self.assertFalse(result.passed)
         self.assertTrue({"producer_stale", "validator_before_producer", "request_count:1!=2", "request_path_missing:/page/2"} <= set(result.failures))
