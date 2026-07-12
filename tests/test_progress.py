@@ -1,11 +1,11 @@
 """Unit tests for state-progress fingerprint stability."""
 
 from unittest import TestCase
-from unittest.mock import MagicMock
 
 from docode.agent.progress import state_progress_fingerprint, state_progress_snapshot
 from docode.agent.repair_coordinator import RepairCoordinator, RepairPhase
 from docode.agent.state import AgentState
+from docode.agent.verification_scheduler import VerificationCommand, VerificationScheduler
 from docode.storage.models import CodingJob
 
 
@@ -13,10 +13,8 @@ def _state(**overrides) -> AgentState:
     job = CodingJob(
         id="j", user_id="u",
         instruction="test",
-        max_iterations=36,
-        max_runtime_seconds=900,
-        max_consecutive_failures=10,
-        max_tool_calls=80,
+        max_iterations=36, max_runtime_seconds=900,
+        max_consecutive_failures=10, max_tool_calls=80,
     )
     s = AgentState(job=job)
     for k, v in overrides.items():
@@ -94,6 +92,29 @@ class FingerprintChangeTests(TestCase):
             state_progress_fingerprint(a),
             state_progress_fingerprint(b),
         )
+
+
+class SchedulerFingerprintTests(TestCase):
+    def test_scheduler_evidence_changes_fingerprint(self) -> None:
+        cmd = VerificationCommand(command="echo ok", kind="producer")
+        sched_a = VerificationScheduler(commands=[cmd])
+        sched_b = VerificationScheduler(commands=[cmd])
+        sched_b.record("echo ok", True)
+        a = _state(verification_scheduler=sched_a, edit_epoch=0)
+        b = _state(verification_scheduler=sched_b, edit_epoch=1)
+        self.assertNotEqual(
+            state_progress_fingerprint(a),
+            state_progress_fingerprint(b),
+        )
+
+    def test_scheduler_sequence_excluded(self) -> None:
+        cmd = VerificationCommand(command="echo ok", kind="producer")
+        sched = VerificationScheduler(commands=[cmd])
+        sched.record("echo ok", True)
+        fp1 = state_progress_fingerprint(_state(verification_scheduler=sched, edit_epoch=0))
+        sched.record("echo ok", True)
+        fp2 = state_progress_fingerprint(_state(verification_scheduler=sched, edit_epoch=0))
+        self.assertEqual(fp1, fp2)
 
 
 class SnapshotStructureTests(TestCase):

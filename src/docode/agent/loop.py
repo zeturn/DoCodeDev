@@ -44,6 +44,7 @@ from docode.agent.source_inspection import (
     source_inspection_evidence,
     successful_source_inspection,
 )
+from docode.agent.progress import state_progress_fingerprint
 from docode.agent.state import AgentState
 from docode.agent.source_policy import continuation_allowed, source_progress_forced, source_tool_block
 from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
@@ -151,16 +152,15 @@ class CodingAgentLoop:
 
         assessment = state.no_progress_tracker.observe(outcome)
 
-        if assessment.no_progress:
-            await self.repository.add_step(
-                job.id,
-                "outcome",
-                {
-                    "type": "step_outcome",
-                    **outcome.to_dict(),
-                    "no_progress": assessment.to_dict(),
-                },
-            )
+        await self.repository.add_step(
+            job.id,
+            "outcome",
+            {
+                "type": "step_outcome",
+                **outcome.to_dict(),
+                "no_progress": assessment.to_dict(),
+            },
+        )
 
         if assessment.escalation == NoProgressEscalation.STOP:
             state.terminal_no_progress_reason = assessment.reason
@@ -552,6 +552,33 @@ class CodingAgentLoop:
                 cancelled = await self.cancelled_job(job.id)
                 if cancelled is not None:
                     return cancelled
+                # -- structured outcome (before execution) --
+                action_key = tool_action_key(tool_name, tool_args)
+                before_fp = state_progress_fingerprint(state)
+
+                # exact-repeat blocking must happen BEFORE tools.call
+                if state.no_progress_tracker.should_block(action_key):
+                    outcome = StepOutcome(
+                        kind=OutcomeKind.DECISION_REJECTED,
+                        action_key=rejected_action_key("repeated_action_blocked", action_key),
+                        success=False,
+                        progress=False,
+                        state_fingerprint_before=before_fp,
+                        state_fingerprint_after=before_fp,
+                    )
+                    await self.record_step_outcome(state, outcome, job)
+                    await self.record_rejected_decision(
+                        state,
+                        reason="repeated_action_blocked",
+                        detail=f"action_key={action_key}",
+                    )
+                    state.add_feedback(
+                        f"REPEATED ACTION BLOCKED: Do not repeat {action_key}. "
+                        f"Choose a different action."
+                    )
+                    state.iteration += 1
+                    continue
+
                 await self.repository.add_step(
                     job.id,
                     "tool",
@@ -592,46 +619,28 @@ class CodingAgentLoop:
                     state.targeted_repair_edits = 0
                     if state.repair_mode == "targeted_repair":
                         state.repair_mode = None
-                # -- structured outcome for every tool call --
-                action_key = tool_action_key(tool_name, tool_args)
-                prev_fp = ""
-                if hasattr(state, "last_outcome") and state.last_outcome is not None:
-                    prev_fp = state.last_outcome.state_fingerprint_after
-                progress = result.ok and (
-                    state.edit_epoch > (state.edit_epoch if not result.ok else state.edit_epoch - 1)
-                    or not prev_fp
+
+                # -- structured outcome (after execution) --
+                after_fp = state_progress_fingerprint(state)
+                progress = (
+                    result.ok
+                    and before_fp != after_fp
+                    and state.last_outcome.state_fingerprint_after != after_fp
+                    if state.last_outcome is not None
+                    else True
                 )
                 outcome = StepOutcome(
                     kind=OutcomeKind.TOOL,
                     action_key=action_key,
                     success=result.ok,
                     progress=progress,
-                    state_fingerprint_before=prev_fp,
+                    state_fingerprint_before=before_fp,
+                    state_fingerprint_after=after_fp,
                 )
                 assessment = await self.record_step_outcome(state, outcome, job)
-                if assessment.no_progress:
-                    feedback = self._render_step_outcome_feedback(outcome, assessment)
-                    if feedback:
-                        state.messages[-1]["content"] = (
-                            str(state.messages[-1]["content"]) + "\n" + feedback
-                        )
-                #  check exact-repeat blocking
-                if state.no_progress_tracker.should_block(action_key):
-                    await self.record_rejected_decision(
-                        state,
-                        reason="repeated_action_blocked",
-                        detail=f"action_key={action_key}",
-                    )
-                    state.add_feedback(
-                        {
-                            "type": "feedback",
-                            "severity": "error",
-                            "code": "repeated_action_blocked",
-                            "message": f"Do not repeat {action_key}. Choose a different action.",
-                        }
-                    )
-                    state.iteration += 1
-                    continue
+                feedback = self._render_step_outcome_feedback(outcome, assessment)
+                if feedback:
+                    state.add_feedback(feedback)
 
                 state.iteration += 1
                 continue

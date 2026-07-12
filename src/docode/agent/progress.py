@@ -52,13 +52,14 @@ def state_progress_snapshot(state: AgentState) -> dict[str, object]:
         nxt = state.verification_scheduler.next_command()
         scheduler["next_command"] = nxt if nxt else ""
         commands: dict[str, object] = {}
-        if hasattr(state.verification_scheduler, "_command_evidence"):
-            for cmd, evidence in sorted(
-                state.verification_scheduler._command_evidence.items()
+        if hasattr(state.verification_scheduler, "evidence"):
+            for cmd, ev in sorted(
+                state.verification_scheduler.evidence.items()
             ):
                 commands[cmd] = {
-                    "passed": evidence.passed,
-                    "edit_epoch": getattr(evidence, "edit_epoch", 0),
+                    "command": ev.command,
+                    "passed": ev.passed,
+                    "edit_epoch": getattr(ev, "edit_epoch", 0),
                 }
         scheduler["commands"] = commands
 

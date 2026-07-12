@@ -1,8 +1,4 @@
-"""Integration scenarios for structured outcome + no-progress control.
-
-Three scripted agents test the full loop: repeated reader (blocked),
-finalization loop (blocked), and repair recovery (passes).
-"""
+"""Integration scenarios for structured outcome + no-progress control."""
 
 from __future__ import annotations
 
@@ -10,7 +6,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase
 
-from docode.agent.action_keys import final_candidate_action_key
 from docode.agent.loop import CodingAgentLoop
 from docode.agent.quality_gate import QualityGate
 from docode.agent.stop_policy import StopPolicy
@@ -24,73 +19,71 @@ from tests.support.local_tools import DiagnosticLocalTools
 from tests.support.repository import RecordingRepository
 
 
-# ── scripted LLMs ────────────────────────────────────────────────────────
-
 class RepeatedReaderLLM:
-    """Always returns read_file on guidebook.md — should be blocked."""
+    """Always returns read_file on guidebook.md — must be blocked."""
 
-    async def decide(self, messages):
+    _count = 0
+
+    async def decide(self, *, system, messages, tools, context):
+        self._count += 1
         return AgentDecision(
             type="tool_call",
             tool_name="read_file",
-            tool_args={"path": "guidebook.md"},
+            args={"path": "guidebook.md"},
         )
 
 
 class FinalizationLoopLLM:
-    """Always submits final_candidate with empty summary — blocker loop."""
+    """Always submits final_candidate — must be blocked with blocker."""
 
     _count = 0
 
-    async def decide(self, messages):
+    async def decide(self, *, system, messages, tools, context):
         self._count += 1
         return AgentDecision(
             type="final_candidate",
             tool_name="final_candidate",
-            tool_args={},
+            args={},
             summary="" if self._count <= 2 else "work done",
         )
 
 
 class RepairRecoveryLLM:
-    """Runs command → inspects → edits → re-runs → succeeds."""
+    """run command → inspect → edit → rerun → succeed."""
     _step = 0
 
-    async def decide(self, messages):
+    async def decide(self, *, system, messages, tools, context):
         self._step += 1
         if self._step == 1:
             return AgentDecision(
                 type="tool_call",
                 tool_name="run_command",
-                tool_args={"command": "echo hello"},
+                args={"command": "echo hello"},
             )
         if self._step == 2:
             return AgentDecision(
                 type="tool_call",
                 tool_name="read_file",
-                tool_args={"path": "guidebook.md"},
+                args={"path": "guidebook.md"},
             )
         if self._step == 3:
             return AgentDecision(
                 type="tool_call",
                 tool_name="write_file",
-                tool_args={"path": "guidebook.md", "content": "# Guidebook\nDone."},
+                args={"path": "guidebook.md", "content": "# Guidebook\nDone."},
             )
         if self._step == 4:
             return AgentDecision(
                 type="tool_call",
                 tool_name="run_command",
-                tool_args={"command": "echo hello"},
+                args={"command": "echo hello"},
             )
         return AgentDecision(
             type="final_candidate",
             tool_name="final_candidate",
-            tool_args={},
+            args={},
             summary="Completed guidebook",
         )
-
-
-# ── tests ────────────────────────────────────────────────────────────────
 
 
 class RepeatedReaderTests(IsolatedAsyncioTestCase):
@@ -119,7 +112,15 @@ class RepeatedReaderTests(IsolatedAsyncioTestCase):
             )
             result = await loop.run(job)
             self.assertIsNotNone(result.failure_reason)
-            self.assertIn("no_progress", result.failure_reason or "")
+            self.assertIn("no_progress_non_convergent", result.failure_reason or "")
+            steps = await repo.list_steps(job.id)
+            outcomes = [s for s in steps if s.kind == "outcome"]
+            self.assertTrue(outcomes, "expected step_outcome records")
+            blocked = [
+                s for s in steps
+                if "repeated_action_blocked" in str(s.content)
+            ]
+            self.assertTrue(blocked, "expected repeated_action_blocked")
 
 
 class FinalizationLoopTests(IsolatedAsyncioTestCase):
@@ -176,3 +177,4 @@ class RepairRecoveryTests(IsolatedAsyncioTestCase):
             )
             result = await loop.run(job)
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
+            self.assertIsNotNone(result.artifact_id)
