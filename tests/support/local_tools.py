@@ -19,6 +19,7 @@ from typing import Any
 
 from docode.dobox.tools import ToolDefinition
 from docode.dobox.types import ToolResult
+from docode.git_changes import filter_diff_output, filter_status_output
 
 from tests.support.path_utils import normalize_path
 
@@ -69,7 +70,13 @@ class DiagnosticLocalTools:
         if base.is_file():
             paths = [base.relative_to(self.workspace).as_posix()]
         else:
-            paths = sorted(file.relative_to(self.workspace).as_posix() for file in base.rglob("*") if file.is_file() and "__pycache__" not in file.parts)
+            paths = sorted(
+                file.relative_to(self.workspace).as_posix()
+                for file in base.rglob("*")
+                if file.is_file()
+                and "__pycache__" not in file.parts
+                and not _is_inside_git(file.relative_to(self.workspace))
+            )
         return ToolResult(tool="list_files", output="\n".join(paths) + ("\n" if paths else ""))
 
     async def read_file(self, path: str) -> ToolResult:
@@ -140,7 +147,7 @@ class DiagnosticLocalTools:
         matches: list[str] = []
         files = [root] if root.is_file() else [file for file in root.rglob("*") if file.is_file()]
         for file in files:
-            if "__pycache__" in file.parts or file.suffix == ".pyc":
+            if "__pycache__" in file.parts or file.suffix == ".pyc" or _is_inside_git(file.relative_to(self.workspace)):
                 continue
             try:
                 lines = file.read_text(encoding="utf-8").splitlines()
@@ -174,7 +181,8 @@ class DiagnosticLocalTools:
 
     async def git_status(self) -> ToolResult:
         changed = self.changed_files()
-        return ToolResult(tool="git_status", output="".join(f" M {path}\n" for path in changed))
+        raw = "".join(f" M {path}\n" for path in changed)
+        return ToolResult(tool="git_status", output=filter_status_output(raw))
 
     async def git_diff(self) -> ToolResult:
         parts: list[str] = []
@@ -186,7 +194,7 @@ class DiagnosticLocalTools:
                 continue
             parts.append(f"diff --git a/{path} b/{path}\n")
             parts.extend(difflib.unified_diff(before, after, fromfile=f"a/{path}", tofile=f"b/{path}"))
-        return ToolResult(tool="git_diff", output="".join(parts))
+        return ToolResult(tool="git_diff", output=filter_diff_output("".join(parts)))
 
     async def run_tests(self) -> ToolResult:
         result = await self.run_command(self.test_command)
@@ -212,11 +220,27 @@ class DiagnosticLocalTools:
         return [path for path in sorted(set(self.initial_files) | set(current)) if self.initial_files.get(path) != current.get(path)]
 
     def snapshot_files(self) -> dict[str, str]:
-        return {
-            file.relative_to(self.workspace).as_posix(): file.read_text(encoding="utf-8", errors="surrogateescape")
-            for file in self.workspace.rglob("*")
-            if file.is_file() and "__pycache__" not in file.parts and not file.name.endswith(".pyc")
-        }
+        result: dict[str, str] = {}
+        for file in self.workspace.rglob("*"):
+            if not file.is_file():
+                continue
+            if "__pycache__" in file.parts or file.name.endswith(".pyc"):
+                continue
+            if _is_inside_git(file.relative_to(self.workspace)):
+                continue
+            result[file.relative_to(self.workspace).as_posix()] = file.read_text(encoding="utf-8", errors="surrogateescape")
+        return result
+
+
+def _is_inside_git(relative: Path) -> bool:
+    """True when *relative* points into the workspace ``.git`` directory.
+
+    The shared ``meaningful_change_path`` filter (from ``docode.git_changes``)
+    already excludes ``.git/`` paths for the real ``DoBoxTools``. This helper
+    mirrors that exclusion for the deterministic test doubles.
+    """
+    posix = relative.as_posix()
+    return posix == ".git" or posix.startswith(".git/")
 
 
 def safe_workspace_path(workspace: Path, path: str) -> Path:

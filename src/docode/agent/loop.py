@@ -18,7 +18,6 @@ from docode.agent.failure_taxonomy import FailureCategory, TerminalResult, categ
 from docode.agent.inspector import ProjectInspector
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
-from docode.agent.verifier import strip_vcs_internal_status
 from docode.agent.repair_planner import (
     RepairAction,
     TARGETED_REPAIR_FORBIDDEN_TOOLS,
@@ -889,8 +888,7 @@ class CodingAgentLoop:
         final_diff = quality.git_diff or verification.git_diff
         if not final_diff:
             final_diff = (await self.tools.git_diff()).output
-        status_clean = strip_vcs_internal_status(status.output)
-        changed_files = tuple(dict.fromkeys([*changed_paths_from_status(status_clean), *changed_files_from_diff(final_diff)]))
+        changed_files = tuple(dict.fromkeys([*changed_paths_from_status(status.output), *changed_files_from_diff(final_diff)]))
         changed_files = tuple(dict.fromkeys([*changed_files, *successful_edit_paths(state)]))
         required_files = tuple(state.task_contract.must_modify_files if state.task_contract is not None else [])
         pre_export = controller.evaluate_pre_export(
