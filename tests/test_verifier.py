@@ -12,11 +12,15 @@ from docode.agent.verifier import (
     CommandEvidence,
     CodingVerifier,
     VerificationEvidence,
+    VerificationPlan,
     build_verification_plan,
     crawler_output_artifact_verified,
     diff_contains_placeholder,
+    evaluate_verification_plan,
     json_output_check_script,
     requires_json_output_check,
+    strip_vcs_internal_diff,
+    strip_vcs_internal_status,
     verification_evidence_from_steps,
 )
 from docode.dobox.types import ToolResult
@@ -1382,3 +1386,100 @@ class VerifierTests(IsolatedAsyncioTestCase):
 
         self.assertFalse(result.passed)
         self.assertIn("fix failing verification command", result.required_fixes)
+
+
+class VcsInternalGitDiffTools(PassingVerifierTools):
+    """Reproduces the Linux CI failure: the agent workspace is itself inside a
+    git checkout, so ``git status``/``git diff`` report git's own metadata
+    (``.git/HEAD``, ``.git/hooks/*.sample``) as modified. The hook templates
+    legitimately contain "TODO" comments."""
+
+    async def git_status(self) -> ToolResult:
+        return ToolResult(
+            tool="git_status",
+            output=" M .git/HEAD\n M .git/hooks/sendemail-validate.sample\n M guidebook.md\n",
+            exit_code=0,
+        )
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(
+            tool="git_diff",
+            output=(
+                "diff --git a/.git/HEAD b/.git/HEAD\n"
+                "-ref: refs/heads/main\n"
+                "+ref: refs/heads/runtime-v2\n"
+                "diff --git a/.git/hooks/sendemail-validate.sample b/.git/hooks/sendemail-validate.sample\n"
+                "old mode 100644\n"
+                "new mode 100755\n"
+                "+# TODO: Replace with appropriate checks for this patch\n"
+                "diff --git a/guidebook.md b/guidebook.md\n"
+                "+# Guidebook\n"
+                "+Complete guidebook content with operational envelope.\n"
+            ),
+            exit_code=0,
+        )
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        _ = cwd
+        return ToolResult(tool="run_command", output="ok", exit_code=0, metadata={"command": command})
+
+    async def list_files(self, path: str = ".") -> ToolResult:
+        _ = path
+        return ToolResult(tool="list_files", output="guidebook.md\n", exit_code=0)
+
+
+class TestVcsInternalDiffExclusion(IsolatedAsyncioTestCase):
+    def test_strip_vcs_internal_diff_removes_git_hunks(self) -> None:
+        diff = (
+            "diff --git a/.git/HEAD b/.git/HEAD\n-a\n+b\n"
+            "diff --git a/.git/hooks/pre-commit.sample b/.git/hooks/pre-commit.sample\n"
+            "+# TODO: stub\n"
+            "diff --git a/guidebook.md b/guidebook.md\n+real content\n"
+        )
+        stripped = strip_vcs_internal_diff(diff)
+        self.assertNotIn(".git/", stripped)
+        self.assertIn("guidebook.md", stripped)
+        self.assertIn("real content", stripped)
+
+    def test_strip_vcs_internal_status_removes_git_entries(self) -> None:
+        status = " M .git/HEAD\n M .git/hooks/pre-commit.sample\n M guidebook.md\n"
+        stripped = strip_vcs_internal_status(status)
+        self.assertNotIn(".git", stripped)
+        self.assertIn("guidebook.md", stripped)
+
+    def test_diff_contains_placeholder_ignores_git_templates_after_strip(self) -> None:
+        raw_diff = (
+            "diff --git a/.git/hooks/sendemail-validate.sample b/.git/hooks/sendemail-validate.sample\n"
+            "+# TODO: Replace with appropriate checks for this patch\n"
+            "diff --git a/guidebook.md b/guidebook.md\n+real content\n"
+        )
+        # Before the fix the raw diff would trigger require_no_placeholder.
+        self.assertTrue(diff_contains_placeholder(raw_diff.lower()))
+        # After stripping, git internals are excluded and the check passes.
+        plan = VerificationPlan(
+            required_commands=[],
+            explicit_commands=[],
+            smoke_commands=[],
+            require_no_placeholder=True,
+        )
+        empty = ToolResult(tool="x", output="", exit_code=0)
+        passed, fixes = evaluate_verification_plan(
+            plan, strip_vcs_internal_diff(raw_diff), empty, empty, empty, empty
+        )
+        self.assertTrue(passed, msg=fixes)
+        self.assertEqual(fixes, [])
+
+    async def test_verify_passes_when_only_git_internals_contain_placeholder(self) -> None:
+        # Regression for the deterministic holdout cross-environment failure:
+        # a clean deliverable (guidebook.md) must not fail because git's own
+        # hook templates contain "TODO" comments.
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="Complete guidebook.md with operational envelope sections",
+            ),
+            VcsInternalGitDiffTools(),
+        )
+        self.assertTrue(result.passed, msg=result.required_fixes)
+        self.assertNotIn("remove placeholder", " ".join(result.required_fixes))

@@ -165,10 +165,11 @@ class CodingVerifier:
             test_result = await run_or_reuse_detected_check("test", "run_tests", tools, evidence, explicit_results, detected_commands)
             build_result = await run_or_reuse_detected_check("build", "run_build", tools, evidence, explicit_results, detected_commands)
             lint_result = await run_or_reuse_detected_check("lint", "run_lint", tools, evidence, explicit_results, detected_commands)
+        status_clean = strip_vcs_internal_status(status_result.output)
         non_git_workspace = is_non_git_status(status_result)
         workspace_result: ToolResult | None = None
         has_explicit_artifact = False
-        if not job.repo_url and (non_git_workspace or has_untracked_workspace_files(status_result.output)):
+        if not job.repo_url and (non_git_workspace or has_untracked_workspace_files(status_clean)):
             workspace_result = await safe_optional_tool_call("list_files", tools, ".")
             has_explicit_artifact = workspace_result.exit_code == 0 and bool(workspace_result.output.strip()) and not workspace_result.truncated
 
@@ -176,12 +177,13 @@ class CodingVerifier:
         status_complete = not status_result.truncated
         has_diff = diff_result.exit_code == 0 and bool(diff_result.output.strip())
         diff_complete = not diff_result.truncated
-        has_status_change_evidence = status_result.exit_code == 0 and bool(changed_paths_from_status(status_result.output))
+        has_status_change_evidence = status_result.exit_code == 0 and bool(changed_paths_from_status(status_clean))
         has_change_evidence = has_diff or has_explicit_artifact or has_status_change_evidence
         tests_ok = test_result.exit_code == 0
         build_ok = build_result.exit_code == 0
         lint_ok = lint_result.exit_code == 0
-        verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_result.output, workspace_result)
+        verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_clean, workspace_result)
+        verified_diff = strip_vcs_internal_diff(verified_diff)
         if plan.required_file_contains:
             verified_diff = await augment_diff_with_required_file_content(verified_diff, plan, tools)
         if plan.require_declared_python_dependencies or plan.require_crawler_artifacts:
@@ -661,6 +663,47 @@ def changed_files_from_diff(diff: str) -> list[str]:
         if path and path != "/dev/null" and meaningful_change_path(path) and path not in files:
             files.append(path)
     return files
+
+
+def is_vcs_internal_path(path: str) -> bool:
+    normalized = (path or "").replace("\\", "/").strip()
+    return normalized == ".git" or normalized.startswith(".git/")
+
+
+def strip_vcs_internal_diff(diff: str) -> str:
+    """Remove diff hunks that belong to VCS-internal paths (e.g. ``.git``).
+
+    Git may report its own metadata/hook templates as modified (for example
+    under ``core.fileMode=true`` on Linux), and those templates legitimately
+    contain placeholder/"TODO" comments. Such internals must never be treated
+    as the agent's deliverable, otherwise a clean workspace fails verification
+    purely because git's own template files contain "TODO".
+    """
+    out: list[str] = []
+    skip = False
+    for line in (diff or "").splitlines():
+        if line.startswith("diff --git "):
+            match = re.search(r" b/(.+)$", line)
+            path = match.group(1).strip() if match else ""
+            skip = is_vcs_internal_path(path)
+            if not skip:
+                out.append(line)
+            continue
+        if not skip:
+            out.append(line)
+    return "\n".join(out)
+
+
+def strip_vcs_internal_status(status: str) -> str:
+    """Drop status entries that refer to VCS-internal paths (e.g. ``.git``)."""
+    out: list[str] = []
+    for line in (status or "").splitlines():
+        match = re.match(r"^..\s+(.+?)(?:\s+->\s+.+)?$", line.rstrip())
+        path = match.group(1) if match else line.strip()
+        if is_vcs_internal_path(path):
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def workspace_diagnostic_command() -> str:
