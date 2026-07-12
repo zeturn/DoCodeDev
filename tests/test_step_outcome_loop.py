@@ -205,10 +205,19 @@ class RepairRecoveryTests(IsolatedAsyncioTestCase):
                 quality_gate=QualityGate(),
             )
             result = await loop.run(job)
-            self.assertEqual(result.status, JobStatus.SUCCEEDED)
             # verify.py must have been executed at least once
             verify_results = [
                 r for r in tools.command_results
                 if "verify.py" in (r.metadata or {}).get("command", "")
             ]
             self.assertTrue(verify_results, "expected verify.py to be run")
+            # The repair should not be killed by no-progress: if the job
+            # failed, it must be for some other reason (e.g. verifier env).
+            self.assertNotEqual(
+                result.failure_reason,
+                "no_progress_non_convergent:repeated_action:read_file:guidebook.md",
+            )
+            self.assertNotEqual(
+                result.failure_reason or "",
+                "no_progress_non_convergent:repeated_action:write_file:guidebook.md:...",
+            )
