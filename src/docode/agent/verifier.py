@@ -11,7 +11,7 @@ from docode.agent.task_contract import TaskContract, task_contract_from_instruct
 from docode.agent.workflow import EDIT_TOOLS, commands_equivalent
 from docode.dobox.tools import DoBoxTools
 from docode.dobox.types import ToolResult
-from docode.git_changes import changed_paths_from_status, meaningful_change_path, parse_status_line, strip_ansi
+from docode.git_changes import changed_paths_from_status, filter_diff_output, filter_status_output, meaningful_change_path, parse_status_line, strip_ansi
 from docode.storage.models import CodingJob
 
 if TYPE_CHECKING:
@@ -165,23 +165,25 @@ class CodingVerifier:
             test_result = await run_or_reuse_detected_check("test", "run_tests", tools, evidence, explicit_results, detected_commands)
             build_result = await run_or_reuse_detected_check("build", "run_build", tools, evidence, explicit_results, detected_commands)
             lint_result = await run_or_reuse_detected_check("lint", "run_lint", tools, evidence, explicit_results, detected_commands)
+        filtered_diff = filter_diff_output(diff_result.output)
+        filtered_status = filter_status_output(status_result.output)
         non_git_workspace = is_non_git_status(status_result)
         workspace_result: ToolResult | None = None
         has_explicit_artifact = False
-        if not job.repo_url and (non_git_workspace or has_untracked_workspace_files(status_result.output)):
+        if not job.repo_url and (non_git_workspace or has_untracked_workspace_files(filtered_status)):
             workspace_result = await safe_optional_tool_call("list_files", tools, ".")
             has_explicit_artifact = workspace_result.exit_code == 0 and bool(workspace_result.output.strip()) and not workspace_result.truncated
 
         status_ok = status_result.exit_code == 0 or has_explicit_artifact
         status_complete = not status_result.truncated
-        has_diff = diff_result.exit_code == 0 and bool(diff_result.output.strip())
+        has_diff = diff_result.exit_code == 0 and bool(filtered_diff.strip())
         diff_complete = not diff_result.truncated
-        has_status_change_evidence = status_result.exit_code == 0 and bool(changed_paths_from_status(status_result.output))
+        has_status_change_evidence = status_result.exit_code == 0 and bool(changed_paths_from_status(filtered_status))
         has_change_evidence = has_diff or has_explicit_artifact or has_status_change_evidence
         tests_ok = test_result.exit_code == 0
         build_ok = build_result.exit_code == 0
         lint_ok = lint_result.exit_code == 0
-        verified_diff = diff_result.output if has_diff else synthetic_diff_from_status(status_result.output, workspace_result)
+        verified_diff = filtered_diff if has_diff else synthetic_diff_from_status(filtered_status, workspace_result)
         if plan.required_file_contains:
             verified_diff = await augment_diff_with_required_file_content(verified_diff, plan, tools)
         if plan.require_declared_python_dependencies or plan.require_crawler_artifacts:

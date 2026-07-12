@@ -13,7 +13,8 @@ from typing import Any
 from docode.dobox.types import ToolResult
 
 from .definitions import HoldoutCase
-from tests.test_real_llm_diagnostic_suite import DiagnosticLocalTools, normalize_path, python_portable_command, safe_workspace_path
+from tests.support.local_tools import DiagnosticLocalTools, safe_workspace_path, python_portable_command
+from tests.support.path_utils import normalize_path
 
 
 EDIT_TOOLS = {"write_file", "edit_file", "replace_in_file", "apply_patch"}

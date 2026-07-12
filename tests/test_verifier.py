@@ -1382,3 +1382,101 @@ class VerifierTests(IsolatedAsyncioTestCase):
 
         self.assertFalse(result.passed)
         self.assertIn("fix failing verification command", result.required_fixes)
+
+
+class GitPollutedDiffTools(PassingVerifierTools):
+    """Simulates a workspace where ``prepare_workspace_for_diff`` has run
+    ``git init``, causing git's own ``.git`` metadata (HEAD, hook sample
+    templates with TODO comments) to appear in the raw git output alongside a
+    real deliverable file (``guidebook.md``)."""
+
+    async def git_status(self) -> ToolResult:
+        return ToolResult(
+            tool="git_status",
+            output=" M .git/HEAD\n M .git/hooks/sendemail-validate.sample\n M guidebook.md\n",
+            exit_code=0,
+        )
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(
+            tool="git_diff",
+            output=(
+                "diff --git a/.git/HEAD b/.git/HEAD\n"
+                "-ref: refs/heads/main\n"
+                "+ref: refs/heads/runtime-v2\n"
+                "diff --git a/.git/hooks/sendemail-validate.sample b/.git/hooks/sendemail-validate.sample\n"
+                "old mode 100644\n"
+                "new mode 100755\n"
+                "+# TODO: Replace with appropriate checks for this patch\n"
+                "diff --git a/guidebook.md b/guidebook.md\n"
+                "+# Guidebook\n"
+                "+Complete guidebook content with operational envelope.\n"
+            ),
+            exit_code=0,
+        )
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        _ = cwd
+        return ToolResult(tool="run_command", output="ok", exit_code=0, metadata={"command": command})
+
+    async def list_files(self, path: str = ".") -> ToolResult:
+        _ = path
+        return ToolResult(tool="list_files", output="guidebook.md\n", exit_code=0)
+
+
+class OnlyGitDiffTools(GitPollutedDiffTools):
+    """Status/diff contain *only* ``.git`` internals — no real deliverable."""
+
+    async def git_status(self) -> ToolResult:
+        return ToolResult(
+            tool="git_status",
+            output=" M .git/HEAD\n M .git/hooks/sendemail-validate.sample\n",
+            exit_code=0,
+        )
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(
+            tool="git_diff",
+            output=(
+                "diff --git a/.git/HEAD b/.git/HEAD\n"
+                "-ref: refs/heads/main\n"
+                "+ref: refs/heads/runtime-v2\n"
+                "diff --git a/.git/hooks/sendemail-validate.sample b/.git/hooks/sendemail-validate.sample\n"
+                "old mode 100644\n"
+                "new mode 100755\n"
+                "+# TODO: Replace with appropriate checks for this patch\n"
+            ),
+            exit_code=0,
+        )
+
+
+class TestGitPollutionVerifier(IsolatedAsyncioTestCase):
+    async def test_verify_passes_when_git_templates_have_todos_but_real_file_exists(self) -> None:
+        """A clean deliverable (guidebook.md) must not fail because git's own
+        hook templates contain TODO comments. The shared ``filter_diff_output``
+        strips ``.git`` hunks before placeholder scanning."""
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="Complete guidebook.md with operational envelope sections",
+            ),
+            GitPollutedDiffTools(),
+        )
+        self.assertTrue(result.passed, msg=result.required_fixes)
+        self.assertNotIn("remove placeholder", " ".join(result.required_fixes))
+
+    async def test_verify_fails_when_only_git_internals_change_no_real_deliverable(self) -> None:
+        """After ``filter_diff_output`` removes ``.git`` hunks the diff becomes
+        empty so ``has_change_evidence`` must be false and the verifier must
+        demand real deliverable changes."""
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="Complete guidebook.md with operational envelope sections",
+            ),
+            OnlyGitDiffTools(),
+        )
+        self.assertFalse(result.passed)
+        self.assertIn("produce a non-empty git diff or explicit artifact", result.required_fixes)
