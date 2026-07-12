@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import hashlib
 import json
 import locale
@@ -297,13 +298,53 @@ def _dump_json(path: Path, payload: Any) -> None:
 def _copy_workspace(src: Path, dst: Path) -> None:
     if dst.exists():
         shutil.rmtree(dst)
-    shutil.copytree(src, dst)
+    shutil.copytree(
+        src,
+        dst,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", "*.pyo"),
+    )
+
+
+def _snapshot_workspace(root: Path) -> dict[str, str]:
+    """Return ``{relative_path: text_content}`` for every non-ignored file
+    under *root*.
+
+    VCS internals (``.git``), Python runtime cache directories
+    (``__pycache__``) and bytecode files are excluded. Binary files that
+    cannot be decoded as UTF-8 are represented by a stable placeholder so
+    the snapshot never contains unencodable surrogate code points.
+    """
+    files: dict[str, str] = {}
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+
+        relative = path.relative_to(root)
+        if ".git" in relative.parts:
+            continue
+        if "__pycache__" in relative.parts:
+            continue
+        if path.suffix in {".pyc", ".pyo"}:
+            continue
+
+        data = path.read_bytes()
+        try:
+            value = data.decode("utf-8")
+        except UnicodeDecodeError:
+            value = (
+                f"<binary size={len(data)} "
+                f"sha256={hashlib.sha256(data).hexdigest()}>"
+            )
+
+        files[relative.as_posix()] = value
+
+    return files
 
 
 def _workspace_diff(before: Path, after: Path) -> str:
-    before_files = {p.relative_to(before).as_posix(): p.read_text(encoding="utf-8", errors="surrogateescape") for p in before.rglob("*") if p.is_file() and "__pycache__" not in p.parts and not p.name.endswith(".pyc")} if before.exists() else {}
-    after_files = {p.relative_to(after).as_posix(): p.read_text(encoding="utf-8", errors="surrogateescape") for p in after.rglob("*") if p.is_file() and "__pycache__" not in p.parts and not p.name.endswith(".pyc")} if after.exists() else {}
-    import difflib
+    before_files = _snapshot_workspace(before) if before.exists() else {}
+    after_files = _snapshot_workspace(after) if after.exists() else {}
 
     lines: list[str] = []
     for rel in sorted(set(before_files) | set(after_files)):

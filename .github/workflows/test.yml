@@ -73,9 +73,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e ".[dev]"
       - name: Run sable_manual trace
-        id: trace-run
+        id: trace_run
         shell: bash
-        continue-on-error: true
         run: |
           PYTHONPATH=src python scripts/run_holdout_case.py \
             --case sable_manual \
@@ -87,9 +86,6 @@ jobs:
         with:
           name: sable-manual-trace-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.ref }}
           path: artifacts/sable-manual*
-      - name: Ensure trace succeeded
-        if: always()
-        run: test "${{ steps.trace-run.outcome }}" = "success"
 
   package:
     runs-on: ubuntu-latest
