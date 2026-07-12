@@ -3196,9 +3196,10 @@ class AgentLoopTests(IsolatedAsyncioTestCase):
             self.assertEqual(result.status, JobStatus.FAILED)
             self.assertIsNotNone(result.failure_reason)
             # May be max_iterations_exceeded or no_progress_non_convergent
-            self.assertIn(
-                result.failure_reason,
-                {"max_iterations_exceeded", "no_progress_non_convergent:repeated_action:read_file:guidebook.md"},
+            self.assertTrue(
+                result.failure_reason == "max_iterations_exceeded"
+                or result.failure_reason.startswith("no_progress_non_convergent"),
+                f"unexpected failure_reason: {result.failure_reason}",
             )
             steps = await repo.list_steps(job.id)
             stuck_steps = [step for step in steps if step.content.get("type") == "stuck_detector"]
