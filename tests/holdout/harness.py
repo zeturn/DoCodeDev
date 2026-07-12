@@ -12,7 +12,7 @@ from typing import Any
 
 from docode.dobox.types import ToolResult
 
-from tests.holdout.definitions import HoldoutCase
+from .definitions import HoldoutCase
 from tests.test_real_llm_diagnostic_suite import DiagnosticLocalTools, normalize_path, python_portable_command, safe_workspace_path
 
 

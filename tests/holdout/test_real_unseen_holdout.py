@@ -20,8 +20,8 @@ from docode.dobox.tools import DoBoxTools
 from docode.runtime.smoke import check_http_health, ensure_dobox_smoke_token
 from docode.storage.models import CodingJob, JobStatus, new_id
 
-from tests.holdout.definitions import CASES, HoldoutCase
-from tests.holdout.harness import EDIT_TOOLS, READ_TOOLS, materialize_fixture, sanitize, summarize_steps
+from .definitions import CASES, HoldoutCase
+from .harness import EDIT_TOOLS, READ_TOOLS, materialize_fixture, sanitize, summarize_steps
 from tests.test_real_llm_smoke import build_real_llm_or_skip
 from tests.test_smoke_readme_job import RecordingRepository
 

@@ -11,8 +11,8 @@ from docode.agent.verifier import CodingVerifier
 from docode.artifacts.exporter import ArtifactExporter
 from docode.storage.models import CodingJob, JobStatus, new_id
 
-from tests.holdout.definitions import CASES, LEAKAGE_MARKERS
-from tests.holdout.harness import HoldoutLocalTools, ScriptedHoldoutLLM, materialize_fixture, summarize_steps, validate_workspace
+from .definitions import CASES, LEAKAGE_MARKERS
+from .harness import HoldoutLocalTools, ScriptedHoldoutLLM, materialize_fixture, summarize_steps, validate_workspace
 from tests.test_smoke_readme_job import RecordingRepository
 
 
