@@ -13,9 +13,12 @@ from urllib.parse import urlparse
 
 from docode.agent.context import ContextManager, ContextPack, target_file_guidance
 from docode.agent.artifact_validator import ExecutionEvidence
+from docode.agent.action_keys import final_candidate_action_key, rejected_action_key, tool_action_key
 from docode.agent.finalization_controller import ExportCompletionState, FinalizationController, PreExportFinalizationState
 from docode.agent.failure_taxonomy import FailureCategory, TerminalResult, category_for_reason
 from docode.agent.inspector import ProjectInspector
+from docode.agent.no_progress import NoProgressAssessment, NoProgressEscalation
+from docode.agent.outcome import BlockerSource, FinalizationBlocker, OutcomeKind, RequiredAction, StepOutcome
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
 from docode.agent.repair_planner import (
@@ -132,6 +135,78 @@ class CodingAgentLoop:
         self.llm_decision_timeout_seconds = max(1.0, llm_decision_timeout_seconds)
         self.runtime_components = runtime_components
 
+    async def record_step_outcome(
+        self,
+        state: AgentState,
+        outcome: StepOutcome,
+        job: CodingJob,
+    ) -> NoProgressAssessment:
+        """Centralised outcome recording: persist, track, escalate."""
+        state.last_outcome = outcome
+        state.recent_outcomes.append(outcome)
+        if len(state.recent_outcomes) > 20:
+            state.recent_outcomes = state.recent_outcomes[-20:]
+
+        state.active_blocker = outcome.primary_blocker()
+
+        assessment = state.no_progress_tracker.observe(outcome)
+
+        if assessment.no_progress:
+            await self.repository.add_step(
+                job.id,
+                "outcome",
+                {
+                    "type": "step_outcome",
+                    **outcome.to_dict(),
+                    "no_progress": assessment.to_dict(),
+                },
+            )
+
+        if assessment.escalation == NoProgressEscalation.STOP:
+            state.terminal_no_progress_reason = assessment.reason
+
+        return assessment
+
+    @staticmethod
+    def _render_step_outcome_feedback(
+        outcome: StepOutcome,
+        assessment: NoProgressAssessment | None = None,
+    ) -> str:
+        """Compact structured feedback for the model's next observation."""
+        lines: list[str] = []
+        blocker = outcome.primary_blocker()
+        if blocker is not None:
+            lines.append("ACTIVE BLOCKER")
+            lines.append(f"code: {blocker.code}")
+            lines.append(f"source: {blocker.source.value}")
+            lines.append(f"required_action: {blocker.required_action.value}")
+            if blocker.related_files:
+                lines.append("related_files:")
+                for f in blocker.related_files:
+                    lines.append(f"- {f}")
+            if blocker.related_commands:
+                lines.append("related_commands:")
+                for c in blocker.related_commands:
+                    lines.append(f"- {c}")
+            if blocker.related_node_ids:
+                lines.append("related_nodes:")
+                for n in blocker.related_node_ids:
+                    lines.append(f"- {n}")
+            lines.append(f"retryable: {blocker.retryable}")
+        if assessment is not None and assessment.no_progress:
+            lines.append("")
+            lines.append("NO-PROGRESS")
+            lines.append(f"streak: {assessment.streak}")
+            lines.append(f"repeated_action_count: {assessment.repeated_action_count}")
+            lines.append(f"repeated_blocker_count: {assessment.repeated_blocker_count}")
+            if assessment.blocked_action_key:
+                lines.append(f"blocked_action: {assessment.blocked_action_key}")
+            if assessment.escalation != NoProgressEscalation.NONE:
+                lines.append(f"escalation: {assessment.escalation.value}")
+            if assessment.required_action != RequiredAction.NONE:
+                lines.append(f"instruction: {assessment.required_action.value}")
+        return "\n".join(lines) if lines else ""
+
     async def run(self, job: CodingJob) -> CodingJob:
         job = await self.repository.update_job(job.id, status=JobStatus.RUNNING)
         state = AgentState(job=job)
@@ -143,6 +218,8 @@ class CodingAgentLoop:
                 return cancelled
             if state.terminal_repair_reason:
                 return await self.fail(job.id, state.terminal_repair_reason)
+            if state.terminal_no_progress_reason:
+                return await self.fail(job.id, state.terminal_no_progress_reason)
 
             self.sync_llm_usage(state)
             stop = self.stop_policy.evaluate(state)
@@ -515,6 +592,47 @@ class CodingAgentLoop:
                     state.targeted_repair_edits = 0
                     if state.repair_mode == "targeted_repair":
                         state.repair_mode = None
+                # -- structured outcome for every tool call --
+                action_key = tool_action_key(tool_name, tool_args)
+                prev_fp = ""
+                if hasattr(state, "last_outcome") and state.last_outcome is not None:
+                    prev_fp = state.last_outcome.state_fingerprint_after
+                progress = result.ok and (
+                    state.edit_epoch > (state.edit_epoch if not result.ok else state.edit_epoch - 1)
+                    or not prev_fp
+                )
+                outcome = StepOutcome(
+                    kind=OutcomeKind.TOOL,
+                    action_key=action_key,
+                    success=result.ok,
+                    progress=progress,
+                    state_fingerprint_before=prev_fp,
+                )
+                assessment = await self.record_step_outcome(state, outcome, job)
+                if assessment.no_progress:
+                    feedback = self._render_step_outcome_feedback(outcome, assessment)
+                    if feedback:
+                        state.messages[-1]["content"] = (
+                            str(state.messages[-1]["content"]) + "\n" + feedback
+                        )
+                #  check exact-repeat blocking
+                if state.no_progress_tracker.should_block(action_key):
+                    await self.record_rejected_decision(
+                        state,
+                        reason="repeated_action_blocked",
+                        detail=f"action_key={action_key}",
+                    )
+                    state.add_feedback(
+                        {
+                            "type": "feedback",
+                            "severity": "error",
+                            "code": "repeated_action_blocked",
+                            "message": f"Do not repeat {action_key}. Choose a different action.",
+                        }
+                    )
+                    state.iteration += 1
+                    continue
+
                 state.iteration += 1
                 continue
 

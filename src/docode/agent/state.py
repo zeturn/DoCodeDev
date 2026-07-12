@@ -10,6 +10,8 @@ from docode.agent.task_contract import TaskContract
 from docode.agent.artifact_contract import ArtifactSemanticContract
 from docode.agent.failure_taxonomy import TerminalResult
 from docode.agent.finalization_controller import FinalizationController
+from docode.agent.no_progress import NoProgressTracker
+from docode.agent.outcome import FinalizationBlocker, StepOutcome
 from docode.agent.profiles import TaskProfile
 from docode.agent.repair_coordinator import RepairCoordinator
 from docode.agent.task_graph import TaskGraph
@@ -57,6 +59,13 @@ class AgentState:
     source_inspection_auto_attempted_urls: set[str] = field(default_factory=set)
     source_inspection_excerpt_presented: bool = False
     terminal_repair_reason: str | None = None
+
+    # structured outcome & no-progress (Runtime V2)
+    active_blocker: FinalizationBlocker | None = None
+    last_outcome: StepOutcome | None = None
+    recent_outcomes: list[StepOutcome] = field(default_factory=list)
+    no_progress_tracker: NoProgressTracker = field(default_factory=NoProgressTracker)
+    terminal_no_progress_reason: str | None = None
 
     def add_observation(self, content: str) -> None:
         self.messages.append({"role": "system", "kind": "observation", "content": content})
