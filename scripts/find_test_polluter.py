@@ -50,13 +50,13 @@ def main() -> int:
     for module in modules:
         result = run_modules([module], args.target)
         commands.append(result)
-        if result["returncode"]:
+        if direct["returncode"] == 0 and result["returncode"]:
             polluters.append(module)
     report = {
         "target": args.target,
         "direct_result": "passed" if direct["returncode"] == 0 else "failed",
         "minimal_polluting_modules": polluters,
-        "required_combination": not polluters,
+        "required_combination": direct["returncode"] == 0 and not polluters,
         "candidate_modules": modules,
         "commands": commands,
     }

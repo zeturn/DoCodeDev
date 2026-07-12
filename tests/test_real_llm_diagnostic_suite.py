@@ -191,7 +191,7 @@ class DiagnosticLocalTools:
 
     async def apply_patch(self, patch: str) -> ToolResult:
         completed = subprocess.run(
-            ["git", "apply", "--whitespace=nowarn", "-"],
+            ["git", "apply", "--no-index", "--whitespace=nowarn", "-"],
             input=patch,
             cwd=self.workspace,
             text=True,
