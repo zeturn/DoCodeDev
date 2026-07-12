@@ -185,6 +185,23 @@ class BlockerSlashTests(TestCase):
         blocker = _make_blocker(related_files=("a\\b.py", "c/d.py"))
         self.assertEqual(blocker.related_files, ("a/b.py", "c/d.py"))
 
+    def test_slash_normalisation_deduplicates_collisions(self) -> None:
+        blocker = _make_blocker(
+            related_files=(
+                "src\\docode\\a.py",
+                "src/docode/a.py",
+            )
+        )
+        self.assertEqual(
+            blocker.related_files,
+            ("src/docode/a.py",),
+        )
+
+    def test_semantically_identical_paths_have_same_fingerprint(self) -> None:
+        windows = _make_blocker(related_files=("src\\docode\\a.py",))
+        posix = _make_blocker(related_files=("src/docode/a.py",))
+        self.assertEqual(windows.fingerprint(), posix.fingerprint())
+
 
 # ── 11.9  empty blocker code rejected ────────────────────────────────────
 

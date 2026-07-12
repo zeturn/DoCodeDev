@@ -19,9 +19,8 @@ runtime component.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
-from functools import total_ordering
 import hashlib
 import json
 from typing import Any
@@ -110,6 +109,21 @@ def _stable_strings(values: tuple[str, ...]) -> tuple[str, ...]:
     )
 
 
+def _stable_paths(values: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalise file paths: string→strip→backslash→slash→dedup→sort.
+
+    Backslash replacement happens **before** deduplication so that
+    ``src\\docode\\a.py`` and ``src/docode/a.py`` are recognised as the
+    same path.
+    """
+    normalized = {
+        str(value).strip().replace("\\", "/")
+        for value in values
+        if str(value).strip()
+    }
+    return tuple(sorted(normalized))
+
+
 def _canonical_json_fingerprint(payload: dict[str, Any]) -> str:
     """Return a 64-char lowercase SHA-256 hex fingerprint of *payload*."""
     encoded = json.dumps(
@@ -189,10 +203,7 @@ class FinalizationBlocker:
         object.__setattr__(
             self,
             "related_files",
-            tuple(
-                value.replace("\\", "/")
-                for value in _stable_strings(self.related_files)
-            ),
+            _stable_paths(self.related_files),
         )
         object.__setattr__(
             self,
