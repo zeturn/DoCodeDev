@@ -13,7 +13,7 @@ from docode.storage.models import CodingJob, JobStatus, new_id
 
 from .definitions import CASES, LEAKAGE_MARKERS
 from .harness import HoldoutLocalTools, ScriptedHoldoutLLM, materialize_fixture, summarize_steps, validate_workspace
-from tests.test_smoke_readme_job import RecordingRepository
+from tests.support.repository import RecordingRepository
 
 
 class HoldoutFixtureTests(TestCase):

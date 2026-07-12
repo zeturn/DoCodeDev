@@ -42,7 +42,7 @@ from tests.crawler_benchmark_v1.harness import (
     variant_source,
 )
 from tests.test_real_llm_smoke import build_real_llm_or_skip
-from tests.test_smoke_readme_job import RecordingRepository
+from tests.support.repository import RecordingRepository
 
 
 REAL_ENABLED = os.getenv("DOCODE_CRAWLER_BENCHMARK_V1", "").lower() in {"1", "true", "yes", "on"}

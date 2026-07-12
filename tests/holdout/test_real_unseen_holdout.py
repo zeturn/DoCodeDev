@@ -23,7 +23,7 @@ from docode.storage.models import CodingJob, JobStatus, new_id
 from .definitions import CASES, HoldoutCase
 from .harness import EDIT_TOOLS, READ_TOOLS, materialize_fixture, sanitize, summarize_steps
 from tests.test_real_llm_smoke import build_real_llm_or_skip
-from tests.test_smoke_readme_job import RecordingRepository
+from tests.support.repository import RecordingRepository
 
 
 REAL_HOLDOUT_ENABLED = os.getenv("DOCODE_REAL_HOLDOUT", "").lower() in {"1", "true", "yes", "on"}

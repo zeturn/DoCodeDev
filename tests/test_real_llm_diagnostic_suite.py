@@ -31,7 +31,8 @@ from docode.runtime.smoke import check_http_health, ensure_dobox_smoke_token
 from docode.storage.models import CodingJob, DocodeStep, JobStatus, new_id
 
 from tests.test_real_llm_smoke import build_real_llm_or_skip
-from tests.test_smoke_readme_job import RecordingRepository, normalize_path
+from tests.support.repository import RecordingRepository
+from tests.support.path_utils import normalize_path
 
 
 REAL_LLM_SMOKE_ENABLED = os.getenv("DOCODE_REAL_LLM_SMOKE", "").lower() in {"1", "true", "yes", "on"}
