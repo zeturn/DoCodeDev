@@ -191,10 +191,9 @@ class DiagnosticLocalTools:
 
     async def apply_patch(self, patch: str) -> ToolResult:
         completed = subprocess.run(
-            "git apply --whitespace=nowarn -",
+            ["git", "apply", "--whitespace=nowarn", "-"],
             input=patch,
             cwd=self.workspace,
-            shell=True,
             text=True,
             capture_output=True,
             check=False,
@@ -204,7 +203,12 @@ class DiagnosticLocalTools:
             path = match.group(1).strip()
             if path != "/dev/null" and path not in paths:
                 paths.append(path)
-        return ToolResult(tool="apply_patch", output=completed.stdout + completed.stderr, exit_code=completed.returncode, metadata={"paths": paths})
+        return ToolResult(
+            tool="apply_patch",
+            output=completed.stdout + completed.stderr,
+            exit_code=completed.returncode,
+            metadata={"paths": paths, "patch_bytes": len(patch.encode("utf-8")), "stderr": completed.stderr},
+        )
 
     async def search(self, query: str, path: str = ".") -> ToolResult:
         root = safe_workspace_path(self.workspace, normalize_path(path) or ".")
