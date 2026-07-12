@@ -167,6 +167,30 @@ class CodingAgentLoop:
 
         return assessment
 
+    async def record_synthetic_tool_outcome(
+        self,
+        state: AgentState,
+        *,
+        tool_name: str,
+        tool_args: dict[str, object],
+        result: ToolResult,
+        progress: bool,
+    ) -> NoProgressAssessment:
+        """Unified outcome for synthetic/cached tool results (duplicate reads, repair policy)."""
+        action_key = tool_action_key(tool_name, tool_args)
+        before_fp = state_progress_fingerprint(state)
+        state.add_tool_result(result)
+        after_fp = state_progress_fingerprint(state)
+        outcome = StepOutcome(
+            kind=OutcomeKind.TOOL,
+            action_key=action_key,
+            success=result.ok,
+            progress=progress,
+            state_fingerprint_before=before_fp,
+            state_fingerprint_after=after_fp,
+        )
+        return await self.record_step_outcome(state, outcome, state.job)
+
     @staticmethod
     def _render_step_outcome_feedback(
         outcome: StepOutcome,
@@ -416,7 +440,6 @@ class CodingAgentLoop:
                     continue
                 repair_read_result = targeted_repair_read_policy_result(state, tool_name, tool_args)
                 if repair_read_result is not None:
-                    state.add_tool_result(repair_read_result)
                     await self.repository.add_step(
                         job.id,
                         "tool",
@@ -429,6 +452,13 @@ class CodingAgentLoop:
                             "truncated": repair_read_result.truncated,
                             "metadata": repair_read_result.metadata or {},
                         },
+                    )
+                    await self.record_synthetic_tool_outcome(
+                        state,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        result=repair_read_result,
+                        progress=False,
                     )
                     state.iteration += 1
                     continue
@@ -477,7 +507,6 @@ class CodingAgentLoop:
                         tool_args = {"command": retarget_command, "cwd": "/workspace"}
                     else:
                         result = cached_duplicate_read_result(state, tool_args, duplicate_read_block)
-                        state.add_tool_result(result)
                         await self.repository.add_step(
                             job.id,
                             "tool",
@@ -490,6 +519,13 @@ class CodingAgentLoop:
                                 "truncated": result.truncated,
                                 "metadata": result.metadata or {},
                             },
+                        )
+                        await self.record_synthetic_tool_outcome(
+                            state,
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            result=result,
+                            progress=False,
                         )
                         state.iteration += 1
                         continue
@@ -576,7 +612,6 @@ class CodingAgentLoop:
                         f"REPEATED ACTION BLOCKED: Do not repeat {action_key}. "
                         f"Choose a different action."
                     )
-                    state.iteration += 1
                     continue
 
                 await self.repository.add_step(

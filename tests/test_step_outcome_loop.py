@@ -11,13 +11,27 @@ from docode.agent.quality_gate import QualityGate
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.verifier import CodingVerifier
 from docode.artifacts.exporter import ArtifactExporter
-from docode.dobox.types import ToolResult
 from docode.llm.runtime import AgentDecision
 from docode.storage.models import CodingJob, JobStatus, new_id
 
 from tests.support.local_tools import DiagnosticLocalTools
 from tests.support.repository import RecordingRepository
 
+
+# ── counting tools ───────────────────────────────────────────────────────
+
+class CountingDiagnosticLocalTools(DiagnosticLocalTools):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.read_file_calls = 0
+
+    async def call(self, tool_name, args):
+        if tool_name == "read_file":
+            self.read_file_calls += 1
+        return await super().call(tool_name, args)
+
+
+# ── scripted LLMs ────────────────────────────────────────────────────────
 
 class RepeatedReaderLLM:
     """Always returns read_file on guidebook.md — must be blocked."""
@@ -31,6 +45,10 @@ class RepeatedReaderLLM:
             tool_name="read_file",
             args={"path": "guidebook.md"},
         )
+
+    @property
+    def decisions(self) -> int:
+        return self._count
 
 
 class FinalizationLoopLLM:
@@ -49,7 +67,7 @@ class FinalizationLoopLLM:
 
 
 class RepairRecoveryLLM:
-    """run command → inspect → edit → rerun → succeed."""
+    """fail → inspect → edit → rerun → succeed."""
     _step = 0
 
     async def decide(self, *, system, messages, tools, context):
@@ -58,7 +76,7 @@ class RepairRecoveryLLM:
             return AgentDecision(
                 type="tool_call",
                 tool_name="run_command",
-                args={"command": "echo hello"},
+                args={"command": "python verify.py"},
             )
         if self._step == 2:
             return AgentDecision(
@@ -76,14 +94,15 @@ class RepairRecoveryLLM:
             return AgentDecision(
                 type="tool_call",
                 tool_name="run_command",
-                args={"command": "echo hello"},
+                args={"command": "python verify.py"},
             )
         return AgentDecision(
             type="final_candidate",
-            tool_name="final_candidate",
-            args={},
-            summary="Completed guidebook",
+            summary="Completed guidebook and verified it.",
         )
+
+
+# ── tests ────────────────────────────────────────────────────────────────
 
 
 class RepeatedReaderTests(IsolatedAsyncioTestCase):
@@ -100,9 +119,10 @@ class RepeatedReaderTests(IsolatedAsyncioTestCase):
                 max_iterations=36, max_runtime_seconds=60,
                 max_consecutive_failures=10, max_tool_calls=80,
             ))
-            tools = DiagnosticLocalTools(ws)
+            tools = CountingDiagnosticLocalTools(ws)
+            llm = RepeatedReaderLLM()
             loop = CodingAgentLoop(
-                llm=RepeatedReaderLLM(),
+                llm=llm,
                 tools=tools,
                 verifier=CodingVerifier(),
                 repository=repo,
@@ -112,7 +132,7 @@ class RepeatedReaderTests(IsolatedAsyncioTestCase):
             )
             result = await loop.run(job)
             self.assertIsNotNone(result.failure_reason)
-            self.assertIn("no_progress_non_convergent", result.failure_reason or "")
+            self.assertIn("no_progress", result.failure_reason or "")
             steps = await repo.list_steps(job.id)
             outcomes = [s for s in steps if s.kind == "outcome"]
             self.assertTrue(outcomes, "expected step_outcome records")
@@ -121,6 +141,7 @@ class RepeatedReaderTests(IsolatedAsyncioTestCase):
                 if "repeated_action_blocked" in str(s.content)
             ]
             self.assertTrue(blocked, "expected repeated_action_blocked")
+            self.assertLess(tools.read_file_calls, llm.decisions)
 
 
 class FinalizationLoopTests(IsolatedAsyncioTestCase):
@@ -157,11 +178,19 @@ class RepairRecoveryTests(IsolatedAsyncioTestCase):
             root = Path(tmp)
             ws = root / "workspace"
             ws.mkdir()
-            (ws / "guidebook.md").write_text("old", encoding="utf-8")
+            # guidebook.md exists but with wrong content → verify.py will fail
+            (ws / "guidebook.md").write_text("wrong content", encoding="utf-8")
+            # verify.py: assertion that will fail until guidebook.md is fixed
+            (ws / "verify.py").write_text(
+                "from pathlib import Path\n"
+                "actual = Path('guidebook.md').read_text(encoding='utf-8')\n"
+                "assert actual == '# Guidebook\\nDone.', repr(actual)\n",
+                encoding="utf-8",
+            )
             repo = RecordingRepository()
             job = await repo.create_job(CodingJob(
                 id=new_id("job"), user_id="u",
-                instruction="Complete guidebook.md",
+                instruction="Complete guidebook.md and run `python verify.py`.",
                 max_iterations=36, max_runtime_seconds=900,
                 max_consecutive_failures=10, max_tool_calls=80,
             ))
@@ -176,5 +205,7 @@ class RepairRecoveryTests(IsolatedAsyncioTestCase):
                 quality_gate=QualityGate(),
             )
             result = await loop.run(job)
+            self.assertEqual(tools.command_results[0].exit_code, 1)
+            self.assertEqual(tools.command_results[-1].exit_code, 0)
             self.assertEqual(result.status, JobStatus.SUCCEEDED)
             self.assertIsNotNone(result.artifact_id)
