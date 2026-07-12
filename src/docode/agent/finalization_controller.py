@@ -2,6 +2,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from docode.agent.outcome import (
+    BlockerSource,
+    FinalizationBlocker,
+    RequiredAction,
+)
+
+if TYPE_CHECKING:
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,46 +37,116 @@ class ExportCompletionState:
 @dataclass(frozen=True, slots=True)
 class FinalizationDecision:
     ready: bool
-    failures: tuple[str, ...]
+    blockers: tuple[FinalizationBlocker, ...]
+
+    @property
+    def failures(self) -> tuple[str, ...]:
+        """Backward-compatible accessor returning blocker codes."""
+        return tuple(blocker.code for blocker in self.blockers)
 
 
 class FinalizationController:
     def evaluate_pre_export(self, state: PreExportFinalizationState) -> FinalizationDecision:
-        failures: list[str] = []
+        blockers: list[FinalizationBlocker] = []
         changed = set(state.changed_files)
+
         if not state.diff.strip() or not changed:
-            failures.append("diff_empty")
+            blockers.append(_make(
+                "diff_empty", BlockerSource.FINALIZATION,
+                RequiredAction.EDIT_TARGET,
+                message="No non-empty diff or changed files",
+            ))
+
         missing = [path for path in state.required_files if path not in changed]
         if missing:
-            failures.append("required_files_missing:" + ",".join(missing))
+            blockers.append(_make(
+                "required_files_missing", BlockerSource.FINALIZATION,
+                RequiredAction.EDIT_TARGET,
+                message=f"Required files not modified: {', '.join(missing)}",
+                related_files=tuple(missing),
+            ))
+
         if changed and all(_generated_or_cache(path) for path in changed):
-            failures.append("generated_or_cache_only")
+            blockers.append(_make(
+                "generated_or_cache_only", BlockerSource.FINALIZATION,
+                RequiredAction.EDIT_TARGET,
+                message="Only generated/cache files changed",
+            ))
+
         added = "\n".join(line[1:] for line in state.diff.splitlines() if line.startswith("+") and not line.startswith("+++"))
         if re.search(r"(?im)^\s*(?:#|//)?\s*(?:TODO|FIXME)\b|placeholder|not implemented", added):
-            failures.append("placeholder_or_debug_marker")
+            blockers.append(_make(
+                "placeholder_or_debug_marker", BlockerSource.FINALIZATION,
+                RequiredAction.REMOVE_PLACEHOLDER,
+                message="Placeholder/TODO/stub text in diff",
+            ))
+
         if not state.explicit_commands_fresh:
-            failures.append("explicit_commands_stale")
+            blockers.append(_make(
+                "explicit_commands_stale", BlockerSource.VERIFICATION_SCHEDULER,
+                RequiredAction.RUN_REQUIRED_COMMAND,
+                message="Explicit verification commands are stale",
+            ))
+
         if not state.semantic_contract_passed:
-            failures.append("semantic_contract_failed")
+            blockers.append(_make(
+                "semantic_contract_failed", BlockerSource.QUALITY_GATE,
+                RequiredAction.REPAIR_SEMANTIC_FAILURE,
+                message="Semantic contract / quality gate failed",
+            ))
+
         if not state.repair_cleared:
-            failures.append("repair_active")
+            blockers.append(_make(
+                "repair_active", BlockerSource.REPAIR_COORDINATOR,
+                RequiredAction.CONTINUE_REPAIR,
+                message="Repair still active",
+            ))
+
         if state.stale_verification:
-            failures.append("verification_stale")
+            blockers.append(_make(
+                "verification_stale", BlockerSource.VERIFICATION_SCHEDULER,
+                RequiredAction.RUN_REQUIRED_COMMAND,
+                message="Verification evidence is stale",
+            ))
+
         if not state.task_graph_complete:
-            failures.append("task_graph_incomplete")
+            blockers.append(_make(
+                "task_graph_incomplete", BlockerSource.TASK_GRAPH,
+                RequiredAction.COMPLETE_TASK_NODE,
+                message="Task graph incomplete",
+            ))
+
         if not state.review_passed:
-            failures.append("review_failed")
+            blockers.append(_make(
+                "review_failed", BlockerSource.REVIEW,
+                RequiredAction.REPAIR_REVIEW_FINDING,
+                message="Independent review failed",
+            ))
+
         if not state.summary.strip():
-            failures.append("summary_empty")
-        return FinalizationDecision(not failures, tuple(failures))
+            blockers.append(_make(
+                "summary_empty", BlockerSource.FINALIZATION,
+                RequiredAction.PROVIDE_FINAL_SUMMARY,
+                message="No final summary provided",
+            ))
+
+        return FinalizationDecision(not blockers, tuple(blockers))
 
     def evaluate_export(self, state: ExportCompletionState) -> FinalizationDecision:
-        failures = []
+        blockers: list[FinalizationBlocker] = []
         if not state.artifact_id:
-            failures.append("artifact_id_missing")
+            blockers.append(_make(
+                "artifact_id_missing", BlockerSource.EXPORT,
+                RequiredAction.RETRY_EXPORT,
+                message="Artifact ID missing",
+            ))
         if state.artifact_count <= 0:
-            failures.append("artifact_files_missing")
-        return FinalizationDecision(not failures, tuple(failures))
+            blockers.append(_make(
+                "artifact_files_missing", BlockerSource.EXPORT,
+                RequiredAction.RETRY_EXPORT,
+                message="No artifact files produced",
+            ))
+        return FinalizationDecision(not blockers, tuple(blockers))
 
     def evaluate(self, state: "FinalizationState") -> FinalizationDecision:
         pre = self.evaluate_pre_export(PreExportFinalizationState(
@@ -95,3 +175,26 @@ class FinalizationState:
 def _generated_or_cache(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
     return any(part in normalized.split("/") for part in ("__pycache__", "dist", "build", ".cache")) or normalized.endswith((".pyc", ".pyo"))
+
+
+# ── adapter helpers ──────────────────────────────────────────────────────
+
+
+def _make(
+    code: str,
+    source: BlockerSource,
+    action: RequiredAction,
+    message: str = "",
+    related_files: tuple[str, ...] = (),
+    related_commands: tuple[str, ...] = (),
+    related_node_ids: tuple[str, ...] = (),
+) -> FinalizationBlocker:
+    return FinalizationBlocker(
+        code=code,
+        source=source,
+        message=message or code,
+        required_action=action,
+        related_files=related_files,
+        related_commands=related_commands,
+        related_node_ids=related_node_ids,
+    )
