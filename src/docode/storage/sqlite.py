@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .models import CodingJob, DocodeArtifact, DocodeStep, JobStatus, new_id, parse_datetime, utcnow
+from .models import CodingJob, DocodeArtifact, DocodeStep, JobStatus, MissionJob, new_id, parse_datetime, utcnow
 from .repository import JobRepository
 
 
@@ -79,6 +79,22 @@ class SQLiteJobRepository(JobRepository):
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_docode_artifacts_job_id ON docode_artifacts(job_id);
+
+            CREATE TABLE IF NOT EXISTS docode_mission_jobs (
+                id TEXT PRIMARY KEY,
+                mission_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                araneae_task_id TEXT,
+                araneae_schedule_id TEXT,
+                hashslip_input_collection TEXT,
+                hashslip_output_collection TEXT,
+                metadata TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_docode_mission_jobs_mission_id ON docode_mission_jobs(mission_id);
             """
         )
         self._ensure_column("docode_jobs", "max_tool_calls", "INTEGER NOT NULL DEFAULT 100")
@@ -247,6 +263,40 @@ class SQLiteJobRepository(JobRepository):
             ).fetchall()
             return [artifact_from_row(row) for row in rows]
 
+    async def create_mission_job(self, mission_job: MissionJob) -> MissionJob:
+        async with self._lock:
+            self._conn.execute(
+                """INSERT INTO docode_mission_jobs (
+                    id, mission_id, name, kind, status, araneae_task_id, araneae_schedule_id,
+                    hashslip_input_collection, hashslip_output_collection, metadata, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    mission_id=excluded.mission_id,
+                    name=excluded.name,
+                    kind=excluded.kind,
+                    status=excluded.status,
+                    araneae_task_id=excluded.araneae_task_id,
+                    araneae_schedule_id=excluded.araneae_schedule_id,
+                    hashslip_input_collection=excluded.hashslip_input_collection,
+                    hashslip_output_collection=excluded.hashslip_output_collection,
+                    metadata=excluded.metadata,
+                    updated_at=excluded.updated_at""",
+                mission_job_to_row(mission_job),
+            )
+            self._conn.commit()
+            return mission_job
+
+    async def list_mission_jobs(self, mission_id: str | None = None) -> list[MissionJob]:
+        async with self._lock:
+            if mission_id:
+                rows = self._conn.execute(
+                    "SELECT * FROM docode_mission_jobs WHERE mission_id = ? ORDER BY created_at ASC",
+                    (mission_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM docode_mission_jobs ORDER BY created_at ASC").fetchall()
+            return [mission_job_from_row(row) for row in rows]
+
 
 def iso(value: Any) -> str | None:
     return value.isoformat() if value is not None else None
@@ -364,4 +414,38 @@ def artifact_from_row(row: sqlite3.Row) -> DocodeArtifact:
         path=str(row["path"]),
         size_bytes=int(row["size_bytes"]),
         created_at=parse_datetime(row["created_at"]) or utcnow(),
+    )
+
+
+def mission_job_to_row(mission_job: MissionJob) -> tuple[object, ...]:
+    return (
+        mission_job.id,
+        mission_job.mission_id,
+        mission_job.name,
+        mission_job.kind,
+        mission_job.status,
+        mission_job.araneae_task_id,
+        mission_job.araneae_schedule_id,
+        mission_job.hashslip_input_collection,
+        mission_job.hashslip_output_collection,
+        json.dumps(mission_job.metadata, ensure_ascii=False),
+        iso(mission_job.created_at),
+        iso(mission_job.updated_at),
+    )
+
+
+def mission_job_from_row(row: sqlite3.Row) -> MissionJob:
+    return MissionJob(
+        id=str(row["id"]),
+        mission_id=str(row["mission_id"]),
+        name=str(row["name"]),
+        kind=str(row["kind"]),
+        status=str(row["status"]),
+        araneae_task_id=row["araneae_task_id"],
+        araneae_schedule_id=row["araneae_schedule_id"],
+        hashslip_input_collection=row["hashslip_input_collection"],
+        hashslip_output_collection=row["hashslip_output_collection"],
+        metadata=json.loads(str(row["metadata"] or "{}")),
+        created_at=parse_datetime(row["created_at"]) or utcnow(),
+        updated_at=parse_datetime(row["updated_at"]) or utcnow(),
     )

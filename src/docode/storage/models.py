@@ -94,3 +94,19 @@ class DocodeArtifact:
     path: str
     size_bytes: int
     created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(slots=True)
+class MissionJob:
+    id: str
+    mission_id: str
+    name: str
+    kind: str = "moiip_rss_tdt"
+    status: str = "created"
+    araneae_task_id: str | None = None
+    araneae_schedule_id: str | None = None
+    hashslip_input_collection: str | None = None
+    hashslip_output_collection: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
