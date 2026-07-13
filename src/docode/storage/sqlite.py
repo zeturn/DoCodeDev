@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .models import CodingJob, DocodeArtifact, DocodeStep, JobStatus, MissionJob, new_id, parse_datetime, utcnow
+from .models import CodingJob, DocodeArtifact, DocodeStep, JobStatus, MissionJob, MissionSpec, new_id, parse_datetime, utcnow
 from .repository import JobRepository
 
 
@@ -95,6 +95,15 @@ class SQLiteJobRepository(JobRepository):
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_docode_mission_jobs_mission_id ON docode_mission_jobs(mission_id);
+
+            CREATE TABLE IF NOT EXISTS docode_mission_specs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_column("docode_jobs", "max_tool_calls", "INTEGER NOT NULL DEFAULT 100")
@@ -118,6 +127,19 @@ class SQLiteJobRepository(JobRepository):
 
     def close(self) -> None:
         self._conn.close()
+
+    async def create_mission_spec(self, mission_spec: MissionSpec) -> MissionSpec:
+        async with self._lock:
+            self._conn.execute("INSERT OR REPLACE INTO docode_mission_specs (id, name, status, spec, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (mission_spec.id, mission_spec.name, mission_spec.status, json.dumps(mission_spec.spec), iso(mission_spec.created_at), iso(mission_spec.updated_at)))
+            self._conn.commit()
+            return mission_spec
+
+    async def get_mission_spec(self, mission_id: str) -> MissionSpec | None:
+        async with self._lock:
+            row = self._conn.execute("SELECT * FROM docode_mission_specs WHERE id = ?", (mission_id,)).fetchone()
+        if row is None:
+            return None
+        return MissionSpec(id=str(row["id"]), name=str(row["name"]), status=str(row["status"]), spec=json.loads(str(row["spec"])), created_at=parse_datetime(str(row["created_at"])) or utcnow(), updated_at=parse_datetime(str(row["updated_at"])) or utcnow())
 
     async def create_job(self, job: CodingJob) -> CodingJob:
         async with self._lock:

@@ -110,3 +110,13 @@ class MissionJob:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(slots=True)
+class MissionSpec:
+    id: str
+    name: str
+    status: str = "active"
+    spec: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)

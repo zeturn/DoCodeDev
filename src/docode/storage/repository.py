@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
-from .models import CodingJob, DocodeArtifact, DocodeStep, JobStatus, MissionJob, new_id, utcnow
+from .models import CodingJob, DocodeArtifact, DocodeStep, JobStatus, MissionJob, MissionSpec, new_id, utcnow
 
 
 class JobRepository:
@@ -46,6 +46,12 @@ class JobRepository:
     async def list_mission_jobs(self, mission_id: str | None = None) -> list[MissionJob]:
         raise NotImplementedError
 
+    async def create_mission_spec(self, mission_spec: MissionSpec) -> MissionSpec:
+        raise NotImplementedError
+
+    async def get_mission_spec(self, mission_id: str) -> MissionSpec | None:
+        raise NotImplementedError
+
 
 class InMemoryJobRepository(JobRepository):
     def __init__(self) -> None:
@@ -54,6 +60,7 @@ class InMemoryJobRepository(JobRepository):
         self._steps: dict[str, list[DocodeStep]] = {}
         self._artifacts: dict[str, list[DocodeArtifact]] = {}
         self._mission_jobs: dict[str, MissionJob] = {}
+        self._mission_specs: dict[str, MissionSpec] = {}
 
     async def create_job(self, job: CodingJob) -> CodingJob:
         async with self._lock:
@@ -155,6 +162,15 @@ class InMemoryJobRepository(JobRepository):
         if mission_id is None:
             return jobs
         return [job for job in jobs if job.mission_id == mission_id]
+
+    async def create_mission_spec(self, mission_spec: MissionSpec) -> MissionSpec:
+        async with self._lock:
+            self._mission_specs[mission_spec.id] = mission_spec
+            return mission_spec
+
+    async def get_mission_spec(self, mission_id: str) -> MissionSpec | None:
+        async with self._lock:
+            return self._mission_specs.get(mission_id)
 
 
 def terminal_status(status: JobStatus) -> bool:
