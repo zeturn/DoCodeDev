@@ -13,6 +13,32 @@ import {
 } from './api';
 
 const STORAGE_TOKEN_KEY = 'docode.authToken';
+const STORAGE_THEME_KEY = 'docode-theme';
+
+function getInitialTheme(): 'light' | 'dark' {
+  if (typeof window === 'undefined') return 'dark';
+  const stored = localStorage.getItem(STORAGE_THEME_KEY);
+  if (stored === 'light' || stored === 'dark') return stored;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function ThemeToggle({ theme, onToggle }: { theme: 'light' | 'dark'; onToggle: () => void }) {
+  return (
+    <button type="button" className="theme-toggle" onClick={onToggle} aria-label="Toggle theme" title={theme === 'dark' ? 'Switch to light' : 'Switch to dark'}>
+      {theme === 'dark' ? (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+        </svg>
+      ) : (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 const TERMINAL_STATUSES: JobStatus[] = ['succeeded', 'failed', 'stopped'];
 const INLINE_VALUE_MAX_LENGTH = 180;
 const OUTPUT_PREVIEW_MAX_LENGTH = 2400;
@@ -60,6 +86,13 @@ function App() {
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
+
+  const [theme, setTheme] = useState<'light' | 'dark'>(getInitialTheme);
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    localStorage.setItem(STORAGE_THEME_KEY, theme);
+  }, [theme]);
+  const toggleTheme = () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
 
   const selectedJobFromList = useMemo(() => jobs.find((job) => job.id === selectedJobId) ?? null, [jobs, selectedJobId]);
 
@@ -291,11 +324,14 @@ function App() {
             <p className="eyebrow">API</p>
             <h2>{apiBase() || 'same origin'}</h2>
           </div>
-          {activeJob && (
-            <button type="button" className="danger" onClick={() => void onCancelJob()} disabled={isTerminalStatus(activeJob.status)}>
-              Cancel job
-            </button>
-          )}
+          <div className="topbar-actions">
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
+            {activeJob && (
+              <button type="button" className="danger" onClick={() => void onCancelJob()} disabled={isTerminalStatus(activeJob.status)}>
+                Cancel job
+              </button>
+            )}
+          </div>
         </header>
 
         {error && <div className="alert error">{error}</div>}
