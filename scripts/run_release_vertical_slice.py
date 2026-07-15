@@ -25,10 +25,12 @@ import argparse
 import asyncio
 import json
 import os
+from datetime import datetime
 import re
 import shutil
 import subprocess
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,22 @@ from docode.storage.models import CodingJob, JobStatus, new_id, public_job_dict
 from docode.storage.repository import InMemoryJobRepository
 from docode.storage.step_redaction import redacted_step_content
 from docode.worker.runner import JobRunnerService
+
+def _json_default(value: Any) -> Any:
+    """Serialization fallback for evidence JSON.
+
+    Explicitly handles the value types the evidence bundle can carry. It does
+    NOT fall back to a broad ``str()`` for unknown types, so a genuinely
+    non-serializable object fails loudly instead of being silently mangled.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
 
 FIXTURE_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "release_vertical_slice"
 
@@ -557,7 +575,10 @@ async def write_evidence_bundle(
             data = payload.encode("utf-8") if isinstance(payload, str) else payload
             (run_dir / name).write_bytes(data)
         else:
-            (run_dir / name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            (run_dir / name).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+                encoding="utf-8",
+            )
 
     _write("summary.json", summary)
     _write("job.json", build_job_record(job))
@@ -585,6 +606,34 @@ async def write_evidence_bundle(
 
 
 # ── Single-run driver ─────────────────────────────────────────────────────
+
+
+def _build_coding_job(
+    config: Any,
+    *,
+    user_id: str,
+    instruction: str,
+    provider: str,
+    model: str,
+) -> CodingJob:
+    """Construct the CodingJob for a release vertical-slice run.
+
+    ``max_consecutive_failures`` is intentionally NOT taken from ``DocodeConfig``
+    (``DocodeConfig`` has no such attribute); the job falls back to the dataclass
+    default defined on ``CodingJob``. This keeps the harness resilient to config
+    shape changes and avoids hard-coding the value here.
+    """
+    return CodingJob(
+        id=new_id("job"),
+        user_id=user_id,
+        instruction=instruction,
+        provider=provider,
+        model=model,
+        max_iterations=config.max_iterations,
+        max_runtime_seconds=config.max_runtime_seconds,
+        max_tool_calls=config.max_tool_calls,
+        artifact_mode="patch",
+    )
 
 
 async def run_single_job(
@@ -630,17 +679,12 @@ async def run_single_job(
     )
 
     job = await repo.create_job(
-        CodingJob(
-            id=new_id("job"),
+        _build_coding_job(
+            config,
             user_id="release-vertical-slice",
             instruction=INSTRUCTION,
             provider=provider,
             model=model,
-            max_iterations=config.max_iterations,
-            max_runtime_seconds=config.max_runtime_seconds,
-            max_tool_calls=config.max_tool_calls,
-            max_consecutive_failures=config.max_consecutive_failures,
-            artifact_mode="patch",
         )
     )
     run_id = job.id

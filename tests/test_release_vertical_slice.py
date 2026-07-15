@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -36,6 +37,8 @@ from run_release_vertical_slice import (  # noqa: E402
     FIXTURE_ROOT,
     DoboxReadiness,
     LocalWorkspaceInspector,
+    _build_coding_job,
+    _json_default,
     build_job_record,
     build_outcomes_record,
     build_steps_record,
@@ -481,6 +484,85 @@ class EvidenceDoBoxRuntimeTests(unittest.TestCase):
         self.assertIn("dobox_runtime", summary)
         self.assertEqual(summary["dobox_runtime"]["dobox_backend_dir"], "../DoBoxDev/backend")
         self.assertEqual(summary["dobox_runtime"]["dobox_mode"], "autostarted")
+
+
+class BuildCodingJobTests(unittest.TestCase):
+    def test_minimal_docode_config_does_not_raise(self):
+        # A minimal real DocodeConfig() must be usable to build a release
+        # vertical-slice job without AttributeError on max_consecutive_failures.
+        config = DocodeConfig()
+        job = _build_coding_job(
+            config,
+            user_id="release-vertical-slice",
+            instruction="fix the calculator bug",
+            provider="openai",
+            model="gpt-5.4-mini",
+        )
+        self.assertEqual(job.user_id, "release-vertical-slice")
+        self.assertEqual(job.provider, "openai")
+        self.assertEqual(job.model, "gpt-5.4-mini")
+        self.assertEqual(job.artifact_mode, "patch")
+        # model-defined default, not a runner hard-coded value.
+        model_default = CodingJob.__dataclass_fields__["max_consecutive_failures"].default
+        self.assertEqual(job.max_consecutive_failures, model_default)
+        self.assertEqual(job.max_iterations, config.max_iterations)
+        self.assertEqual(job.max_runtime_seconds, config.max_runtime_seconds)
+        self.assertEqual(job.max_tool_calls, config.max_tool_calls)
+
+
+class JsonDefaultSerializerTests(unittest.TestCase):
+    def test_datetime_iso8601(self):
+        dt = datetime(2026, 7, 15, 20, 37, 5)
+        self.assertEqual(_json_default(dt), "2026-07-15T20:37:05")
+
+    def test_enum_value(self):
+        self.assertEqual(_json_default(JobStatus.SUCCEEDED), "succeeded")
+        self.assertEqual(_json_default(JobStatus.FAILED), "failed")
+
+    def test_path_string(self):
+        p = Path("/tmp/workspace/calculator.py")
+        self.assertIsInstance(_json_default(p), str)
+        self.assertEqual(_json_default(p), str(p))
+
+    def test_unknown_object_raises_type_error(self):
+        class _Unserializable:
+            pass
+
+        with self.assertRaises(TypeError):
+            _json_default(_Unserializable())
+
+    def test_job_and_summary_bundle_writes_without_secrets(self):
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u",
+            instruction="fix it",
+            provider="openai",
+            model="gpt-5.4-mini",
+            apicred_access_token="super-secret-token",
+            dobox_project_id="proj-1",
+            status=JobStatus.SUCCEEDED,
+            artifact_id="art-1",
+        )
+        # build_job_record / build_summary redact sensitive fields; the
+        # serializer must round-trip datetimes/enums without swallowing errors.
+        record = build_job_record(job)
+        serialized = json.dumps(record, default=_json_default)
+        self.assertNotIn("super-secret-token", serialized)
+        self.assertNotIn("sk-", serialized)
+        summary = build_summary(
+            run_id=job.id,
+            fixture="simple_bugfix",
+            job=job,
+            iterations=3,
+            tool_calls=5,
+            outcome_count=8,
+            components={"runner": "JobRunnerService", "llm": "DoCodeDecisionAdapter", "tools": "DoBoxTools", "repository": "InMemoryJobRepository", "exporter": "ArtifactExporter"},
+            started_at=job.created_at.isoformat(),
+            finished_at=job.completed_at.isoformat() if job.completed_at else job.updated_at.isoformat(),
+        )
+        summary_blob = json.dumps(summary, default=_json_default)
+        self.assertIn("redacted", summary_blob)
+        self.assertNotIn("sk-", summary_blob)
 
 
 if __name__ == "__main__":
