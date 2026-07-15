@@ -13,9 +13,12 @@ from urllib.parse import urlparse
 
 from docode.agent.context import ContextManager, ContextPack, target_file_guidance
 from docode.agent.artifact_validator import ExecutionEvidence
+from docode.agent.action_keys import final_candidate_action_key, rejected_action_key, tool_action_key
 from docode.agent.finalization_controller import ExportCompletionState, FinalizationController, PreExportFinalizationState
 from docode.agent.failure_taxonomy import FailureCategory, TerminalResult, category_for_reason
 from docode.agent.inspector import ProjectInspector
+from docode.agent.no_progress import NoProgressAssessment, NoProgressEscalation
+from docode.agent.outcome import BlockerSource, FinalizationBlocker, OutcomeKind, RequiredAction, StepOutcome
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
 from docode.agent.repair_planner import (
@@ -41,6 +44,7 @@ from docode.agent.source_inspection import (
     source_inspection_evidence,
     successful_source_inspection,
 )
+from docode.agent.progress import state_progress_fingerprint
 from docode.agent.state import AgentState
 from docode.agent.source_policy import continuation_allowed, source_progress_forced, source_tool_block
 from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
@@ -132,6 +136,101 @@ class CodingAgentLoop:
         self.llm_decision_timeout_seconds = max(1.0, llm_decision_timeout_seconds)
         self.runtime_components = runtime_components
 
+    async def record_step_outcome(
+        self,
+        state: AgentState,
+        outcome: StepOutcome,
+        job: CodingJob,
+    ) -> NoProgressAssessment:
+        """Centralised outcome recording: persist, track, escalate."""
+        state.last_outcome = outcome
+        state.recent_outcomes.append(outcome)
+        if len(state.recent_outcomes) > 20:
+            state.recent_outcomes = state.recent_outcomes[-20:]
+
+        state.active_blocker = outcome.primary_blocker()
+
+        assessment = state.no_progress_tracker.observe(outcome)
+
+        await self.repository.add_step(
+            job.id,
+            "outcome",
+            {
+                "type": "step_outcome",
+                **outcome.to_dict(),
+                "no_progress": assessment.to_dict(),
+            },
+        )
+
+        if assessment.escalation == NoProgressEscalation.STOP:
+            state.terminal_no_progress_reason = assessment.reason
+
+        return assessment
+
+    async def record_synthetic_tool_outcome(
+        self,
+        state: AgentState,
+        *,
+        tool_name: str,
+        tool_args: dict[str, object],
+        result: ToolResult,
+        progress: bool,
+    ) -> NoProgressAssessment:
+        """Unified outcome for synthetic/cached tool results (duplicate reads, repair policy)."""
+        action_key = tool_action_key(tool_name, tool_args)
+        before_fp = state_progress_fingerprint(state)
+        state.add_tool_result(result)
+        after_fp = state_progress_fingerprint(state)
+        outcome = StepOutcome(
+            kind=OutcomeKind.TOOL,
+            action_key=action_key,
+            success=result.ok,
+            progress=progress,
+            state_fingerprint_before=before_fp,
+            state_fingerprint_after=after_fp,
+        )
+        return await self.record_step_outcome(state, outcome, state.job)
+
+    @staticmethod
+    def _render_step_outcome_feedback(
+        outcome: StepOutcome,
+        assessment: NoProgressAssessment | None = None,
+    ) -> str:
+        """Compact structured feedback for the model's next observation."""
+        lines: list[str] = []
+        blocker = outcome.primary_blocker()
+        if blocker is not None:
+            lines.append("ACTIVE BLOCKER")
+            lines.append(f"code: {blocker.code}")
+            lines.append(f"source: {blocker.source.value}")
+            lines.append(f"required_action: {blocker.required_action.value}")
+            if blocker.related_files:
+                lines.append("related_files:")
+                for f in blocker.related_files:
+                    lines.append(f"- {f}")
+            if blocker.related_commands:
+                lines.append("related_commands:")
+                for c in blocker.related_commands:
+                    lines.append(f"- {c}")
+            if blocker.related_node_ids:
+                lines.append("related_nodes:")
+                for n in blocker.related_node_ids:
+                    lines.append(f"- {n}")
+            lines.append(f"retryable: {blocker.retryable}")
+        if assessment is not None and assessment.no_progress:
+            lines.append("")
+            lines.append("NO-PROGRESS")
+            lines.append(f"streak: {assessment.streak}")
+            lines.append(f"repeated_action_count: {assessment.repeated_action_count}")
+            lines.append(f"repeated_blocker_count: {assessment.repeated_blocker_count}")
+            if assessment.blocked_action_key:
+                lines.append(f"blocked_action: {assessment.blocked_action_key}")
+            if assessment.escalation != NoProgressEscalation.NONE:
+                lines.append(f"escalation: {assessment.escalation.value}")
+            if assessment.required_action != RequiredAction.NONE:
+                lines.append(f"instruction: {assessment.required_action.value}")
+        return "\n".join(lines) if lines else ""
+
     async def run(self, job: CodingJob) -> CodingJob:
         job = await self.repository.update_job(job.id, status=JobStatus.RUNNING)
         state = AgentState(job=job)
@@ -143,6 +242,8 @@ class CodingAgentLoop:
                 return cancelled
             if state.terminal_repair_reason:
                 return await self.fail(job.id, state.terminal_repair_reason)
+            if state.terminal_no_progress_reason:
+                return await self.fail(job.id, state.terminal_no_progress_reason)
 
             self.sync_llm_usage(state)
             stop = self.stop_policy.evaluate(state)
@@ -339,7 +440,6 @@ class CodingAgentLoop:
                     continue
                 repair_read_result = targeted_repair_read_policy_result(state, tool_name, tool_args)
                 if repair_read_result is not None:
-                    state.add_tool_result(repair_read_result)
                     await self.repository.add_step(
                         job.id,
                         "tool",
@@ -352,6 +452,13 @@ class CodingAgentLoop:
                             "truncated": repair_read_result.truncated,
                             "metadata": repair_read_result.metadata or {},
                         },
+                    )
+                    await self.record_synthetic_tool_outcome(
+                        state,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        result=repair_read_result,
+                        progress=False,
                     )
                     state.iteration += 1
                     continue
@@ -400,7 +507,6 @@ class CodingAgentLoop:
                         tool_args = {"command": retarget_command, "cwd": "/workspace"}
                     else:
                         result = cached_duplicate_read_result(state, tool_args, duplicate_read_block)
-                        state.add_tool_result(result)
                         await self.repository.add_step(
                             job.id,
                             "tool",
@@ -413,6 +519,13 @@ class CodingAgentLoop:
                                 "truncated": result.truncated,
                                 "metadata": result.metadata or {},
                             },
+                        )
+                        await self.record_synthetic_tool_outcome(
+                            state,
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            result=result,
+                            progress=False,
                         )
                         state.iteration += 1
                         continue
@@ -475,6 +588,32 @@ class CodingAgentLoop:
                 cancelled = await self.cancelled_job(job.id)
                 if cancelled is not None:
                     return cancelled
+                # -- structured outcome (before execution) --
+                action_key = tool_action_key(tool_name, tool_args)
+                before_fp = state_progress_fingerprint(state)
+
+                # exact-repeat blocking must happen BEFORE tools.call
+                if state.no_progress_tracker.should_block(action_key):
+                    outcome = StepOutcome(
+                        kind=OutcomeKind.DECISION_REJECTED,
+                        action_key=rejected_action_key("repeated_action_blocked", action_key),
+                        success=False,
+                        progress=False,
+                        state_fingerprint_before=before_fp,
+                        state_fingerprint_after=before_fp,
+                    )
+                    await self.record_step_outcome(state, outcome, job)
+                    await self.record_rejected_decision(
+                        state,
+                        reason="repeated_action_blocked",
+                        detail=f"action_key={action_key}",
+                    )
+                    state.add_feedback(
+                        f"REPEATED ACTION BLOCKED: Do not repeat {action_key}. "
+                        f"Choose a different action."
+                    )
+                    continue
+
                 await self.repository.add_step(
                     job.id,
                     "tool",
@@ -515,6 +654,29 @@ class CodingAgentLoop:
                     state.targeted_repair_edits = 0
                     if state.repair_mode == "targeted_repair":
                         state.repair_mode = None
+
+                # -- structured outcome (after execution) --
+                after_fp = state_progress_fingerprint(state)
+                progress = (
+                    result.ok
+                    and before_fp != after_fp
+                    and state.last_outcome.state_fingerprint_after != after_fp
+                    if state.last_outcome is not None
+                    else True
+                )
+                outcome = StepOutcome(
+                    kind=OutcomeKind.TOOL,
+                    action_key=action_key,
+                    success=result.ok,
+                    progress=progress,
+                    state_fingerprint_before=before_fp,
+                    state_fingerprint_after=after_fp,
+                )
+                assessment = await self.record_step_outcome(state, outcome, job)
+                feedback = self._render_step_outcome_feedback(outcome, assessment)
+                if feedback:
+                    state.add_feedback(feedback)
+
                 state.iteration += 1
                 continue
 
