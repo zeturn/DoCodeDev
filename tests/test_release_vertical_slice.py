@@ -15,6 +15,7 @@ separately by ``scripts/run_release_vertical_slice.py`` against a real DoBox.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -24,13 +25,22 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+from docode.config import DocodeConfig  # noqa: E402
+from docode.runtime.smoke import (  # noqa: E402
+    CommandProbe,
+    SmokeCheck,
+    ensure_dobox_smoke_token,
+    managed_local_dobox,
+)
 from run_release_vertical_slice import (  # noqa: E402
     FIXTURE_ROOT,
+    DoboxReadiness,
     LocalWorkspaceInspector,
     build_job_record,
     build_outcomes_record,
     build_steps_record,
     build_summary,
+    plan_dobox_readiness,
     redact_endpoint,
     resolve_provider_and_config,
     run_hidden_checker,
@@ -90,17 +100,15 @@ class SimpleStep:
 
 
 class ConfigFailClosedTests(unittest.TestCase):
-    def test_missing_dobox_url_is_detected(self):
+    def test_missing_dobox_url_defaults_to_localhost(self):
         env = {
-            "DOCODE_DOBOX_BASE_URL": "",
             "DOCODE_OPENAI_API_KEY": "sk-test",
             "DOCODE_PROVIDER": "openai",
         }
-        with mock.patch.dict(os.environ, env, clear=False):
-            _ = os.environ.pop("DOCODE_DOBOX_BASE_URL", None)
-            os.environ["DOCODE_DOBOX_BASE_URL"] = ""
+        with mock.patch.dict(os.environ, env, clear=True):
             config, creds, provider, model, reasons = resolve_provider_and_config()
-        self.assertIn("DOCODE_DOBOX_BASE_URL missing", reasons[0])
+        self.assertEqual(config.dobox_base_url, "http://localhost:3000")
+        self.assertFalse(any("DOCODE_DOBOX_BASE_URL missing" in r for r in reasons), reasons)
         self.assertTrue(creds)  # provider key still resolved
 
     def test_missing_provider_key_is_detected(self):
@@ -259,6 +267,220 @@ class HiddenCheckerTests(unittest.IsolatedAsyncioTestCase):
             bad = await run_hidden_checker(inspector, fx, job, bad_steps)
         self.assertTrue(good["checks"]["fresh_after_edit"], good["failures"])
         self.assertFalse(bad["checks"]["fresh_after_edit"], bad["failures"])
+
+
+class DoBoxReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_dobox_url_defaults_to_localhost(self):
+        env = {"DOCODE_OPENAI_API_KEY": "sk-test", "DOCODE_PROVIDER": "openai"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            config, _creds, _p, _m, reasons = resolve_provider_and_config()
+        self.assertEqual(config.dobox_base_url, "http://localhost:3000")
+        self.assertFalse(any("DOCODE_DOBOX_BASE_URL missing" in r for r in reasons), reasons)
+
+    async def test_reachable_uses_existing_no_start(self):
+        config = DocodeConfig()
+        readiness = await plan_dobox_readiness(
+            config,
+            start_dobox=False,
+            health_checker=lambda u: asyncio.sleep(0, result=(True, "ok")),
+            command_runner=lambda c, d, t: CommandProbe(True, "ok"),
+        )
+        self.assertTrue(readiness.reachable)
+        self.assertEqual(readiness.mode, "existing")
+        self.assertFalse(readiness.started_by_runner)
+        self.assertIsNone(readiness.fail_reason)
+
+    async def test_unreachable_without_start_dobox_fails_closed(self):
+        config = DocodeConfig()
+        readiness = await plan_dobox_readiness(
+            config,
+            start_dobox=False,
+            health_checker=lambda u: asyncio.sleep(0, result=(False, "down")),
+            command_runner=lambda c, d, t: CommandProbe(True, "ok"),
+        )
+        self.assertFalse(readiness.reachable)
+        self.assertIsNotNone(readiness.fail_reason)
+        self.assertIn("--start-dobox", readiness.fail_reason)
+        self.assertFalse(readiness.started_by_runner)
+
+    async def test_unreachable_with_start_dobox_plans_autostart(self):
+        config = DocodeConfig()
+        readiness = await plan_dobox_readiness(
+            config,
+            start_dobox=True,
+            health_checker=lambda u: asyncio.sleep(0, result=(False, "down")),
+            command_runner=lambda c, d, t: CommandProbe(True, "ok"),
+        )
+        self.assertFalse(readiness.reachable)
+        self.assertEqual(readiness.mode, "autostarted")
+        self.assertTrue(readiness.started_by_runner)
+        self.assertIsNone(readiness.fail_reason)
+
+
+class ManagedLocalDoBoxTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.config = DocodeConfig()
+        self.config.dobox_backend_dir = Path("DoBoxDev/backend")
+
+    async def test_reachable_does_not_start_or_stop(self):
+        checks = [SmokeCheck("dobox_backend_dir", "passed", "ok"), SmokeCheck("docker_daemon", "passed", "ok")]
+        with mock.patch("docode.runtime.smoke.start_dobox_process") as start, mock.patch(
+            "docode.runtime.smoke.stop_process"
+        ) as stop:
+            async with managed_local_dobox(
+                self.config, lambda u: asyncio.sleep(0, result=(True, "ok")), False, checks
+            ) as sc:
+                self.assertEqual(sc, [])
+            start.assert_not_called()
+            stop.assert_not_called()
+
+    async def test_starts_and_stops_own_process(self):
+        checks = [
+            SmokeCheck("dobox_backend_dir", "passed", "ok"),
+            SmokeCheck("docker_daemon", "passed", "ok"),
+            SmokeCheck("dobox_sandbox_image", "passed", "ok"),
+        ]
+
+        class _Health:
+            def __init__(self):
+                self.calls = 0
+
+            async def __call__(self, url):
+                self.calls += 1
+                # First call: endpoint down -> trigger autostart. Later calls: up.
+                return (False, "down") if self.calls == 1 else (True, "ok")
+
+        fake_proc = mock.MagicMock()
+        fake_proc.poll.return_value = None
+        with mock.patch("docode.runtime.smoke.start_dobox_process", return_value=fake_proc) as start, mock.patch(
+            "docode.runtime.smoke.stop_process"
+        ) as stop:
+            async with managed_local_dobox(
+                self.config, _Health(), True, checks
+            ) as sc:
+                self.assertTrue(any(c.name == "dobox_autostart" and c.status == "passed" for c in sc))
+            start.assert_called_once()
+            stop.assert_called_once_with(fake_proc)
+
+    async def test_docker_unavailable_structured_failure(self):
+        checks = [SmokeCheck("dobox_backend_dir", "passed", "ok"), SmokeCheck("docker_daemon", "warning", "down")]
+        with mock.patch("docode.runtime.smoke.start_dobox_process") as start:
+            async with managed_local_dobox(
+                self.config, lambda u: asyncio.sleep(0, result=(False, "down")), True, checks
+            ) as sc:
+                failed = [c for c in sc if c.name == "dobox_autostart" and c.status == "failed"]
+                self.assertTrue(failed, sc)
+            start.assert_not_called()
+
+    async def test_backend_dir_missing_structured_failure(self):
+        checks = [SmokeCheck("dobox_backend_dir", "warning", "no go.mod"), SmokeCheck("docker_daemon", "passed", "ok")]
+        with mock.patch("docode.runtime.smoke.start_dobox_process") as start:
+            async with managed_local_dobox(
+                self.config, lambda u: asyncio.sleep(0, result=(False, "down")), True, checks
+            ) as sc:
+                failed = [c for c in sc if c.name == "dobox_autostart" and c.status == "failed"]
+                self.assertTrue(failed, sc)
+            start.assert_not_called()
+
+    async def test_keep_dobox_skips_stop(self):
+        checks = [
+            SmokeCheck("dobox_backend_dir", "passed", "ok"),
+            SmokeCheck("docker_daemon", "passed", "ok"),
+            SmokeCheck("dobox_sandbox_image", "passed", "ok"),
+        ]
+        fake_proc = mock.MagicMock()
+        fake_proc.poll.return_value = None
+        with mock.patch("docode.runtime.smoke.start_dobox_process", return_value=fake_proc), mock.patch(
+            "docode.runtime.smoke.stop_process"
+        ) as stop:
+            async with managed_local_dobox(
+                self.config, lambda u: asyncio.sleep(0, result=(True, "ok")), True, checks, keep=True
+            ):
+                pass
+            stop.assert_not_called()
+
+
+class DoBoxTokenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_token_returned(self):
+        config = DocodeConfig()
+        config.dobox_token = "preconfigured-token"
+        token, check = await ensure_dobox_smoke_token(config)
+        self.assertEqual(token, "preconfigured-token")
+        self.assertEqual(check.status, "passed")
+
+    async def test_token_resolved_via_register(self):
+        config = DocodeConfig()
+        config.dobox_token = ""
+
+        class _FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"token": "resolved-token"}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json=None):
+                return _FakeResp()
+
+        with mock.patch("httpx.AsyncClient", side_effect=_FakeClient):
+            token, check = await ensure_dobox_smoke_token(config)
+        self.assertEqual(token, "resolved-token")
+        self.assertEqual(check.status, "passed")
+
+
+class EvidenceDoBoxRuntimeTests(unittest.TestCase):
+    def test_summary_includes_dobox_runtime_no_secrets(self):
+        job = CodingJob(
+            id=new_id("job"),
+            user_id="u",
+            instruction="x",
+            provider="openai",
+            model="gpt-5.4",
+            dobox_project_id="proj-1",
+            status=JobStatus.SUCCEEDED,
+            artifact_id="art-1",
+        )
+        dobox_runtime = {
+            "dobox_mode": "autostarted",
+            "dobox_backend_dir": "../DoBoxDev/backend",
+            "dobox_started_by_runner": True,
+            "docker_daemon_available": True,
+            "sandbox_image_available": True,
+        }
+        summary = build_summary(
+            run_id=job.id,
+            fixture="simple_bugfix",
+            job=job,
+            iterations=1,
+            tool_calls=2,
+            outcome_count=3,
+            components={
+                "runner": "JobRunnerService",
+                "llm": "DecisionAdapter",
+                "tools": "DoBoxTools",
+                "repository": "InMemoryJobRepository",
+                "exporter": "ArtifactExporter",
+            },
+            started_at="t0",
+            finished_at="t1",
+            dobox_runtime=dobox_runtime,
+        )
+        blob = json.dumps(summary)
+        self.assertNotIn("resolved-token", blob)
+        self.assertNotIn("sk-", blob)
+        self.assertNotIn("preconfigured-token", blob)
+        self.assertIn("dobox_runtime", summary)
+        self.assertEqual(summary["dobox_runtime"]["dobox_backend_dir"], "../DoBoxDev/backend")
+        self.assertEqual(summary["dobox_runtime"]["dobox_mode"], "autostarted")
 
 
 if __name__ == "__main__":

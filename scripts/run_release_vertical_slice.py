@@ -32,12 +32,21 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import httpx
+from dataclasses import dataclass
 
-from docode.config import load_config
+from docode.config import DocodeConfig, load_config
 from docode.dobox.client import DoBoxClient
 from docode.llm.credentials import APICredCredentialResolver, ProviderCredential
 from docode.llm.runtime import build_docode_llm
+from docode.runtime.smoke import (
+    CommandRunner,
+    HealthChecker,
+    check_http_health,
+    ensure_dobox_smoke_token,
+    local_dobox_checks,
+    managed_local_dobox,
+    run_command_probe,
+)
 from docode.storage.models import CodingJob, JobStatus, new_id, public_job_dict
 from docode.storage.repository import InMemoryJobRepository
 from docode.storage.step_redaction import redacted_step_content
@@ -82,12 +91,13 @@ def resolve_provider_and_config() -> tuple[Any, dict[str, ProviderCredential], s
     reasons: list[str] = []
     local_credentials: dict[str, ProviderCredential] = {}
 
+    # DoBox URL is optional: when unset the config default (http://localhost:3000)
+    # is used, and `--start-dobox` can autostart a local backend. An external
+    # endpoint is configured only via DOCODE_DOBOX_BASE_URL.
     dobox_url = os.getenv("DOCODE_DOBOX_BASE_URL")
-    if not dobox_url:
-        reasons.append("DOCODE_DOBOX_BASE_URL missing (a real DoBox endpoint is required)")
-    dobox_token = os.getenv("DOCODE_DOBOX_TOKEN") or os.getenv("DOCODE_DOBOX_API_KEY")
     if dobox_url:
         config.dobox_base_url = dobox_url
+    dobox_token = os.getenv("DOCODE_DOBOX_TOKEN") or os.getenv("DOCODE_DOBOX_API_KEY")
     if dobox_token:
         config.dobox_token = dobox_token
 
@@ -158,6 +168,63 @@ def redact_endpoint(url: str | None) -> str:
     if not url:
         return "redacted"
     return "redacted"
+
+
+@dataclass
+class DoboxReadiness:
+    reachable: bool
+    mode: str
+    started_by_runner: bool
+    fail_reason: str | None
+    docker_daemon_available: bool | None
+    sandbox_image_available: bool | None
+    autostart_checks: list
+
+
+async def plan_dobox_readiness(
+    config: DocodeConfig,
+    *,
+    start_dobox: bool,
+    health_checker: HealthChecker = check_http_health,
+    command_runner: CommandRunner = run_command_probe,
+) -> DoboxReadiness:
+    """Decide DoBox mode and whether autostart is required (does not start it).
+
+    Reuses the shared ``docode.runtime.smoke`` checks so there is a single
+    source of truth for local DoBox readiness and startup.
+    """
+    checks = await local_dobox_checks(config, command_runner)
+    docker_daemon_available = _smoke_check_passed(checks, "docker_daemon")
+    sandbox_image_available = _smoke_check_passed(checks, "dobox_sandbox_image")
+    reachable, _detail = await health_checker(config.dobox_base_url.rstrip("/") + "/health")
+    if reachable:
+        return DoboxReadiness(True, "existing", False, None, docker_daemon_available, sandbox_image_available, checks)
+    if not start_dobox:
+        return DoboxReadiness(
+            False,
+            "autostarted",
+            False,
+            f"DoBox unreachable at {config.dobox_base_url}; pass --start-dobox to autostart a local DoBox, "
+            f"or set DOCODE_DOBOX_BASE_URL to an external endpoint",
+            docker_daemon_available,
+            sandbox_image_available,
+            checks,
+        )
+    return DoboxReadiness(False, "autostarted", True, None, docker_daemon_available, sandbox_image_available, checks)
+
+
+def _smoke_check_passed(checks: list, name: str) -> bool | None:
+    for check in checks:
+        if check.name == name:
+            return check.status == "passed"
+    return None
+
+
+def _relative_backend_dir(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except Exception:
+        return "redacted"
 
 
 # ── Fixture seeding DoBox client ──────────────────────────────────────────
@@ -363,6 +430,7 @@ def build_summary(
     components: dict[str, str],
     started_at: str,
     finished_at: str,
+    dobox_runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "run_id": run_id,
@@ -379,6 +447,7 @@ def build_summary(
         "started_at": started_at,
         "finished_at": finished_at,
         "components": components,
+        "dobox_runtime": dobox_runtime or {},
     }
 
 
@@ -463,6 +532,7 @@ async def write_evidence_bundle(
     started_at: str,
     finished_at: str,
     checker_result: dict[str, Any] | None,
+    dobox_runtime: dict[str, Any] | None = None,
 ) -> Path:
     run_dir = output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -478,6 +548,7 @@ async def write_evidence_bundle(
         components=components,
         started_at=started_at,
         finished_at=finished_at,
+        dobox_runtime=dobox_runtime,
     )
 
     def _write(name: str, payload: Any) -> None:
@@ -525,6 +596,7 @@ async def run_single_job(
     fixture: str,
     output_dir: Path,
     dobox: DoBoxClient,
+    dobox_runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fixture_root = FIXTURE_ROOT / fixture
     repo: InMemoryJobRepository = InMemoryJobRepository()
@@ -614,6 +686,7 @@ async def run_single_job(
         started_at=started_at,
         finished_at=finished_at,
         checker_result=checker_result,
+        dobox_runtime=dobox_runtime,
     )
 
     _assert_no_forbidden_doubles(components)
@@ -641,69 +714,105 @@ async def main_async(args: argparse.Namespace) -> int:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Fail closed: missing real infrastructure must never be reported as success.
-    dobox_url = config.dobox_base_url
-    if dobox_url:
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                health = await client.get(dobox_url.rstrip("/") + "/health")
-                health.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            reasons.append(f"DoBox health check failed: {type(exc).__name__}: {exc}")
+    # ── DoBox readiness (reuses docode.runtime.smoke) ──────────────────────
+    readiness = await plan_dobox_readiness(config, start_dobox=args.start_dobox)
+    if readiness.fail_reason:
+        reasons.append(readiness.fail_reason)
 
-    if reasons:
-        report = {
-            "status": "failed",
-            "failure_reason": "environment_failure",
-            "details": reasons,
-            "note": "SKIPPED != PASSED: missing real infrastructure; no success claimed.",
-        }
-        (output_dir / "terminal_result.json").write_text(
-            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        print("[release-vertical-slice] FAIL-CLOSED (environment):", file=sys.stderr)
-        for reason in reasons:
-            print(f"  - {reason}", file=sys.stderr)
-        return 2
+    dobox_mode = readiness.mode
+    started_by_runner = False
+    docker_daemon_available = readiness.docker_daemon_available
+    sandbox_image_available = readiness.sandbox_image_available
+    # Only autostart when explicitly requested AND the endpoint is not already up.
+    effective_start = args.start_dobox and not readiness.reachable
 
-    dobox = FixtureSeedingDoBoxClient(config.dobox_base_url, config.dobox_token, fixture_root)
-    runs: list[dict[str, Any]] = []
-    for index in range(args.runs):
-        print(f"[release-vertical-slice] run {index + 1}/{args.runs} ...", file=sys.stderr)
-        result = await run_single_job(
-            config=config,
-            local_credentials=local_credentials,
-            provider=provider,
-            model=model,
-            fixture=fixture,
-            output_dir=output_dir,
-            dobox=dobox,
-        )
-        runs.append(result)
-        print(f"[release-vertical-slice] run {index + 1}: status={result['status']} "
-              f"checker_passed={result['checker']['passed'] if result['checker'] else None}", file=sys.stderr)
+    async with managed_local_dobox(
+        config, check_http_health, effective_start, readiness.autostart_checks, keep=args.keep_dobox
+    ) as start_checks:
+        # When we asked to start a new backend, confirm it actually came up.
+        if effective_start:
+            autostart_failed = next(
+                (c for c in start_checks if c.name == "dobox_autostart" and c.status == "failed"),
+                None,
+            )
+            if autostart_failed is not None:
+                reasons.append(f"DoBox autostart failed: {autostart_failed.detail}")
+            else:
+                started_by_runner = True
 
-    passed = sum(1 for r in runs if r["status"] == "SUCCEEDED" and (r["checker"] or {}).get("passed"))
-    manifest = {
-        "fixture": fixture,
-        "provider": provider,
-        "model": model,
-        "runs": [
-            {
-                "run_id": r["run_id"],
-                "status": r["status"],
-                "checker_passed": (r["checker"] or {}).get("passed"),
-                "evidence_dir": str(output_dir / r["run_id"]),
+        # Resolve a DoBox token (uses configured token, else registers a smoke user).
+        token, _token_check = await ensure_dobox_smoke_token(config)
+        if token:
+            config.dobox_token = token
+        elif not config.dobox_token:
+            reasons.append("DoBox token could not be resolved (auth failed)")
+
+        # Fail closed: missing real infrastructure must never be reported as success.
+        if reasons:
+            report = {
+                "status": "failed",
+                "failure_reason": "environment_failure",
+                "details": reasons,
+                "note": "SKIPPED != PASSED: missing real infrastructure; no success claimed.",
             }
-            for r in runs
-        ],
-        "success_rate": f"{passed}/{len(runs)}",
-        "required": f"{args.runs}/{args.runs}",
-    }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (output_dir / "terminal_result.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print("[release-vertical-slice] FAIL-CLOSED (environment):", file=sys.stderr)
+            for reason in reasons:
+                print(f"  - {reason}", file=sys.stderr)
+            return 2
 
-    print(json.dumps(manifest, ensure_ascii=False, indent=2))
-    return 0 if passed >= args.runs else 1
+        dobox = FixtureSeedingDoBoxClient(config.dobox_base_url, config.dobox_token, fixture_root)
+        dobox_runtime = {
+            "dobox_mode": dobox_mode,
+            "dobox_backend_dir": _relative_backend_dir(config.dobox_backend_dir),
+            "dobox_started_by_runner": started_by_runner,
+            "docker_daemon_available": docker_daemon_available,
+            "sandbox_image_available": sandbox_image_available,
+        }
+
+        runs: list[dict[str, Any]] = []
+        for index in range(args.runs):
+            print(f"[release-vertical-slice] run {index + 1}/{args.runs} ...", file=sys.stderr)
+            result = await run_single_job(
+                config=config,
+                local_credentials=local_credentials,
+                provider=provider,
+                model=model,
+                fixture=fixture,
+                output_dir=output_dir,
+                dobox=dobox,
+                dobox_runtime=dobox_runtime,
+            )
+            runs.append(result)
+            print(
+                f"[release-vertical-slice] run {index + 1}: status={result['status']} "
+                f"checker_passed={result['checker']['passed'] if result['checker'] else None}",
+                file=sys.stderr,
+            )
+
+        passed = sum(1 for r in runs if r["status"] == "SUCCEEDED" and (r["checker"] or {}).get("passed"))
+        manifest = {
+            "fixture": fixture,
+            "provider": provider,
+            "model": model,
+            "runs": [
+                {
+                    "run_id": r["run_id"],
+                    "status": r["status"],
+                    "checker_passed": (r["checker"] or {}).get("passed"),
+                    "evidence_dir": str(output_dir / r["run_id"]),
+                }
+                for r in runs
+            ],
+            "success_rate": f"{passed}/{len(runs)}",
+            "required": f"{args.runs}/{args.runs}",
+        }
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0 if passed >= args.runs else 1
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -711,6 +820,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture", default="simple_bugfix")
     parser.add_argument("--output", default="artifacts/release-vertical-slice")
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--start-dobox", action="store_true", help="autostart a local DoBox backend if unreachable")
+    parser.add_argument("--keep-dobox", action="store_true", help="keep the autostarted backend after the run (debug only)")
     return parser
 
 
