@@ -53,22 +53,20 @@ from docode.storage.models import CodingJob, JobStatus, new_id, public_job_dict
 from docode.storage.repository import InMemoryJobRepository
 from docode.storage.step_redaction import redacted_step_content
 from docode.worker.runner import JobRunnerService
-
-def _json_default(value: Any) -> Any:
-    """Serialization fallback for evidence JSON.
-
-    Explicitly handles the value types the evidence bundle can carry. It does
-    NOT fall back to a broad ``str()`` for unknown types, so a genuinely
-    non-serializable object fails loudly instead of being silently mangled.
-    """
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Path):
-        return str(value)
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
+from docode.eval.evidence import (
+    DoBoxWorkspaceInspector,
+    LocalWorkspaceInspector,
+    _json_default,
+    build_artifact_manifest,
+    build_commands_record,
+    build_job_record,
+    build_outcomes_record,
+    build_steps_record,
+    build_summary,
+    count_metrics,
+    redact_endpoint,
+    write_evidence_bundle,
+)
 
 FIXTURE_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "release_vertical_slice"
 
@@ -179,13 +177,6 @@ def resolve_provider_and_config() -> tuple[Any, dict[str, ProviderCredential], s
         config.apicred_mode = "proxy"
 
     return config, local_credentials, provider, model, reasons
-
-
-def redact_endpoint(url: str | None) -> str:
-    """Never write a real endpoint/secret into artifacts."""
-    if not url:
-        return "redacted"
-    return "redacted"
 
 
 @dataclass
@@ -299,44 +290,6 @@ class FixtureSeedingDoBoxClient(DoBoxClient):
 
 
 # ── Independent workspace inspectors (used by the hidden checker) ─────────
-
-
-class DoBoxWorkspaceInspector:
-    """Reads/executes against the real DoBox workspace, independent of the agent."""
-
-    def __init__(self, dobox: DoBoxClient, project_id: str, session_id: str | None) -> None:
-        self.dobox = dobox
-        self.project_id = project_id
-        self.session_id = session_id
-
-    async def read_text(self, path: str) -> str:
-        result = await self.dobox.read_file(self.project_id, path, agent_session_id=self.session_id)
-        return result.content if hasattr(result, "content") else str(result)
-
-    async def run_command(self, command: str) -> tuple[int, str]:
-        result = await self.dobox.run_command(
-            self.project_id, command, cwd="/workspace", timeout_sec=120, output_limit=200_000
-        )
-        return result.exit_code, result.output
-
-
-class LocalWorkspaceInspector:
-    """Filesystem-backed inspector for unit tests (no DoBox, no provider)."""
-
-    def __init__(self, workspace_root: Path) -> None:
-        self.root = workspace_root
-
-    async def read_text(self, path: str) -> str:
-        return (self.root / path).read_text(encoding="utf-8")
-
-    async def run_command(self, command: str) -> tuple[int, str]:
-        executable = command
-        if command.startswith("python "):
-            executable = command.replace("python ", f'"{sys.executable}" ', 1)
-        completed = subprocess.run(
-            executable, shell=True, cwd=self.root, capture_output=True, text=True, check=False
-        )
-        return completed.returncode, completed.stdout + completed.stderr
 
 
 # ── Hidden checker ────────────────────────────────────────────────────────
