@@ -744,6 +744,54 @@ def _assert_no_forbidden_doubles(components: dict[str, str]) -> None:
             raise RuntimeError(f"gate violation: forbidden test-double substring {forbidden!r} in components {components}")
 
 
+def is_successful_live_run(result: dict[str, Any]) -> bool:
+    """A live run counts as successful only when the job reached the
+    ``SUCCEEDED`` terminal state AND the independent hidden checker passed.
+
+    The persisted ``status`` is the lowercase enum value ``"succeeded"``; we
+    compare against ``JobStatus.SUCCEEDED.value`` rather than a hardcoded
+    uppercase string so the accounting cannot silently disagree with the
+    repository state. We deliberately do NOT normalize the stored status to
+    uppercase — the repository persists lowercase enum values.
+    """
+    return (
+        result.get("status") == JobStatus.SUCCEEDED.value
+        and bool((result.get("checker") or {}).get("passed"))
+    )
+
+
+def count_successful_live_runs(runs: list[dict[str, Any]]) -> int:
+    return sum(1 for r in runs if is_successful_live_run(r))
+
+
+def build_live_manifest(
+    *,
+    fixture: str,
+    provider: str,
+    model: str,
+    runs: list[dict[str, Any]],
+    required_runs: int,
+    output_dir: Path | None,
+) -> dict[str, Any]:
+    passed = count_successful_live_runs(runs)
+    return {
+        "fixture": fixture,
+        "provider": provider,
+        "model": model,
+        "runs": [
+            {
+                "run_id": r["run_id"],
+                "status": r["status"],
+                "checker_passed": (r["checker"] or {}).get("passed"),
+                "evidence_dir": str(output_dir / r["run_id"]) if output_dir is not None else r["run_id"],
+            }
+            for r in runs
+        ],
+        "success_rate": f"{passed}/{len(runs)}",
+        "required": f"{required_runs}/{required_runs}",
+    }
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 
@@ -836,23 +884,15 @@ async def main_async(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-        passed = sum(1 for r in runs if r["status"] == "SUCCEEDED" and (r["checker"] or {}).get("passed"))
-        manifest = {
-            "fixture": fixture,
-            "provider": provider,
-            "model": model,
-            "runs": [
-                {
-                    "run_id": r["run_id"],
-                    "status": r["status"],
-                    "checker_passed": (r["checker"] or {}).get("passed"),
-                    "evidence_dir": str(output_dir / r["run_id"]),
-                }
-                for r in runs
-            ],
-            "success_rate": f"{passed}/{len(runs)}",
-            "required": f"{args.runs}/{args.runs}",
-        }
+        manifest = build_live_manifest(
+            fixture=fixture,
+            provider=provider,
+            model=model,
+            runs=runs,
+            required_runs=args.runs,
+            output_dir=output_dir,
+        )
+        passed = count_successful_live_runs(runs)
         (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
         print(json.dumps(manifest, ensure_ascii=False, indent=2))

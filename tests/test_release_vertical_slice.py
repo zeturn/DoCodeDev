@@ -40,9 +40,12 @@ from run_release_vertical_slice import (  # noqa: E402
     _build_coding_job,
     _json_default,
     build_job_record,
+    build_live_manifest,
     build_outcomes_record,
     build_steps_record,
     build_summary,
+    count_successful_live_runs,
+    is_successful_live_run,
     plan_dobox_readiness,
     redact_endpoint,
     resolve_provider_and_config,
@@ -563,6 +566,58 @@ class JsonDefaultSerializerTests(unittest.TestCase):
         summary_blob = json.dumps(summary, default=_json_default)
         self.assertIn("redacted", summary_blob)
         self.assertNotIn("sk-", summary_blob)
+
+
+class LiveSuccessAccountingTests(unittest.TestCase):
+    """The runner must count a live run as success only when the job reached
+    the lowercase ``"succeeded"`` terminal state AND the hidden checker passed.
+
+    These guard against the bug where ``passed`` was compared against the
+    hardcoded uppercase ``"SUCCEEDED"`` while the stored status is lowercase,
+    which silently failed every live run and made the runner exit non-zero
+    even though the job succeeded.
+    """
+
+    def _run(self, *, status: str, checker_passed: bool) -> dict[str, Any]:
+        return {
+            "run_id": "job_account",
+            "status": status,
+            "checker": {"passed": checker_passed},
+            "failure_reason": None,
+        }
+
+    def test_succeeded_with_passed_checker_counts(self):
+        self.assertTrue(is_successful_live_run(self._run(status="succeeded", checker_passed=True)))
+
+    def test_failed_status_not_counted(self):
+        self.assertFalse(is_successful_live_run(self._run(status="failed", checker_passed=True)))
+
+    def test_succeeded_with_failed_checker_not_counted(self):
+        self.assertFalse(is_successful_live_run(self._run(status="succeeded", checker_passed=False)))
+
+    def test_single_success_manifest_rate_is_1_of_1(self):
+        runs = [self._run(status="succeeded", checker_passed=True)]
+        manifest = build_live_manifest(
+            fixture="simple_bugfix",
+            provider="openai",
+            model="gpt-5.4-mini",
+            runs=runs,
+            required_runs=1,
+            output_dir=None,
+        )
+        self.assertEqual(manifest["success_rate"], "1/1")
+        self.assertEqual(manifest["required"], "1/1")
+        self.assertEqual(manifest["runs"][0]["status"], "succeeded")
+
+    def test_single_success_exit_code_is_zero(self):
+        runs = [self._run(status="succeeded", checker_passed=True)]
+        exit_code = 0 if count_successful_live_runs(runs) >= 1 else 1
+        self.assertEqual(exit_code, 0)
+
+    def test_failed_run_does_not_produce_exit_zero(self):
+        runs = [self._run(status="failed", checker_passed=True)]
+        exit_code = 0 if count_successful_live_runs(runs) >= 1 else 1
+        self.assertEqual(exit_code, 1)
 
 
 if __name__ == "__main__":
