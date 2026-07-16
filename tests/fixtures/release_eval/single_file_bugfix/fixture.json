@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "single_file_bugfix",
+  "title": "Fix a single-file Python logic bug",
+  "category": "bugfix",
+  "difficulty": "easy",
+  "language": "python",
+  "workspace": "workspace",
+  "instruction": "instruction.md",
+  "checker": "checker.py",
+  "required_commands": ["python -m unittest -q"],
+  "expected_terminal": "succeeded",
+  "network_mode": "no_internet",
+  "tags": ["single-file", "unit-test"]
+}
