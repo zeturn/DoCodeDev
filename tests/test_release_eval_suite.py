@@ -30,7 +30,7 @@ from docode.eval.manifest import (  # noqa: E402
     load_suite_manifests,
 )
 from docode.eval.fixture import load_fixture, validate_all_fixtures, validate_fixture  # noqa: E402
-from docode.eval.models import RunResult, classify_run_outcome, derive_false_flags  # noqa: E402
+from docode.eval.models import RunResult, classify_run_outcome, derive_false_flags, extract_failure_signals  # noqa: E402
 from docode.eval.metrics import aggregate_results, suite_exit_code, write_suite_outputs  # noqa: E402
 from docode.eval.evidence import build_summary, redact_endpoint  # noqa: E402
 from docode.eval.runner import _build_coding_job, run_case  # noqa: E402
@@ -399,6 +399,169 @@ class VerticalSliceCompatTests(unittest.TestCase):
             resolve_provider_and_config,
             write_evidence_bundle,
         )
+
+
+class StructuredClassificationTests(unittest.TestCase):
+    def _job(self, *, project_id=None, failure_reason=None, category=None, status="failed"):
+        from docode.agent.failure_taxonomy import FailureCategory, TerminalResult
+
+        terminal = None
+        if category is not None:
+            terminal = TerminalResult(status, FailureCategory(category), failure_reason or "")
+        return types.SimpleNamespace(
+            dobox_project_id=project_id,
+            failure_reason=failure_reason,
+            terminal_result=terminal,
+            status=status,
+        )
+
+    def _classify(self, job, steps, *, checker_passed=None, expected_terminal="succeeded", harness_error=False):
+        signals = extract_failure_signals(job, steps, harness_error=harness_error)
+        return classify_run_outcome(
+            terminal_status=job.status,
+            checker_passed=checker_passed,
+            expected_terminal=expected_terminal,
+            failure_reason=job.failure_reason,
+            signals=signals,
+            harness_error=harness_error,
+        )
+
+    def test_dobox_project_creation_http_500_is_infra(self):
+        job = self._job(
+            project_id=None,
+            failure_reason="POST /api/projects failed with HTTP 500: Failed to create project network: all predefined address pools have been fully subnetted",
+            category="runtime_failure",
+        )
+        self.assertEqual(self._classify(job, []), "infrastructure_failure")
+
+    def test_docker_address_pool_exhausted_is_infra(self):
+        job = self._job(
+            project_id=None,
+            failure_reason="Failed to create project network: Error response from daemon: all predefined address pools have been fully subnetted",
+            category="environment_failure",
+        )
+        self.assertEqual(self._classify(job, []), "infrastructure_failure")
+
+    def test_provider_auth_before_workspace_is_provider_failure(self):
+        job = self._job(
+            project_id=None,
+            failure_reason="apicred_authorize_failed: apicred unavailable",
+            category="provider_failure",
+        )
+        self.assertEqual(self._classify(job, []), "provider_failure")
+
+    def test_model_unavailable_is_provider_failure(self):
+        job = self._job(
+            project_id=None,
+            failure_reason="The model gpt-5.4-mini is currently unavailable",
+            category="provider_failure",
+        )
+        self.assertEqual(self._classify(job, []), "provider_failure")
+
+    def test_unsupported_decision_type_is_decision_parse(self):
+        steps = [{"kind": "tool", "content": {"type": "tool_result", "error": "unsupported decision type: frobnicate"}}]
+        job = self._job(project_id="proj-1", failure_reason="unsupported decision type: frobnicate")
+        self.assertEqual(self._classify(job, steps), "decision_parse_failure")
+
+    def test_dobox_transport_error_during_tool_call(self):
+        steps = [{"kind": "tool", "content": {"type": "transport_error", "error": "RemoteProtocolError: connection reset"}}]
+        job = self._job(project_id="proj-1", failure_reason="DoBoxTransportError: RemoteProtocolError")
+        self.assertEqual(self._classify(job, steps), "dobox_transport_failure")
+
+    def test_workspace_established_model_decided_ordinary_failure_is_agent(self):
+        steps = [
+            {"kind": "llm", "content": {"type": "llm_decision"}},
+            {"kind": "tool", "content": {"type": "tool_call", "tool": "run_command"}},
+        ]
+        job = self._job(project_id="proj-1", failure_reason="max_iterations_exceeded")
+        self.assertEqual(self._classify(job, steps, checker_passed=False), "agent_failure")
+
+    def test_max_consecutive_failures_after_tool_activity_is_agent(self):
+        steps = [
+            {"kind": "llm", "content": {"type": "llm_decision"}},
+            {"kind": "tool", "content": {"type": "tool_call", "tool": "run_command"}},
+            {"kind": "tool", "content": {"type": "tool_result", "error": "command failed"}},
+        ]
+        job = self._job(project_id="proj-1", failure_reason="max_consecutive_failures_exceeded")
+        self.assertEqual(self._classify(job, steps, checker_passed=False), "agent_failure")
+
+    def test_max_consecutive_failures_with_transport_signal_is_transport(self):
+        steps = [
+            {"kind": "llm", "content": {"type": "llm_decision"}},
+            {"kind": "tool", "content": {"type": "tool_call", "tool": "run_command"}},
+            {"kind": "tool", "content": {"type": "transport_error", "error": "ConnectError: timed out"}},
+        ]
+        job = self._job(project_id="proj-1", failure_reason="max_consecutive_failures_exceeded")
+        self.assertEqual(self._classify(job, steps, checker_passed=False), "dobox_transport_failure")
+
+    def test_job_succeeded_checker_failed_is_false_success(self):
+        job = self._job(project_id="proj-1", status="succeeded")
+        outcome = self._classify(job, [{"kind": "llm", "content": {"type": "llm_decision"}}], checker_passed=False)
+        self.assertEqual(outcome, "checker_failure")
+        ff, fs = derive_false_flags(outcome, terminal_status="succeeded", checker_passed=False)
+        self.assertTrue(fs)
+
+    def test_unsatisfiable_safe_failure_with_checker_pass(self):
+        job = self._job(project_id="proj-1", status="failed", category="runtime_failure")
+        outcome = self._classify(job, [], checker_passed=True, expected_terminal="failed")
+        self.assertEqual(outcome, "expected_outcome_pass")
+
+    def test_malformed_terminal_result_does_not_crash(self):
+        job = types.SimpleNamespace(
+            dobox_project_id=None,
+            failure_reason="boom",
+            terminal_result={"category": "not_a_real_enum"},
+            status="failed",
+        )
+        signals = extract_failure_signals(job, [])
+        self.assertFalse(signals.workspace_created)
+        outcome = classify_run_outcome(
+            terminal_status="failed", checker_passed=False, expected_terminal="succeeded", signals=signals
+        )
+        self.assertEqual(outcome, "infrastructure_failure")
+
+    def test_terminal_result_none_does_not_crash(self):
+        job = types.SimpleNamespace(dobox_project_id=None, failure_reason="boom", terminal_result=None, status="failed")
+        signals = extract_failure_signals(job, [])
+        self.assertIsNone(signals.failure_category)
+        outcome = classify_run_outcome(terminal_status="failed", checker_passed=False, expected_terminal="succeeded", signals=signals)
+        self.assertEqual(outcome, "infrastructure_failure")
+
+    def test_structured_signals_win_over_conflicting_text(self):
+        # Free text says decision parse, but structured signals show a
+        # pre-workspace provisioning failure -> infrastructure must win.
+        job = self._job(
+            project_id=None,
+            failure_reason="unsupported decision type: but project never created",
+            category="runtime_failure",
+        )
+        outcome = self._classify(job, [])
+        self.assertEqual(outcome, "infrastructure_failure")
+
+    def test_invalid_baseline_regression_not_agent_failure(self):
+        # De-sensitized minimal reproduction of the original INVALID baseline:
+        # workspace provisioning failures must NOT be counted as agent_failure.
+        job = self._job(
+            project_id=None,
+            failure_reason="POST /api/projects failed with HTTP 500: Failed to create project network: all predefined address pools have been fully subnetted",
+            category="runtime_failure",
+        )
+        outcome = self._classify(job, [])
+        self.assertNotEqual(outcome, "agent_failure")
+        self.assertEqual(outcome, "infrastructure_failure")
+
+
+class AggregateInfraNotAgentTests(unittest.TestCase):
+    def test_infra_failure_not_counted_as_agent(self):
+        results = [
+            RunResult(suite_run_id="s", case_id="c0", run_index=0, outcome="infrastructure_failure", expected_terminal="succeeded"),
+            RunResult(suite_run_id="s", case_id="c1", run_index=0, outcome="agent_failure", expected_terminal="succeeded"),
+        ]
+        summary = aggregate_results(results, suite_run_id="s")
+        self.assertEqual(summary["agent_failure_count"], 1)
+        self.assertEqual(summary["infrastructure_failure_count"], 1)
+        self.assertEqual(summary["by_outcome"].get("infrastructure_failure"), 1)
+        self.assertEqual(summary["by_outcome"].get("agent_failure"), 1)
 
 
 if __name__ == "__main__":

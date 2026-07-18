@@ -24,7 +24,12 @@ from typing import Any
 from docode.eval.checker import CheckerContext, run_checker_module
 from docode.eval.evidence import DoBoxWorkspaceInspector, write_evidence_bundle
 from docode.eval.fixture import Fixture
-from docode.eval.models import RunResult, classify_run_outcome, derive_false_flags
+from docode.eval.models import (
+    RunResult,
+    classify_run_outcome,
+    derive_false_flags,
+    extract_failure_signals,
+)
 from docode.llm.credentials import APICredCredentialResolver, ProviderCredential
 from docode.llm.runtime import build_docode_llm
 from docode.storage.models import CodingJob, JobStatus, new_id
@@ -217,11 +222,27 @@ async def run_case(
 
     checker_passed = bool((checker_result or {}).get("passed"))
     terminal_status = job.status.value if hasattr(job.status, "value") else str(job.status)
+
+    harness_exception_type = None
+    if harness_error:
+        for step in steps:
+            content = step.content if hasattr(step, "content") else getattr(step, "get", lambda _k: None)("content")
+            if isinstance(content, dict) and content.get("type") == "harness_exception":
+                harness_exception_type = content.get("exception_type")
+                break
+
+    signals = extract_failure_signals(
+        job,
+        steps,
+        harness_error=harness_error,
+        harness_exception_type=harness_exception_type,
+    )
     outcome = classify_run_outcome(
         terminal_status=terminal_status,
         checker_passed=checker_passed,
         expected_terminal=fixture.manifest.expected_terminal,
         failure_reason=job.failure_reason,
+        signals=signals,
         harness_error=harness_error,
     )
     false_failure, false_success = derive_false_flags(outcome, terminal_status=terminal_status, checker_passed=checker_passed)

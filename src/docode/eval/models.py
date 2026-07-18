@@ -146,61 +146,217 @@ class RunResult:
 # ── Outcome classification ─────────────────────────────────────────────────
 
 
+# Keywords that indicate a genuine transport/protocol failure (connect/read/
+# write timeout or protocol error) raised by the DoBox client. A structured
+# HTTP 500 from workspace provisioning is NOT a transport failure.
+_TRANSPORT_KEYWORDS = (
+    "doboxtransporterror",
+    "remoteprotocolerror",
+    "connecterror",
+    "readerror",
+    "writeerror",
+    "server disconnected",
+)
+
+# Keywords that indicate a provider-side failure (auth, model availability,
+# provider HTTP errors) before a valid decision was produced.
+_PROVIDER_KEYWORDS = (
+    "provider auth",
+    "provider authentication",
+    "model unavailable",
+    "apicred_authorize_failed",
+    "authentication failed",
+    "unauthorized",
+    "401 ",
+    "403 ",
+)
+
+
+@dataclass(frozen=True)
+class FailureSignals:
+    """Centralized structured failure signals extracted from a finished run.
+
+    ``run_case`` must build this once via :func:`extract_failure_signals` rather
+    than scattering ad-hoc string checks across the runner. Structured signals
+    take priority over free-text ``failure_reason`` matching.
+    """
+
+    failure_class: str | None = None
+    failure_category: str | None = None
+    failure_stage: str | None = None
+    exception_type: str | None = None
+    workspace_created: bool = False
+    llm_started: bool = False
+    tool_execution_started: bool = False
+    transport_error: bool = False
+    provider_error: bool = False
+    decision_parse_error: bool = False
+
+
+def _summarize_steps(steps: list[Any]) -> tuple[bool, bool, bool, bool]:
+    """Return (llm_started, tool_execution_started, transport_error, decision_parse_error)."""
+    llm_started = False
+    tool_execution_started = False
+    transport_error = False
+    decision_parse_error = False
+    for step in steps or []:
+        content = step.content if hasattr(step, "content") else (step.get("content", {}) if isinstance(step, dict) else {})
+        kind = step.kind if hasattr(step, "kind") else (step.get("kind") if isinstance(step, dict) else None)
+        if not isinstance(content, dict):
+            content = {}
+        stype = str(content.get("type") or "")
+        if stype == "llm_decision":
+            llm_started = True
+        if kind == "tool" and stype in ("tool_call", "tool_result"):
+            tool_execution_started = True
+        if stype == "transport_error" or "transport" in str(content.get("error") or "").lower():
+            transport_error = True
+        if "unsupported decision type" in str(content).lower():
+            decision_parse_error = True
+    return llm_started, tool_execution_started, transport_error, decision_parse_error
+
+
+def extract_failure_signals(
+    job: Any,
+    steps: list[Any],
+    *,
+    harness_error: bool = False,
+    harness_exception_type: str | None = None,
+) -> FailureSignals:
+    """Extract structured failure signals from a finished job + its steps.
+
+    This is the single place that interprets the job's structured fields
+    (``terminal_result.category``, ``dobox_project_id``) and the step stream.
+    """
+    project_id = getattr(job, "dobox_project_id", None)
+    workspace_created = bool(project_id)
+    llm_started, tool_execution_started, transport_error, decision_parse_error = _summarize_steps(steps)
+
+    terminal = getattr(job, "terminal_result", None)
+    failure_category = None
+    if isinstance(terminal, dict):
+        cat = terminal.get("category")
+        failure_category = cat.value if hasattr(cat, "value") else cat
+    elif terminal is not None:
+        cat = getattr(terminal, "category", None)
+        if hasattr(cat, "value"):
+            failure_category = cat.value
+        elif isinstance(cat, str):
+            failure_category = cat
+
+    failure_reason = getattr(job, "failure_reason", None) or ""
+    reason_l = failure_reason.lower()
+
+    provider_error = failure_category == "provider_failure" or any(k in reason_l for k in _PROVIDER_KEYWORDS)
+    # Transport only for genuine transport/protocol errors, never for a
+    # structured HTTP 500 workspace-provisioning error.
+    transport_error = transport_error or any(k in reason_l for k in _TRANSPORT_KEYWORDS)
+
+    if not workspace_created and not llm_started and not tool_execution_started:
+        failure_stage = "provisioning"
+    elif not llm_started and not tool_execution_started:
+        failure_stage = "pre_decision"
+    elif not tool_execution_started:
+        failure_stage = "decision_only"
+    else:
+        failure_stage = "execution"
+
+    return FailureSignals(
+        failure_class=None,
+        failure_category=failure_category,
+        failure_stage=failure_stage,
+        exception_type=harness_exception_type if harness_error else None,
+        workspace_created=workspace_created,
+        llm_started=llm_started,
+        tool_execution_started=tool_execution_started,
+        transport_error=transport_error,
+        provider_error=provider_error,
+        decision_parse_error=decision_parse_error,
+    )
+
+
 def classify_run_outcome(
     *,
     terminal_status: str | None,
     checker_passed: bool | None,
     expected_terminal: str,
     failure_reason: str | None = None,
+    signals: FailureSignals | None = None,
+    harness_error: bool = False,
     failure_class: str | None = None,
     failure_category: str | None = None,
-    harness_error: bool = False,
 ) -> str:
     """Map raw run signals to a single canonical Outcome label.
 
-    The rules follow the harness contract:
+    Classification priority:
+      1. harness_failure
+      2. infrastructure_failure
+      3. provider_failure
+      4. decision_parse_failure
+      5. dobox_transport_failure
+      6. budget_exceeded
+      7. no_progress
+      8. expected outcome / passed / checker failure / agent failure
 
-    * a harness/infrastructure error is never an Agent capability failure;
-    * a job that reached the expected terminal with a passing checker is a
-      success (or an expected-outcome pass for the unsatisfiable case);
-    * a job that succeeded but failed the checker is a checker failure
-      (false success);
-    * a job that failed but whose checker proves the implementation correct is
-      a false failure (still an agent failure in strict terms).
+    Structured ``signals`` take priority over free-text ``failure_reason``.
+    The legacy ``failure_class``/``failure_category`` kwargs are retained for
+    backward compatibility and are only consulted when ``signals`` is omitted.
     """
-    status = (terminal_status or "").lower()
+    if signals is None:
+        # Backward-compatible path: synthesize minimal signals. We deliberately
+        # do NOT assume a provisioning failure here (the generic provisioning
+        # rule requires real structured signals via ``failure_stage``).
+        signals = FailureSignals(
+            failure_class=failure_class,
+            failure_category=failure_category,
+            workspace_created=bool(
+                failure_category == "workspace_inconsistent" or failure_class == "infra_failed"
+            ),
+        )
 
-    if harness_error:
+    status = (terminal_status or "").lower()
+    reason_l = (failure_reason or "").lower()
+
+    # 1. Harness failure: only genuine harness/runtime exceptions.
+    if harness_error or signals.failure_category == "harness_failure":
         return Outcome.HARNESS_FAILURE.value
 
-    if failure_class in ("infra_failed",) or failure_category in (
-        "workspace_inconsistent",
-        "provider_call_failed",
-        "provider_auth_failed",
-    ):
-        if failure_category in ("provider_auth_failed", "provider_call_failed"):
-            return Outcome.INFRASTRUCTURE_FAILURE.value
+    # 2. Infrastructure failure: workspace/project provisioning failed before
+    #    any LLM decision or Agent tool call, or an explicit infra signal.
+    #    A provider/transport/parser signal that merely happened to occur
+    #    pre-workspace is classified under its own (higher-specificity) bucket,
+    #    not as a generic infrastructure failure.
+    provisioning_failed = (
+        (signals.failure_class == "infra_failed" or signals.failure_category in ("workspace_inconsistent",) or signals.failure_stage == "provisioning")
+        and not signals.provider_error
+        and not signals.decision_parse_error
+        and not signals.transport_error
+    )
+    if provisioning_failed:
         return Outcome.INFRASTRUCTURE_FAILURE.value
 
-    if failure_class == "model_unavailable":
+    # 3. Provider failure: auth, model unavailable, provider HTTP failure
+    #    before a valid decision was produced.
+    if signals.failure_category == "provider_failure" or signals.provider_error or signals.failure_class == "model_unavailable":
         return Outcome.PROVIDER_FAILURE.value
 
-    # Decision/parser failures surface through the runtime as parser_failed or
-    # unsupported decision types.
-    reason = (failure_reason or "").lower()
-    if "unsupported decision type" in reason or failure_class == "parser_failed":
+    # 4. Decision/parser failure.
+    if signals.decision_parse_error or signals.failure_class == "parser_failed" or "unsupported decision type" in reason_l:
         return Outcome.DECISION_PARSE_FAILURE.value
 
-    # Transport failures raised by the DoBox client are classified separately.
-    if failure_class == "transport_failed" or "dobox_transport" in reason or "server disconnected" in reason:
+    # 5. DoBox transport failure (genuine transport/protocol errors only).
+    if signals.transport_error or signals.failure_class == "transport_failed" or "dobox_transport" in reason_l or "server disconnected" in reason_l:
         return Outcome.DOBOX_TRANSPORT_FAILURE.value
 
-    if failure_class == "budget_exceeded":
+    # 6. Budget exceeded.
+    if signals.failure_class == "budget_exceeded" or "budget" in reason_l:
         return Outcome.BUDGET_EXCEEDED.value
 
-    if failure_class == "no_progress":
+    # 7. No progress.
+    if signals.failure_class == "no_progress" or "no_progress" in reason_l or "non_convergent" in reason_l:
         return Outcome.NO_PROGRESS.value
 
+    # 8. Terminal-based classification.
     succeeded = status == "succeeded"
     checker_ok = bool(checker_passed)
 
