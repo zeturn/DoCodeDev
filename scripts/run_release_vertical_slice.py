@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 from datetime import datetime
@@ -268,11 +269,26 @@ class FixtureSeedingDoBoxClient(DoBoxClient):
         return project
 
     async def _seed_fixture(self, project_id: str) -> None:
+        # Seed every file as raw bytes through the binary-safe upload path so
+        # that non-UTF-8 content (images, compiled artifacts, corrupted samples,
+        # encoding-damaged files) is preserved byte-for-byte. We never decode to
+        # UTF-8 first; text and binary files travel through a single bytes path.
         for path in sorted(self._fixture_root.rglob("*")):
+            # Never silently treat a symlink as a regular file: following it
+            # would upload the target's bytes under the symlink's path and can
+            # leak files outside the fixture workspace. Symlinks are skipped.
+            if path.is_symlink():
+                continue
             if not path.is_file():
                 continue
             rel = path.relative_to(self._fixture_root).as_posix()
-            await self.write_file(project_id, rel, path.read_text(encoding="utf-8"))
+            # Defensive guard: the backend also rejects traversal, but we refuse
+            # to upload any entry whose relative path escapes the fixture root.
+            if ".." in rel.split("/"):
+                raise RuntimeError(f"refusing to seed path-traversal entry: {rel}")
+            data = path.read_bytes()
+            b64 = base64.b64encode(data).decode("ascii")
+            await self.write_file(project_id, rel, content_base64=b64)
         await self.run_command(
             project_id,
             [

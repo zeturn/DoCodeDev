@@ -13,7 +13,9 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import os
 import sys
 import types
 import unittest
@@ -36,6 +38,7 @@ from docode.eval.evidence import build_summary, redact_endpoint  # noqa: E402
 from docode.eval.runner import _build_coding_job, run_case  # noqa: E402
 from docode.eval.checker import CheckerContext, FilesystemInspector, check, run_checker_module  # noqa: E402
 from docode.storage.models import JobStatus  # noqa: E402
+from run_release_vertical_slice import FixtureSeedingDoBoxClient  # noqa: E402
 
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures" / "release_eval"
 SUCCESS_CASES = [
@@ -562,6 +565,140 @@ class AggregateInfraNotAgentTests(unittest.TestCase):
         self.assertEqual(summary["infrastructure_failure_count"], 1)
         self.assertEqual(summary["by_outcome"].get("infrastructure_failure"), 1)
         self.assertEqual(summary["by_outcome"].get("agent_failure"), 1)
+
+
+class _RecordingSeedingClient(FixtureSeedingDoBoxClient):
+    """In-memory stand-in for the real DoBox seeding client.
+
+    It records every ``write_file`` payload (path + base64 content) and every
+    ``run_command`` without contacting a network or a Provider. This lets the
+    binary-safe seeding logic be exercised deterministically and network-free.
+    """
+
+    def __init__(self, fixture_root: Path) -> None:
+        super().__init__("http://dobox.example", "token", fixture_root)
+        self.writes: list[tuple[str, str | None]] = []
+        self.commands: list[object] = []
+
+    async def create_project(self, *, name: str, repo_url: str | None = None, branch: str | None = None, image: str | None = None, network_mode: str | None = None):
+        # Mirror production: seed immediately after project creation.
+        await self._seed_fixture("proj-seeded")
+        return types.SimpleNamespace(project_id="proj-seeded", sandbox_id="sb", raw={})
+
+    async def write_file(self, project_id: str, path: str, content: str | None = None, *, content_base64: str | None = None, agent_session_id: str | None = None) -> None:
+        self.writes.append((path, content_base64))
+
+    async def run_command(self, project_id: str, command, cwd: str = "/workspace", timeout_sec: int = 30, output_limit: int = 200_000, agent_session_id: str | None = None):
+        self.commands.append(command)
+        return types.SimpleNamespace(output="ok", exit_code=0, truncated=False)
+
+
+class BinarySafeSeedingTests(unittest.IsolatedAsyncioTestCase):
+    async def _seed(self, fixture_root: Path) -> _RecordingSeedingClient:
+        client = _RecordingSeedingClient(fixture_root)
+        await client._seed_fixture("proj-seeded")
+        return client
+
+    async def test_utf8_text_file_seeded_as_base64(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text("héllo ☃\n", encoding="utf-8", newline="")
+            client = await self._seed(root)
+            self.assertEqual(len(client.writes), 1)
+            rel, b64 = client.writes[0]
+            self.assertEqual(rel, "a.txt")
+            self.assertEqual(base64.b64decode(b64), "héllo ☃\n".encode("utf-8"))
+
+    async def test_non_utf8_bytes_seeded_byte_for_byte(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = bytes([0x00, 0xFF, 0xFE, 0x80, 0x41, 0xE3, 0x00])
+            (root / "bin.dat").write_bytes(data)
+            client = await self._seed(root)
+            self.assertEqual(len(client.writes), 1)
+            rel, b64 = client.writes[0]
+            self.assertEqual(rel, "bin.dat")
+            self.assertEqual(base64.b64decode(b64), data)
+
+    async def test_empty_file_seeded(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "empty.txt").write_bytes(b"")
+            client = await self._seed(root)
+            self.assertEqual(len(client.writes), 1)
+            rel, b64 = client.writes[0]
+            self.assertEqual(rel, "empty.txt")
+            self.assertEqual(base64.b64decode(b64), b"")
+
+    async def test_nested_path_seeded(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sub" / "dir").mkdir(parents=True)
+            (root / "sub" / "dir" / "deep.py").write_text("x=1\n", encoding="utf-8")
+            (root / "top.txt").write_text("y", encoding="utf-8")
+            client = await self._seed(root)
+            rels = {rel for rel, _ in client.writes}
+            self.assertIn("sub/dir/deep.py", rels)
+            self.assertIn("top.txt", rels)
+
+    async def test_symlink_not_treated_as_regular_file(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "secret.txt"
+            target.write_text("TOP SECRET", encoding="utf-8")
+            try:
+                (root / "link.txt").symlink_to(target)
+            except OSError as exc:  # symlink privilege may be unavailable (e.g. Windows)
+                self.skipTest(f"symlink unavailable: {exc}")
+            client = await self._seed(root)
+            rels = {rel for rel, _ in client.writes}
+            self.assertNotIn("link.txt", rels)
+            self.assertIn("secret.txt", rels)
+
+    async def test_checker_and_gold_outside_workspace_not_seeded(self):
+        # The harness seeds only the workspace dir, never the fixture root's
+        # checker.py / gold / naive (those must stay hidden from the agent).
+        with TemporaryDirectory() as tmp:
+            fx = Path(tmp) / "fixture"
+            ws = fx / "workspace"
+            ws.mkdir(parents=True)
+            (ws / "app.py").write_text("print(1)\n", encoding="utf-8")
+            (fx / "checker.py").write_text("...", encoding="utf-8")
+            (fx / "gold").mkdir()
+            (fx / "gold" / "app.py").write_text("print(2)\n", encoding="utf-8")
+            client = _RecordingSeedingClient(ws)
+            await client._seed_fixture("proj-seeded")
+            rels = {rel for rel, _ in client.writes}
+            self.assertEqual(rels, {"app.py"})
+
+    async def test_no_path_traversal_entries_seeded(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            client = await self._seed(root)
+            for rel, _ in client.writes:
+                self.assertNotIn("..", rel.split("/"))
+
+    async def test_no_llm_provisioning_seeds_binary_without_provider(self):
+        # A fixture containing a non-UTF-8 file is seeded to a recording DoBox
+        # interface; the uploaded bytes are the raw base64 of the file and no
+        # Provider is contacted (the seeding client is pure DoBox I/O).
+        with TemporaryDirectory() as tmp:
+            fx = Path(tmp) / "fixture"
+            ws = fx / "workspace"
+            ws.mkdir(parents=True)
+            data = bytes([0x89, 0x50, 0x4E, 0x47, 0xFF, 0x00])  # PNG-like header + invalid byte
+            (ws / "image.bin").write_bytes(data)
+            (ws / "main.py").write_text("x=1\n", encoding="utf-8", newline="")
+            client = _RecordingSeedingClient(ws)
+            # create_project triggers seeding; no Provider credential is touched.
+            project = await client.create_project(name="docode-provision")
+            self.assertEqual(project.project_id, "proj-seeded")
+            by_rel = {rel: b64 for rel, b64 in client.writes}
+            self.assertIn("image.bin", by_rel)
+            self.assertEqual(base64.b64decode(by_rel["image.bin"]), data)
+            self.assertEqual(base64.b64decode(by_rel["main.py"]), b"x=1\n")
+            self.assertTrue(client.commands)  # git init/commit ran
 
 
 if __name__ == "__main__":

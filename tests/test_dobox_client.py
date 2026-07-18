@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from typing import Any
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
@@ -107,6 +108,56 @@ class DoBoxClientTests(IsolatedAsyncioTestCase):
 
         self.assertIn("POST /api/projects failed with HTTP 500", str(raised.exception))
         self.assertIn("sandbox image missing", str(raised.exception))
+
+
+class WriteFileBinaryTests(IsolatedAsyncioTestCase):
+    async def test_write_file_sends_content_base64_when_provided(self) -> None:
+        class Rec(DoBoxClient):
+            def __init__(self) -> None:
+                super().__init__("http://dobox.example", "token")
+                self.sent: dict[str, Any] | None = None
+
+            async def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+                self.sent = json or {}
+                return {}
+
+        client = Rec()
+        await client.write_file("p1", "img.png", content_base64=base64.b64encode(b"\xff\xfe").decode("ascii"))
+        assert client.sent is not None
+        self.assertIn("content_base64", client.sent)
+        self.assertNotIn("content", client.sent)
+        self.assertEqual(base64.b64decode(client.sent["content_base64"]), b"\xff\xfe")
+
+    async def test_write_file_sends_text_content_when_no_base64(self) -> None:
+        class Rec(DoBoxClient):
+            def __init__(self) -> None:
+                super().__init__("http://dobox.example", "token")
+                self.sent: dict[str, Any] | None = None
+
+            async def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+                self.sent = json or {}
+                return {}
+
+        client = Rec()
+        await client.write_file("p1", "a.txt", "hello")
+        assert client.sent is not None
+        self.assertEqual(client.sent.get("content"), "hello")
+        self.assertNotIn("content_base64", client.sent)
+
+    async def test_write_file_empty_content_uploads_zero_bytes(self) -> None:
+        class Rec(DoBoxClient):
+            def __init__(self) -> None:
+                super().__init__("http://dobox.example", "token")
+                self.sent: dict[str, Any] | None = None
+
+            async def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+                self.sent = json or {}
+                return {}
+
+        client = Rec()
+        await client.write_file("p1", "empty.txt", content_base64="")
+        assert client.sent is not None
+        self.assertEqual(client.sent.get("content_base64"), "")
 
 
 class TransportErrorContextTests(IsolatedAsyncioTestCase):
