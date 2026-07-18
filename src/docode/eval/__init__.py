@@ -1104,3 +1104,15 @@ def initialize_git_repo(path: Path) -> bool:
         if result.returncode != 0:
             return False
     return True
+
+
+# ── Release evaluation harness (V1) ───────────────────────────────────────
+# The generic, auditable holdout-evaluation harness lives in submodules so the
+# single-file legacy eval API above remains importable as ``docode.eval``.
+from docode.eval.models import *  # noqa: F401,F403
+from docode.eval.manifest import *  # noqa: F401,F403
+from docode.eval.fixture import *  # noqa: F401,F403
+from docode.eval.checker import *  # noqa: F401,F403
+from docode.eval.metrics import *  # noqa: F401,F403
+from docode.eval.evidence import *  # noqa: F401,F403
+from docode.eval.runner import *  # noqa: F401,F403

@@ -101,8 +101,31 @@ class DoBoxClient:
             truncated=bool(data.get("truncated", False)),
         )
 
-    async def write_file(self, project_id: str, path: str, content: str, agent_session_id: str | None = None) -> None:
-        await self._request("POST", f"/api/projects/{project_id}/files/write", json={"path": path, "content": content, "agent_session_id": session_payload_id(agent_session_id)})
+    async def write_file(
+        self,
+        project_id: str,
+        path: str,
+        content: str | None = None,
+        *,
+        content_base64: str | None = None,
+        agent_session_id: str | None = None,
+    ) -> None:
+        """Write ``content`` (text) or ``content_base64`` (binary-safe) to a file.
+
+        The DoBox backend accepts either a UTF-8 ``content`` string or a
+        ``content_base64`` blob; when ``content_base64`` is supplied it takes
+        precedence and is decoded to raw bytes server-side. Callers that upload
+        arbitrary repository bytes (e.g. the evaluation fixture seeder) must use
+        ``content_base64`` so that non-UTF-8 files (images, compiled artifacts,
+        corrupted samples) are preserved byte-for-byte instead of being decoded
+        as UTF-8 and raising ``UnicodeDecodeError``.
+        """
+        payload: dict[str, Any] = {"path": path, "agent_session_id": session_payload_id(agent_session_id)}
+        if content_base64 is not None:
+            payload["content_base64"] = content_base64
+        elif content is not None:
+            payload["content"] = content
+        await self._request("POST", f"/api/projects/{project_id}/files/write", json=payload)
 
     async def list_files(self, project_id: str, path: str = ".", agent_session_id: str | None = None) -> CommandResult:
         data = await self._request("POST", f"/api/projects/{project_id}/files/list", json={"path": path, "agent_session_id": session_payload_id(agent_session_id)})

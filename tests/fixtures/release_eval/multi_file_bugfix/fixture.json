@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "multi_file_bugfix",
+  "title": "Fix a multi-file Python config/precedence bug",
+  "category": "bugfix",
+  "difficulty": "medium",
+  "language": "python",
+  "workspace": "workspace",
+  "instruction": "instruction.md",
+  "checker": "checker.py",
+  "required_commands": ["python -m unittest -q"],
+  "expected_terminal": "succeeded",
+  "network_mode": "no_internet",
+  "tags": ["multi-file", "config", "precedence"]
+}

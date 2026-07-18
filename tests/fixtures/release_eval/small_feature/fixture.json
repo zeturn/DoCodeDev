@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "small_feature",
+  "title": "Implement a slugify feature from scratch",
+  "category": "feature",
+  "difficulty": "easy",
+  "language": "python",
+  "workspace": "workspace",
+  "instruction": "instruction.md",
+  "checker": "checker.py",
+  "required_commands": ["python -m unittest -q"],
+  "expected_terminal": "succeeded",
+  "network_mode": "no_internet",
+  "tags": ["feature", "string"]
+}
