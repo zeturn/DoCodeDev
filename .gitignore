@@ -3,6 +3,7 @@
 .docode-*/
 .docode_artifacts/
 .docode_artifacts*/
+holdout_traces/
 __pycache__/
 *.py[cod]
 frontend/node_modules/

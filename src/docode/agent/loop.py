@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
+import json
 import posixpath
 import re
 import shlex
@@ -10,18 +12,41 @@ from typing import Any
 from urllib.parse import urlparse
 
 from docode.agent.context import ContextManager, ContextPack, target_file_guidance
+from docode.agent.artifact_validator import ExecutionEvidence
+from docode.agent.action_keys import final_candidate_action_key, rejected_action_key, tool_action_key
+from docode.agent.finalization_controller import ExportCompletionState, FinalizationController, PreExportFinalizationState
+from docode.agent.failure_taxonomy import FailureCategory, TerminalResult, category_for_reason
 from docode.agent.inspector import ProjectInspector
+from docode.agent.no_progress import NoProgressAssessment, NoProgressEscalation
+from docode.agent.outcome import BlockerSource, FinalizationBlocker, OutcomeKind, RequiredAction, StepOutcome
 from docode.agent.prompts import DOCODE_SYSTEM_PROMPT
 from docode.agent.quality_gate import QualityGate, QualityGateResult
 from docode.agent.repair_planner import (
     RepairAction,
     TARGETED_REPAIR_FORBIDDEN_TOOLS,
     format_repair_action,
+    infer_named_fixture_files,
     infer_python_traceback_files,
     plan_repair_from_tool_result,
 )
 from docode.agent.reviewer import CodeReviewer, ReviewResult
+from docode.agent.runtime_components import RuntimeComponents, build_runtime_components
+from docode.agent.repository_index import build_remote_repository_index
+from docode.agent.workspace_reader import DoBoxWorkspaceReader
+from docode.agent.verification_scheduler import VerificationScheduler
+from docode.agent.profiles import select_task_profile
+from docode.agent.repair_coordinator import RepairPhase
+from docode.agent.task_graph import TaskStatus
+from docode.agent.source_inspection import (
+    attempted_source_urls,
+    crawler_source_inspection_required,
+    instruction_source_urls,
+    source_inspection_evidence,
+    successful_source_inspection,
+)
+from docode.agent.progress import state_progress_fingerprint
 from docode.agent.state import AgentState
+from docode.agent.source_policy import continuation_allowed, source_progress_forced, source_tool_block
 from docode.agent.stuck import NO_DIFF_EXPLORATION_BUDGET, REPAIR_ALLOWED_TOOLS, StuckDetector, git_status_clean
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.task_contract import TaskContract, heredoc_delimiter_from_command, is_crawler_instruction, task_contract_from_instruction
@@ -29,6 +54,7 @@ from docode.agent.verifier import CodingVerifier, VerificationResult, changed_fi
 from docode.agent.workflow import (
     WorkflowPhase,
     changed_paths_from_status,
+    command_was_run,
     commands_equivalent,
     display_command,
     final_candidate_gate,
@@ -46,6 +72,8 @@ from docode.storage.repository import JobRepository
 INITIAL_NO_DIFF_EXPLORATION_BUDGET = NO_DIFF_EXPLORATION_BUDGET
 LOCAL_INSPECTION_TOOLS = {"read_file", "read_file_range", "read_symbol", "list_files", "search", "git_status", "git_diff"}
 EDIT_TOOLS = {"write_file", "edit_file", "replace_in_file", "apply_patch"}
+FOCUSED_REPAIR_READ_TOOLS = {"read_file", "read_file_range", "read_symbol"}
+TARGETED_REPAIR_GIT_TOOLS = {"git_status", "git_diff"}
 CONTEXT_HEAVY_REPAIR_CATEGORIES = {
     "missing_required_field",
     "parsed_value_mismatch",
@@ -89,6 +117,7 @@ class CodingAgentLoop:
         llm_max_attempts: int = 3,
         llm_retry_delays: tuple[float, ...] = (2.0, 5.0),
         llm_decision_timeout_seconds: float = 45.0,
+        runtime_components: RuntimeComponents | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -105,6 +134,102 @@ class CodingAgentLoop:
         self.llm_max_attempts = max(1, llm_max_attempts)
         self.llm_retry_delays = llm_retry_delays
         self.llm_decision_timeout_seconds = max(1.0, llm_decision_timeout_seconds)
+        self.runtime_components = runtime_components
+
+    async def record_step_outcome(
+        self,
+        state: AgentState,
+        outcome: StepOutcome,
+        job: CodingJob,
+    ) -> NoProgressAssessment:
+        """Centralised outcome recording: persist, track, escalate."""
+        state.last_outcome = outcome
+        state.recent_outcomes.append(outcome)
+        if len(state.recent_outcomes) > 20:
+            state.recent_outcomes = state.recent_outcomes[-20:]
+
+        state.active_blocker = outcome.primary_blocker()
+
+        assessment = state.no_progress_tracker.observe(outcome)
+
+        await self.repository.add_step(
+            job.id,
+            "outcome",
+            {
+                "type": "step_outcome",
+                **outcome.to_dict(),
+                "no_progress": assessment.to_dict(),
+            },
+        )
+
+        if assessment.escalation == NoProgressEscalation.STOP:
+            state.terminal_no_progress_reason = assessment.reason
+
+        return assessment
+
+    async def record_synthetic_tool_outcome(
+        self,
+        state: AgentState,
+        *,
+        tool_name: str,
+        tool_args: dict[str, object],
+        result: ToolResult,
+        progress: bool,
+    ) -> NoProgressAssessment:
+        """Unified outcome for synthetic/cached tool results (duplicate reads, repair policy)."""
+        action_key = tool_action_key(tool_name, tool_args)
+        before_fp = state_progress_fingerprint(state)
+        state.add_tool_result(result)
+        after_fp = state_progress_fingerprint(state)
+        outcome = StepOutcome(
+            kind=OutcomeKind.TOOL,
+            action_key=action_key,
+            success=result.ok,
+            progress=progress,
+            state_fingerprint_before=before_fp,
+            state_fingerprint_after=after_fp,
+        )
+        return await self.record_step_outcome(state, outcome, state.job)
+
+    @staticmethod
+    def _render_step_outcome_feedback(
+        outcome: StepOutcome,
+        assessment: NoProgressAssessment | None = None,
+    ) -> str:
+        """Compact structured feedback for the model's next observation."""
+        lines: list[str] = []
+        blocker = outcome.primary_blocker()
+        if blocker is not None:
+            lines.append("ACTIVE BLOCKER")
+            lines.append(f"code: {blocker.code}")
+            lines.append(f"source: {blocker.source.value}")
+            lines.append(f"required_action: {blocker.required_action.value}")
+            if blocker.related_files:
+                lines.append("related_files:")
+                for f in blocker.related_files:
+                    lines.append(f"- {f}")
+            if blocker.related_commands:
+                lines.append("related_commands:")
+                for c in blocker.related_commands:
+                    lines.append(f"- {c}")
+            if blocker.related_node_ids:
+                lines.append("related_nodes:")
+                for n in blocker.related_node_ids:
+                    lines.append(f"- {n}")
+            lines.append(f"retryable: {blocker.retryable}")
+        if assessment is not None and assessment.no_progress:
+            lines.append("")
+            lines.append("NO-PROGRESS")
+            lines.append(f"streak: {assessment.streak}")
+            lines.append(f"repeated_action_count: {assessment.repeated_action_count}")
+            lines.append(f"repeated_blocker_count: {assessment.repeated_blocker_count}")
+            if assessment.blocked_action_key:
+                lines.append(f"blocked_action: {assessment.blocked_action_key}")
+            if assessment.escalation != NoProgressEscalation.NONE:
+                lines.append(f"escalation: {assessment.escalation.value}")
+            if assessment.required_action != RequiredAction.NONE:
+                lines.append(f"instruction: {assessment.required_action.value}")
+        return "\n".join(lines) if lines else ""
 
     async def run(self, job: CodingJob) -> CodingJob:
         job = await self.repository.update_job(job.id, status=JobStatus.RUNNING)
@@ -115,6 +240,10 @@ class CodingAgentLoop:
             cancelled = await self.cancelled_job(job.id)
             if cancelled is not None:
                 return cancelled
+            if state.terminal_repair_reason:
+                return await self.fail(job.id, state.terminal_repair_reason)
+            if state.terminal_no_progress_reason:
+                return await self.fail(job.id, state.terminal_no_progress_reason)
 
             self.sync_llm_usage(state)
             stop = self.stop_policy.evaluate(state)
@@ -125,6 +254,7 @@ class CodingAgentLoop:
                 return await self.fail(job.id, stop.reason or "stopped")
 
             refresh_targeted_repair_phase(state)
+            await self.maybe_execute_controller_source_inspection(state)
             context_pack = await self.collect_observation(state)
             observation = context_pack.render()
             await self.repository.add_step(job.id, "system", observation_step(context_pack))
@@ -230,11 +360,73 @@ class CodingAgentLoop:
                 current_tools = allowed_tool_definitions_for_state(self.tools.definitions(), state)
                 current_tool_names = {str(getattr(definition, "name", "")) for definition in current_tools}
                 if current_tool_names and tool_name not in current_tool_names:
+                    same_turn_retry = (
+                        is_crawler_instruction(state.job.instruction)
+                        and tool_name in {"inspect_source", "fetch_url", "web_search", *LOCAL_INSPECTION_TOOLS}
+                    )
                     await self.record_unavailable_tool_requested(
                         state,
                         requested_tool=tool_name,
                         requested_args=tool_args,
                         available_tools=sorted(current_tool_names),
+                        workflow_state=current_workflow.to_dict(),
+                        increment_iteration=not same_turn_retry,
+                        reason="source_inspection_complete_edit_required" if tool_name == "inspect_source" else "tool_not_in_current_schema",
+                    )
+                    if not same_turn_retry:
+                        continue
+                    await self.repository.add_step(
+                        job.id,
+                        "system",
+                        {
+                            "type": "llm_schema_repair_retry",
+                            "reason": "invalid_tool_same_turn_retry",
+                            "requested_tool": tool_name,
+                            "available_tools": sorted(current_tool_names),
+                        },
+                    )
+                    retry_observation = (
+                        observation
+                        + "\n\nThe requested tool is not available in this workflow phase. "
+                        "The source evidence is already present in Source Inspection memory. "
+                        "Choose exactly one available tool now. Read the target file once if needed, otherwise edit it. "
+                        "Do not request inspect_source, fetch_url, or web_search."
+                    )
+                    try:
+                        decision = await self.decide_with_transient_retries(state, retry_observation)
+                    except Exception as exc:
+                        await self.record_model_failure(state, "llm_schema_repair_retry_failed", str(exc))
+                        continue
+                    self.sync_llm_usage(state)
+                    await self.repository.add_step(job.id, "llm", decision_to_step(decision, self.usage_meter))
+                    if decision.type != "tool_call" or not decision.tool_name:
+                        await self.record_rejected_decision(
+                            state,
+                            reason="invalid_tool_same_turn_retry_unusable",
+                            detail="Schema-repair retry must choose exactly one currently available tool.",
+                            workflow_state=current_workflow.to_dict(),
+                        )
+                        continue
+                    tool_name = decision.tool_name
+                    tool_args = decision.args or {}
+                    current_tools = allowed_tool_definitions_for_state(self.tools.definitions(), state)
+                    current_tool_names = {str(getattr(definition, "name", "")) for definition in current_tools}
+                    if current_tool_names and tool_name not in current_tool_names:
+                        await self.record_unavailable_tool_requested(
+                            state,
+                            requested_tool=tool_name,
+                            requested_args=tool_args,
+                            available_tools=sorted(current_tool_names),
+                            workflow_state=current_workflow.to_dict(),
+                            reason="invalid_tool_same_turn_retry_exhausted",
+                        )
+                        continue
+                source_tool_block = source_inspection_required_tool_block(state, tool_name)
+                if source_tool_block:
+                    await self.record_rejected_decision(
+                        state,
+                        reason="source_inspection_required_tool_forbidden",
+                        detail=source_tool_block,
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
@@ -245,6 +437,30 @@ class CodingAgentLoop:
                         reason=f"{state.repair_mode}_tool_forbidden" if state.repair_mode else "repair_mode_tool_forbidden",
                         detail=repair_tool_block,
                     )
+                    continue
+                repair_read_result = targeted_repair_read_policy_result(state, tool_name, tool_args)
+                if repair_read_result is not None:
+                    await self.repository.add_step(
+                        job.id,
+                        "tool",
+                        {
+                            "type": "tool_result",
+                            "tool": repair_read_result.tool,
+                            "exit_code": repair_read_result.exit_code,
+                            "summary": summarize_output(repair_read_result.output),
+                            "output": repair_read_result.output,
+                            "truncated": repair_read_result.truncated,
+                            "metadata": repair_read_result.metadata or {},
+                        },
+                    )
+                    await self.record_synthetic_tool_outcome(
+                        state,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        result=repair_read_result,
+                        progress=False,
+                    )
+                    state.iteration += 1
                     continue
                 targeted_action_block = targeted_repair_action_block(state, tool_name, tool_args)
                 if targeted_action_block:
@@ -291,7 +507,6 @@ class CodingAgentLoop:
                         tool_args = {"command": retarget_command, "cwd": "/workspace"}
                     else:
                         result = cached_duplicate_read_result(state, tool_args, duplicate_read_block)
-                        state.add_tool_result(result)
                         await self.repository.add_step(
                             job.id,
                             "tool",
@@ -304,6 +519,13 @@ class CodingAgentLoop:
                                 "truncated": result.truncated,
                                 "metadata": result.metadata or {},
                             },
+                        )
+                        await self.record_synthetic_tool_outcome(
+                            state,
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            result=result,
+                            progress=False,
                         )
                         state.iteration += 1
                         continue
@@ -318,7 +540,6 @@ class CodingAgentLoop:
                         workflow_state=current_workflow.to_dict(),
                     )
                     continue
-                tool_args = crawler_corrected_fetch_url_args(state, tool_name, tool_args) or tool_args
                 external_source_block = crawler_external_source_tool_block(state, tool_name, tool_args)
                 if external_source_block:
                     await self.record_rejected_decision(
@@ -367,6 +588,32 @@ class CodingAgentLoop:
                 cancelled = await self.cancelled_job(job.id)
                 if cancelled is not None:
                     return cancelled
+                # -- structured outcome (before execution) --
+                action_key = tool_action_key(tool_name, tool_args)
+                before_fp = state_progress_fingerprint(state)
+
+                # exact-repeat blocking must happen BEFORE tools.call
+                if state.no_progress_tracker.should_block(action_key):
+                    outcome = StepOutcome(
+                        kind=OutcomeKind.DECISION_REJECTED,
+                        action_key=rejected_action_key("repeated_action_blocked", action_key),
+                        success=False,
+                        progress=False,
+                        state_fingerprint_before=before_fp,
+                        state_fingerprint_after=before_fp,
+                    )
+                    await self.record_step_outcome(state, outcome, job)
+                    await self.record_rejected_decision(
+                        state,
+                        reason="repeated_action_blocked",
+                        detail=f"action_key={action_key}",
+                    )
+                    state.add_feedback(
+                        f"REPEATED ACTION BLOCKED: Do not repeat {action_key}. "
+                        f"Choose a different action."
+                    )
+                    continue
+
                 await self.repository.add_step(
                     job.id,
                     "tool",
@@ -382,6 +629,7 @@ class CodingAgentLoop:
                     result = tool_exception_result(tool_name, exc)
                 result = enrich_tool_result_metadata(tool_name, tool_args, result)
                 state.add_tool_result(result)
+                reset_parser_mismatch_convergence(state, result)
                 note_targeted_repair_tool_result(state, result)
                 await self.repository.add_step(
                     job.id,
@@ -406,6 +654,29 @@ class CodingAgentLoop:
                     state.targeted_repair_edits = 0
                     if state.repair_mode == "targeted_repair":
                         state.repair_mode = None
+
+                # -- structured outcome (after execution) --
+                after_fp = state_progress_fingerprint(state)
+                progress = (
+                    result.ok
+                    and before_fp != after_fp
+                    and state.last_outcome.state_fingerprint_after != after_fp
+                    if state.last_outcome is not None
+                    else True
+                )
+                outcome = StepOutcome(
+                    kind=OutcomeKind.TOOL,
+                    action_key=action_key,
+                    success=result.ok,
+                    progress=progress,
+                    state_fingerprint_before=before_fp,
+                    state_fingerprint_after=after_fp,
+                )
+                assessment = await self.record_step_outcome(state, outcome, job)
+                feedback = self._render_step_outcome_feedback(outcome, assessment)
+                if feedback:
+                    state.add_feedback(feedback)
+
                 state.iteration += 1
                 continue
 
@@ -419,7 +690,9 @@ class CodingAgentLoop:
             continue
 
     async def plan_targeted_repair_from_failure(self, state: AgentState, result: ToolResult) -> None:
-        action = plan_repair_from_tool_result(tool=result.tool, output=result.output, metadata=result.metadata or {})
+        action = parser_source_mismatch_repair(state, result)
+        if action is None:
+            action = plan_repair_from_tool_result(tool=result.tool, output=result.output, metadata=result.metadata or {})
         if action is None:
             action = fallback_required_command_repair(state, result)
         if action is None:
@@ -457,6 +730,7 @@ class CodingAgentLoop:
             result = tool_exception_result("run_command", exc)
         result = enrich_tool_result_metadata("run_command", args, result)
         state.add_tool_result(result)
+        reset_parser_mismatch_convergence(state, result)
         note_targeted_repair_tool_result(state, result)
         await self.repository.add_step(
             state.job.id,
@@ -482,6 +756,71 @@ class CodingAgentLoop:
             if state.repair_mode == "targeted_repair":
                 state.repair_mode = None
         state.iteration += 1
+        return True
+
+    async def maybe_execute_controller_source_inspection(self, state: AgentState) -> bool:
+        if not crawler_source_inspection_required(state.job.instruction):
+            return False
+        if successful_source_inspection(state.messages, state.job.instruction) is not None:
+            return False
+        if successful_edit_tool_called(state):
+            return False
+        source_urls = instruction_source_urls(state.job.instruction)
+        if not source_urls:
+            return False
+        selected_url = source_urls[0]
+        attempted = attempted_source_urls(state.messages) | state.source_inspection_auto_attempted_urls
+        if selected_url in attempted:
+            return False
+        state.source_inspection_auto_attempted_urls.add(selected_url)
+        args: dict[str, object] = {"url": selected_url, "mode": "raw", "max_bytes": 50_000, "timeout": 15}
+        await self.repository.add_step(
+            state.job.id,
+            "system",
+            {
+                "type": "source_inspection_auto_execution",
+                "reason": "crawler_literal_source_requires_sandbox_inspection_before_edit",
+                "url": selected_url,
+                "execution_scope": "sandbox",
+            },
+        )
+        await self.repository.add_step(
+            state.job.id,
+            "tool",
+            {"type": "tool_call", "tool": "inspect_source", "args": sanitize_tool_args(args)},
+        )
+        try:
+            result = await self.tools.call("inspect_source", args)
+        except Exception as exc:
+            result = tool_exception_result("inspect_source", exc)
+        result = enrich_tool_result_metadata("inspect_source", args, result)
+        result = ToolResult(
+            tool=result.tool,
+            output=result.output,
+            exit_code=result.exit_code,
+            metadata={**(result.metadata or {}), "controller_owned": True},
+            truncated=result.truncated,
+        )
+        state.add_tool_result(result)
+        await self.repository.add_step(
+            state.job.id,
+            "tool",
+            {
+                "type": "tool_result",
+                "tool": result.tool,
+                "exit_code": result.exit_code,
+                "summary": summarize_output(result.output),
+                "output": result.output,
+                "truncated": result.truncated,
+                "metadata": result.metadata or {},
+            },
+        )
+        evidence = source_inspection_evidence(state.messages, state.job.instruction)[-1]
+        await self.repository.add_step(
+            state.job.id,
+            "system",
+            {"type": "source_inspection_evidence", **evidence.to_dict()},
+        )
         return True
 
     async def maybe_activate_required_command_repair(self, state: AgentState, workflow: Any) -> bool:
@@ -545,6 +884,16 @@ class CodingAgentLoop:
         cancelled = await self.cancelled_job(job.id)
         if cancelled is not None:
             return cancelled
+        if crawler_source_inspection_required(job.instruction) and successful_source_inspection(state.messages, job.instruction) is None:
+            await self.record_rejected_decision(
+                state,
+                reason="source_inspection_required_before_final",
+                detail=(
+                    "A successful sandbox inspect_source result for a literal task source is required before final_candidate. "
+                    "web_search and host fetch_url results do not satisfy this requirement."
+                ),
+            )
+            return None
         status = await self.tools.git_status()
         state.latest_git_status = status
         final_summary = (decision.summary or "").strip()
@@ -583,7 +932,22 @@ class CodingAgentLoop:
                 workflow_state=gate.snapshot.to_dict(),
             )
             return None
-        quality = await self.quality_gate.run(tools=self.tools, task_contract=state.task_contract, instruction=job.instruction)
+        scheduled = state.verification_scheduler.next_command() if state.verification_scheduler is not None else None
+        if scheduled:
+            await self.record_rejected_decision(
+                state,
+                reason="verification_scheduler_stale",
+                detail=f"Verification evidence is stale or incomplete. Run the scheduler-selected command exactly: {display_command(scheduled)}",
+                workflow_state=gate.snapshot.to_dict(),
+            )
+            return None
+        quality_kwargs: dict[str, Any] = {"tools": self.tools, "task_contract": state.task_contract, "instruction": job.instruction}
+        quality_parameters = inspect.signature(self.quality_gate.run).parameters
+        if "artifact_contract" in quality_parameters:
+            quality_kwargs["artifact_contract"] = state.artifact_contract
+        if "execution_evidence" in quality_parameters:
+            quality_kwargs["execution_evidence"] = artifact_execution_evidence(state)
+        quality = await self.quality_gate.run(**quality_kwargs)
         state.quality_gate_attempts += 1
         state.last_quality_gate = quality.to_dict()
         await self.repository.add_step(job.id, "system", quality.to_dict())
@@ -606,9 +970,22 @@ class CodingAgentLoop:
             {"type": "finalization_stage", "stage": "verification_start"},
         )
         await self.repository.update_job(job.id, status=JobStatus.VERIFYING)
-        evidence = verification_evidence_from_steps(await self.repository.list_steps(job.id)).with_no_test_reason(decision.no_test_reason)
+        evidence = verification_evidence_from_steps(
+            await self.repository.list_steps(job.id),
+            explicit_commands=list(state.task_contract.must_run_commands) if state.task_contract else [],
+        ).with_no_test_reason(decision.no_test_reason)
         try:
-            verification = await asyncio.wait_for(self.verifier.verify(job, self.tools, evidence=evidence), timeout=180)
+            verify_kwargs: dict[str, Any] = {"evidence": evidence}
+            verify_parameters = inspect.signature(self.verifier.verify).parameters
+            supports_context = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in verify_parameters.values())
+            if supports_context or "task_contract" in verify_parameters:
+                verify_kwargs["task_contract"] = state.task_contract
+            if supports_context or "inspection" in verify_parameters:
+                verify_kwargs["inspection"] = state.inspection
+            verification = await asyncio.wait_for(
+                self.verifier.verify(job, self.tools, **verify_kwargs),
+                timeout=180,
+            )
         except Exception as exc:
             await self.repository.add_step(
                 job.id,
@@ -629,6 +1006,8 @@ class CodingAgentLoop:
             state.add_feedback(verification_repair_feedback(verification, state.task_contract))
             state.iteration += 1
             return None
+        if state.task_graph is not None and "verify" in state.task_graph.nodes and state.verification_scheduler is not None and state.verification_scheduler.next_command() is None:
+            state.task_graph.set_status("verify", TaskStatus.DONE, reason="verification passed with fresh scheduler evidence", evidence_refs=[f"verification:{state.edit_epoch}"])
         await self.repository.add_step(
             job.id,
             "system",
@@ -656,6 +1035,42 @@ class CodingAgentLoop:
                     state.add_feedback(review_repair_feedback(review))
                 state.iteration += 1
                 return None
+        if state.task_graph is not None and "review" in state.task_graph.nodes and quality.passed and (review is None or review.passed):
+            state.task_graph.set_status("review", TaskStatus.DONE, reason="quality gate and independent review passed", evidence_refs=[f"review:{state.edit_epoch}"])
+        if state.repair_coordinator is not None and state.active_repair_action is None and state.repair_mode is None:
+            state.repair_coordinator.resolve_if_verified(
+                scheduler_fresh=state.verification_scheduler is None or state.verification_scheduler.next_command() is None,
+                quality_passed=quality.passed,
+                review_passed=review is None or review.passed,
+                edit_epoch=state.edit_epoch,
+            )
+        controller = state.finalization_controller or FinalizationController()
+        state.finalization_controller = controller
+        graph_complete = state.task_graph is None or state.task_graph.complete()
+        final_diff = quality.git_diff or verification.git_diff
+        if not final_diff:
+            final_diff = (await self.tools.git_diff()).output
+        changed_files = tuple(dict.fromkeys([*changed_paths_from_status(status.output), *changed_files_from_diff(final_diff)]))
+        changed_files = tuple(dict.fromkeys([*changed_files, *successful_edit_paths(state)]))
+        required_files = tuple(state.task_contract.must_modify_files if state.task_contract is not None else [])
+        pre_export = controller.evaluate_pre_export(
+            PreExportFinalizationState(
+                changed_files=changed_files,
+                required_files=required_files,
+                diff=final_diff,
+                explicit_commands_fresh=state.verification_scheduler is None or state.verification_scheduler.next_command() is None,
+                semantic_contract_passed=quality.passed,
+                repair_cleared=state.repair_coordinator is None or state.repair_coordinator.phase in {RepairPhase.INSPECT_ALLOWED, RepairPhase.RESOLVED},
+                stale_verification=state.verification_scheduler is not None and state.verification_scheduler.next_command() is not None,
+                task_graph_complete=graph_complete,
+                review_passed=review is None or review.passed,
+                summary=final_summary,
+            )
+        )
+        await self.repository.add_step(job.id, "system", {"type": "pre_export_finalization", "passed": pre_export.ready, "failures": list(pre_export.failures)})
+        if not pre_export.ready:
+            await self.record_rejected_decision(state, reason="pre_export_finalization_failed", detail="; ".join(pre_export.failures))
+            return None
         await self.repository.add_step(
             job.id,
             "system",
@@ -671,6 +1086,10 @@ class CodingAgentLoop:
             )
             raise
         artifact_id = terminal_artifact_id(artifacts)
+        export_completion = controller.evaluate_export(ExportCompletionState(artifact_id, len(artifacts)))
+        await self.repository.add_step(job.id, "system", {"type": "export_completion", "passed": export_completion.ready, "failures": list(export_completion.failures), "artifact_id": artifact_id})
+        if not export_completion.ready:
+            return await self.fail(job.id, "finalization_export_incomplete")
         await self.repository.add_step(
             job.id,
             "system",
@@ -680,6 +1099,7 @@ class CodingAgentLoop:
             job.id,
             status=JobStatus.SUCCEEDED,
             result_summary=final_summary,
+            terminal_result=TerminalResult("succeeded", FailureCategory.SUCCESS, functionally_correct=True, strict_success=True).to_dict(),
             artifact_id=artifact_id,
         )
 
@@ -687,13 +1107,34 @@ class CodingAgentLoop:
         command = str((result.metadata or {}).get("command") or "") if result is not None else ""
         if command:
             state.last_failed_command = command
-        count = state.failure_signatures.get(action.signature, 0) + 1
-        state.failure_signatures[action.signature] = count
+        if state.repair_coordinator is None:
+            components = getattr(self, "runtime_components", None)
+            state.repair_coordinator = components.repair_coordinator if components is not None else build_runtime_components(state.job.instruction).repair_coordinator
+        phase = state.repair_coordinator.activate(action)
+        count = state.repair_coordinator.attempt_count(action.signature)
+        state.failure_signatures = {action.signature: count}
         state.repair_action_attempts = count
+        if phase == RepairPhase.NON_CONVERGENT:
+            state.terminal_repair_reason = "repeated_zero_record_parser_failure" if action.failure_class == "parser_source_mismatch" else f"repair_non_convergent:{action.signature}"
+            state.add_feedback(
+                "non_convergent_repair: The same failure signature remained after the configured maximum attempts. "
+                "Stopping instead of continuing blind rewrites."
+            )
+            await self.repository.add_step(
+                state.job.id,
+                "system",
+                {
+                    "type": "non_convergent_repair",
+                    "reason": state.terminal_repair_reason,
+                    "signature": action.signature,
+                    "repeated_count": count,
+                },
+            )
+            return
         action_payload = repair_action_contract(action, state)
         state.active_repair_action = action_payload
         state.active_repair_started_at = repair_action_start_index(state, result)
-        state.targeted_repair_phase = "inspect_allowed"
+        state.targeted_repair_phase = phase.value
         state.targeted_repair_inspections = 0
         state.targeted_repair_edits = 0
         state.repair_mode = "targeted_repair"
@@ -753,9 +1194,39 @@ class CodingAgentLoop:
         return None
 
     async def bootstrap(self, state: AgentState) -> None:
-        inspection = await self.inspector.inspect(state.job.instruction, self.tools)
+        components = self.runtime_components or build_runtime_components(state.job.instruction)
+        self.runtime_components = components
+        state.profile = components.profile
+        state.task_contract = components.task_contract
+        state.artifact_contract = components.artifact_contract
+        state.verification_scheduler = components.verification_scheduler
+        state.repair_coordinator = components.repair_coordinator
+        state.repository_context = components.repository_context
+        state.task_graph = components.task_graph
+        state.finalization_controller = components.finalization_controller
+        if state.profile.context_policy.use_repository_index and all(hasattr(self.tools, name) for name in ("list_files", "read_file", "search")):
+            state.repository_context = await build_remote_repository_index(DoBoxWorkspaceReader(self.tools))
+            components.repository_context = state.repository_context
+        inspection = await self.inspector.inspect(state.job.instruction, self.tools, state.task_contract)
         state.inspection = inspection
-        state.task_contract = task_contract_from_instruction(state.job.instruction)
+        if state.task_graph is not None:
+            relevant_files = list(state.task_contract.must_modify_files or inspection.important_files)
+            understand_node = state.task_graph.nodes.get("understand")
+            if understand_node is not None and not understand_node.target_files:
+                understand_node.target_files = list(relevant_files)
+            implement_node = state.task_graph.nodes.get("implement")
+            if implement_node is not None and not implement_node.target_files and state.task_contract.must_modify_files:
+                implement_node.target_files = list(state.task_contract.must_modify_files)
+            understand = state.task_graph.nodes.get("understand")
+            if understand is not None:
+                understand_refs = [f"inspection:{path}" for path in relevant_files] or ["inspection:workspace-scan"]
+                state.task_graph.set_status("understand", TaskStatus.DONE, reason="bootstrap workspace inspection completed", evidence_refs=understand_refs)
+            plan = state.task_graph.nodes.get("plan")
+            concrete_plan = list(inspection.plan) or [f"modify {path}" for path in relevant_files]
+            if not concrete_plan and understand is not None and understand.status == TaskStatus.DONE:
+                concrete_plan = ["implement the requested change in the inspected workspace"]
+            if plan is not None and concrete_plan and understand is not None and understand.status == TaskStatus.DONE:
+                state.task_graph.set_status("plan", TaskStatus.DONE, reason="repository-specific implementation plan recorded", evidence_refs=[f"plan:{item}" for item in concrete_plan])
         await self.repository.add_step(
             state.job.id,
             "system",
@@ -764,12 +1235,20 @@ class CodingAgentLoop:
                 "listing": inspection.listing,
                 "important_files": list(inspection.important_files),
                 "detected_commands": inspection.detected_commands,
+                "explicit_commands": inspection.explicit_commands,
                 "plan": inspection.plan,
                 "acceptance_criteria": inspection.acceptance_criteria,
                 "task_contract": {
                     "must_modify_files": state.task_contract.must_modify_files,
                     "must_run_commands": state.task_contract.must_run_commands,
                     "forbidden_finish_conditions": state.task_contract.forbidden_finish_conditions,
+                },
+                "runtime_components": {
+                    "profile": state.profile.name,
+                    "repository_files": len(state.repository_context.files) if state.repository_context is not None else 0,
+                    "repository_symbols": len(state.repository_context.symbols) if state.repository_context is not None else 0,
+                    "task_nodes": list(state.task_graph.nodes) if state.task_graph is not None else [],
+                    "verification_commands": [node.command for node in state.verification_scheduler.commands],
                 },
             },
         )
@@ -790,7 +1269,8 @@ class CodingAgentLoop:
             },
         )
         workflow = workflow_snapshot(state, status.output)
-        return self.context_manager.build_pack(
+        include_source_body = not successful_edit_tool_called(state)
+        context_pack = self.context_manager.build_pack(
             job=state.job,
             inspection=state.inspection,
             messages=state.messages,
@@ -804,12 +1284,19 @@ class CodingAgentLoop:
             active_repair_action=state.active_repair_action,
             targeted_repair_phase=state.targeted_repair_phase,
             workflow_phase=workflow.phase.value if hasattr(workflow.phase, "value") else str(workflow.phase),
+            include_source_body=include_source_body,
+            profile=state.profile,
+            repository_context=state.repository_context,
+            task_graph=state.task_graph,
         )
+        return context_pack
 
     async def fail(self, job_id: str, reason: str) -> CodingJob:
+        terminal = TerminalResult("failed", category_for_reason(reason), reason)
+        await self.repository.add_step(job_id, "system", {"type": "terminal_result", **terminal.to_dict()})
         current = await self.repository.get_job(job_id)
         if current is None:
-            return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason)
+            return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason, terminal_result=terminal.to_dict())
         artifact_id = None
         try:
             git_diff = ""
@@ -832,7 +1319,7 @@ class CodingAgentLoop:
             await self.repository.add_step(job_id, "system", {"type": "failure_artifacts_exported", "reason": reason, "artifact_id": artifact_id})
         except Exception as exc:
             await self.repository.add_step(job_id, "system", {"type": "failure_export_failed", "reason": reason, "error": str(exc)})
-        return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason, artifact_id=artifact_id)
+        return await self.repository.update_job(job_id, status=JobStatus.FAILED, failure_reason=reason, terminal_result=terminal.to_dict(), artifact_id=artifact_id)
 
     async def record_model_failure(self, state: AgentState, reason: str, detail: str) -> None:
         self.sync_llm_usage(state)
@@ -949,13 +1436,14 @@ class CodingAgentLoop:
         requested_args: dict[str, object],
         available_tools: list[str],
         workflow_state: dict[str, object] | None = None,
+        increment_iteration: bool = True,
+        reason: str = "tool_not_in_current_schema",
     ) -> None:
         self.sync_llm_usage(state)
         edit_pressure = duplicate_inspection_edit_forced(
             state,
             workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else ""),
         )
-        reason = "tool_not_in_current_schema"
         payload: dict[str, object] = {
             "type": "unavailable_tool_requested",
             "requested_tool": requested_tool,
@@ -967,7 +1455,16 @@ class CodingAgentLoop:
             payload["workflow_state"] = workflow_state
         await self.repository.add_step(state.job.id, "system", payload)
 
-        if requested_tool in LOCAL_INSPECTION_TOOLS and edit_pressure:
+        if requested_tool == "inspect_source" and reason == "source_inspection_complete_edit_required":
+            edit_tools = ", ".join(tool for tool in ("write_file", "edit_file", "replace_in_file", "apply_patch") if tool in available_tools)
+            target_files = target_candidates_for_edit_pressure(state)
+            target = target_files[0] if target_files else "the most likely target file"
+            feedback = (
+                "source_inspection_complete_edit_required: Source evidence is already retained in Source Inspection memory.\n"
+                f"Available editing tools: {edit_tools or ', '.join(available_tools)}.\n"
+                f"Read {target} once if necessary, otherwise you must edit it now."
+            )
+        elif requested_tool in {"inspect_source", *LOCAL_INSPECTION_TOOLS} and edit_pressure:
             edit_tools = ", ".join(tool for tool in ("write_file", "edit_file", "replace_in_file", "apply_patch") if tool in available_tools)
             target_files = target_candidates_for_edit_pressure(state)
             target = target_files[0] if target_files else "the most likely target file"
@@ -982,7 +1479,8 @@ class CodingAgentLoop:
                 f"Available tools: {', '.join(available_tools)}."
             )
         state.add_feedback(feedback)
-        state.iteration += 1
+        if increment_iteration:
+            state.iteration += 1
 
     def sync_llm_usage(self, state: AgentState) -> None:
         if self.usage_meter is not None:
@@ -993,6 +1491,41 @@ class CodingAgentLoop:
         if not state.messages:
             return []
         return [compact_llm_message(message) for message in state.messages[-4:]]
+
+
+def successful_edit_paths(state: AgentState) -> list[str]:
+    paths: list[str] = []
+    for message in state.messages:
+        if message.get("role") != "tool" or message.get("tool") not in EDIT_TOOLS or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def artifact_execution_evidence(state: AgentState) -> ExecutionEvidence:
+    scheduler = state.verification_scheduler
+    producer = None
+    validator = None
+    if scheduler is not None:
+        for node in scheduler.commands:
+            evidence = scheduler.evidence.get(node.command)
+            if evidence is None or not evidence.passed:
+                continue
+            if node.kind == "producer":
+                producer = evidence
+            elif node.kind == "validator":
+                validator = evidence
+    return ExecutionEvidence(
+        edit_epoch=state.edit_epoch,
+        producer_epoch=producer.edit_epoch if producer else None,
+        producer_sequence=producer.sequence if producer else None,
+        validator_epoch=validator.edit_epoch if validator else None,
+        validator_sequence=validator.sequence if validator else None,
+        request_paths=(),
+    )
 
 
 def verification_to_dict(result: VerificationResult) -> dict[str, object]:
@@ -1029,6 +1562,15 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
             "output": result.smoke_result.output if result.smoke_result else None,
             "metadata": result.smoke_result.metadata if result.smoke_result else None,
         },
+        "explicit_commands": [
+            {
+                "command": (item.metadata or {}).get("command"),
+                "exit_code": item.exit_code,
+                "output": item.output,
+                "metadata": item.metadata or {},
+            }
+            for item in (result.explicit_results or [])
+        ],
         "llm_judgement": {
             "passed": result.llm_judgement.passed,
             "confidence": result.llm_judgement.confidence,
@@ -1039,6 +1581,7 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
         else None,
         "verification_plan": {
             "required_commands": result.verification_plan.required_commands,
+            "explicit_commands": result.verification_plan.explicit_commands,
             "smoke_commands": result.verification_plan.smoke_commands,
             "require_test_change": result.verification_plan.require_test_change,
             "require_entrypoint_run": result.verification_plan.require_entrypoint_run,
@@ -1053,7 +1596,21 @@ def verification_to_dict(result: VerificationResult) -> dict[str, object]:
         "evidence": {
             "successful_fetch_urls": result.evidence.successful_fetch_urls,
             "successful_web_search_queries": result.evidence.successful_web_search_queries,
+            "successful_source_inspections": result.evidence.successful_source_inspections or [],
             "relevant_fetch_urls": result.evidence.relevant_fetch_urls or [],
+            "latest_edit_step_index": result.evidence.latest_edit_step_index,
+            "latest_edit_epoch": result.evidence.latest_edit_epoch,
+            "command_runs": [
+                {
+                    "command": run.command,
+                    "output": run.output,
+                    "exit_code": run.exit_code,
+                    "step_index": run.step_index,
+                    "edit_epoch": run.edit_epoch,
+                    "explicit": run.explicit,
+                }
+                for run in (result.evidence.command_runs or [])
+            ],
             "no_test_reason": result.evidence.no_test_reason,
         }
         if result.evidence
@@ -1081,6 +1638,7 @@ def observation_step(context_pack: ContextPack) -> dict[str, object]:
         "repo_map": context_pack.repo_map,
         "working_memory": context_pack.working_memory,
         "file_memory": context_pack.file_memory,
+        "source_inspection": context_pack.source_inspection,
         "latest_evidence": context_pack.latest_evidence,
         "recent_messages": context_pack.recent_messages,
     }
@@ -1088,14 +1646,33 @@ def observation_step(context_pack: ContextPack) -> dict[str, object]:
 
 def enrich_tool_result_metadata(tool_name: str, args: dict[str, object], result: ToolResult) -> ToolResult:
     metadata = dict(result.metadata or {})
-    if "path" not in metadata and tool_name in {"write_file", "edit_file", "replace_in_file", "read_file"}:
+    if "path" not in metadata and tool_name in {"write_file", "edit_file", "replace_in_file", *FOCUSED_REPAIR_READ_TOOLS}:
         path = args.get("path")
         if path:
             metadata["path"] = str(path)
+    if tool_name == "apply_patch" and "paths" not in metadata:
+        patch = str(args.get("patch") or "")
+        paths = []
+        for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+)$", patch, flags=re.MULTILINE):
+            path = match.group(1).strip()
+            if path != "/dev/null" and path not in paths:
+                paths.append(path)
+        if paths:
+            metadata["paths"] = paths
+    if tool_name == "read_file_range":
+        metadata.setdefault("start_line", args.get("start_line", 1))
+        metadata.setdefault("end_line", args.get("end_line", 120))
+    elif tool_name == "read_symbol":
+        metadata.setdefault("symbol", args.get("symbol", ""))
+        metadata.setdefault("context_lines", args.get("context_lines", 5))
     if "command" not in metadata and tool_name == "run_command":
         command = args.get("command")
         if command:
             metadata["command"] = str(command)
+    if tool_name == "inspect_source":
+        metadata.setdefault("requested_url", str(args.get("url") or ""))
+        metadata.setdefault("mode", str(args.get("mode") or "raw"))
+        metadata.setdefault("execution_scope", "sandbox")
     if metadata == (result.metadata or {}):
         return result
     return ToolResult(
@@ -1115,7 +1692,11 @@ def compact_llm_message(message: dict[str, Any]) -> dict[str, Any]:
     if "content" in message:
         compact["content"] = truncate_text(str(message["content"]), 500)
     if "output" in message:
-        compact["output"] = truncate_text(str(message["output"]), 500)
+        compact["output"] = (
+            "<source body represented in Source Inspection>"
+            if message.get("tool") == "inspect_source"
+            else truncate_text(str(message["output"]), 500)
+        )
     metadata = message.get("metadata")
     if isinstance(metadata, dict):
         keep = {}
@@ -1193,7 +1774,10 @@ def refine_repair_action_targets(action: RepairAction, task_contract: TaskContra
     source_targets = task_contract_source_targets(task_contract)
     if not source_targets:
         return action
-    target_files = unique_preserving_paths([*source_targets, *action.target_files])
+    action_targets = list(action.target_files)
+    if "main.py" in action_targets and "main.py" not in source_targets:
+        action_targets = [path for path in action_targets if path != "main.py"]
+    target_files = unique_preserving_paths([*source_targets, *action_targets])
     if target_files == action.target_files:
         return action
     return replace(action, target_files=target_files)
@@ -1240,6 +1824,110 @@ def fallback_required_command_repair(state: AgentState, result: ToolResult) -> R
     )
 
 
+ZERO_RECORD_RE = re.compile(r"\b(?:wrote|collected|parsed|produced|found)?\s*0\s+(?:records?|cards?|entries?|items?|rows?)\b", re.IGNORECASE)
+
+
+def parser_source_mismatch_repair(state: AgentState, result: ToolResult) -> RepairAction | None:
+    if not is_crawler_instruction(state.job.instruction) or result.tool != "run_command":
+        return None
+    if not re.search(r"AssertionError:\s*0\b|\bempty\s+(?:payload|records?|list)\b", result.output, re.IGNORECASE):
+        return None
+    commands = list(state.task_contract.must_run_commands if state.task_contract is not None else [])
+    if len(commands) < 2:
+        return None
+    producer = str(commands[0])
+    producer_result = next(
+        (
+            message
+            for message in reversed(state.messages)
+            if message.get("role") == "tool"
+            and message.get("tool") == "run_command"
+            and int(message.get("exit_code") or 0) == 0
+            and commands_equivalent(str((message.get("metadata") or {}).get("command") or ""), producer)
+        ),
+        None,
+    )
+    if producer_result is None or not ZERO_RECORD_RE.search(str(producer_result.get("output") or "")):
+        return None
+    targets = list(state.task_contract.must_modify_files if state.task_contract is not None else [])
+    if not targets:
+        targets = [token.strip("'\"") for token in producer.split() if token.strip("'\"").endswith(".py")][:1]
+    target = targets[0] if targets else "main.py"
+    diagnosis = source_parser_diagnosis(state, target)
+    signature = f"parser_source_mismatch:{normalize_workspace_relative_path(target)}:zero_records"
+    return RepairAction(
+        category="parser_source_mismatch",
+        signature=signature,
+        reason="The collector executed successfully but matched zero records.",
+        target_files=[target],
+        allowed_tools=["read_file", "read_file_range", "read_symbol", "edit_file", "write_file", "replace_in_file", "apply_patch", "run_command", "git_status", "git_diff"],
+        forbidden_tools=TARGETED_REPAIR_FORBIDDEN_TOOLS,
+        rerun_commands=[producer, *[str(command) for command in commands[1:]]],
+        instruction=(
+            "The collector executed successfully but matched zero records. The current parser assumptions likely do not match "
+            "the inspected source structure.\n\n"
+            f"Latest producer output:\n{truncate_text(str(producer_result.get('output') or ''), 800)}\n\n"
+            f"Validator assertion:\n{truncate_text(result.output, 800)}\n\n"
+            f"Evidence-backed source/parser diagnosis:\n{diagnosis}\n\n"
+            "Re-read the retained representative source excerpt, update the parser generically, then rerun the producer before the validator."
+        ),
+        initial_inspection_budget=1,
+        failure_class="parser_source_mismatch",
+        producer_semantic_result="zero_records",
+    )
+
+
+def source_parser_diagnosis(state: AgentState, target: str) -> str:
+    evidence = [item for item in source_inspection_evidence(state.messages, state.job.instruction) if item.usable]
+    observed: list[str] = []
+    summaries: list[str] = []
+    for item in evidence:
+        summary = item.structure_summary or {}
+        summaries.append(json.dumps(summary, ensure_ascii=False))
+        for key in ("top_level_keys", "sample_keys", "class_names", "data_attributes"):
+            observed.extend(str(value) for value in summary.get(key) or [])
+        observed.extend(str(entry.get("tag")) for entry in summary.get("repeated_tags") or [] if isinstance(entry, dict))
+        observed.extend(str(key) for key in (summary.get("list_fields") or {}))
+        observed.extend(str(key) for key in (summary.get("pagination_fields") or {}))
+    target_normalized = normalize_workspace_relative_path(target)
+    code_text = ""
+    for message in reversed(state.messages):
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if path == target_normalized and message.get("tool") in {"read_file", "read_file_range", "read_symbol", "write_file", "edit_file"}:
+            code_text = str(message.get("output") or "")
+            if code_text:
+                break
+    references = sorted(
+        {
+            match.group(1)
+            for match in re.finditer(r"['\"]([A-Za-z_][A-Za-z0-9_.:-]{1,48})['\"]", code_text)
+        }
+    )[:30]
+    observed_set = {value.lower() for value in observed}
+    absent = [value for value in references if value.lower() not in observed_set][:15]
+    excerpt = next((item.body for item in evidence if item.body), "")
+    return (
+        f"Usable source count: {len(evidence)}\n"
+        f"Observed source summaries: {truncate_text(' | '.join(summaries), 1800)}\n"
+        f"Current parser references: {', '.join(references) or '<not recovered from prior reads/edits>'}\n"
+        f"Parser identifiers absent from observed structure: {', '.join(absent) or '<none detected>'}\n"
+        f"Representative source excerpt: {truncate_text(excerpt, 1500)}"
+    )
+
+
+def reset_parser_mismatch_convergence(state: AgentState, result: ToolResult) -> None:
+    if result.tool != "run_command" or result.exit_code != 0 or ZERO_RECORD_RE.search(result.output):
+        return
+    commands = list(state.task_contract.must_run_commands if state.task_contract is not None else [])
+    observed = str((result.metadata or {}).get("command") or "")
+    if not commands or not commands_equivalent(observed, str(commands[0])):
+        return
+    for signature in list(state.failure_signatures):
+        if signature.startswith("parser_source_mismatch:"):
+            state.failure_signatures.pop(signature, None)
+
+
 SOURCE_FILE_EXTENSIONS = {
     ".py",
     ".js",
@@ -1264,10 +1952,29 @@ def fallback_required_command_target_files(state: AgentState, *, output: str, co
     if task_contract is not None:
         candidates.extend(str(path) for path in task_contract.must_modify_files if str(path).strip())
     candidates.extend(infer_python_traceback_files(output))
+    candidates.extend(infer_named_fixture_files(output, command))
     candidates.extend(source_files_implied_by_command(command))
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     candidates.extend(changed_source_files_from_status(status_output))
+    candidates.extend(successfully_inspected_source_files(state))
     return unique_preserving_paths(candidates)
+
+
+def successfully_inspected_source_files(state: AgentState) -> list[str]:
+    paths: list[str] = []
+    for message in state.messages:
+        if (
+            message.get("role") != "tool"
+            or message.get("tool") not in FOCUSED_REPAIR_READ_TOOLS
+            or int(message.get("exit_code") or 0) != 0
+        ):
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        suffix = posixpath.splitext(path)[1].lower()
+        if path and suffix in SOURCE_FILE_EXTENSIONS:
+            paths.append(path)
+    return unique_preserving_paths(paths)
 
 
 def source_files_implied_by_command(command: str) -> list[str]:
@@ -1337,17 +2044,32 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
     target_files: list[str] = []
     rerun_commands: list[str] = []
     lines = ["Quality gate blocked finalization. Modify the listed target file(s) before running commands again."]
+    generated_without_producer: QualityIssue | None = None
     for issue in blockers:
         path = str(issue.path or "").strip()
         code = str(issue.code or "quality_blocker")
-        repair_path = quality_gate_repair_target(path, code)
-        if repair_path and repair_path not in target_files:
-            target_files.append(repair_path)
+        candidates = list(issue.producer_targets) if issue.artifact_ownership == "generated" else [quality_gate_repair_target(path, code)]
+        for repair_path in candidates:
+            if repair_path and repair_path not in target_files:
+                target_files.append(repair_path)
         where = f" ({path})" if path else ""
         lines.append(f"- [{code}] {issue.message}{where}")
+        if issue.artifact_ownership == "generated" and not issue.producer_targets:
+            generated_without_producer = issue
+            lines.append("  Required phase: locate the producer; do not edit the generated artifact.")
         if issue.repair_hint:
             lines.append(f"  Repair hint: {issue.repair_hint}")
     if not target_files:
+        if generated_without_producer is not None:
+            issue = generated_without_producer
+            return RepairAction(
+                category="artifact_producer_repair", signature="quality:" + str(abs(hash(f"{issue.code}:{issue.message}:{issue.path}")))[:12],
+                reason="locate_artifact_producer", target_files=[], allowed_tools=["search", "read_file", "read_file_range", "read_symbol", "git_diff", "git_status"],
+                forbidden_tools=["edit_file", "write_file", "replace_in_file", "apply_patch", "run_command"], instruction="\n".join(lines),
+                artifact_path=issue.path, artifact_ownership="generated", producer_command_id=issue.producer_command_id,
+                producer_command=issue.producer_command, validator_id=issue.validator_id, failure_details=issue.message,
+                evidence_refs=list(issue.evidence_refs),
+            )
         issue_text = "\n".join(f"{issue.code}: {issue.message}" for issue in blockers)
         return plan_repair_from_tool_result(
             tool="run_command",
@@ -1355,6 +2077,7 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
             metadata={},
         )
     signature_source = "|".join(f"{issue.code}:{issue.message}:{issue.path}" for issue in blockers)
+    primary = blockers[0]
     return RepairAction(
         category="quality_gate_repair",
         signature="quality:" + str(abs(hash(signature_source)))[:12],
@@ -1376,6 +2099,13 @@ def repair_action_from_quality_gate(result: QualityGateResult) -> RepairAction |
         rerun_commands=rerun_commands,
         exploration_forbidden=True,
         initial_inspection_budget=1,
+        artifact_path=primary.path,
+        artifact_ownership=primary.artifact_ownership,
+        producer_command_id=primary.producer_command_id,
+        producer_command=primary.producer_command,
+        validator_id=primary.validator_id,
+        failure_details=primary.message,
+        evidence_refs=list(primary.evidence_refs),
     )
 
 
@@ -1526,11 +2256,16 @@ def allowed_tool_definitions(definitions: list[Any], repair_mode: str | None) ->
 
 def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState) -> list[Any]:
     refresh_targeted_repair_phase(state)
+    source_continuation = continuation_allowed(state)
+    if successful_source_inspection(state.messages, state.job.instruction) is not None and not source_continuation:
+        definitions = [definition for definition in definitions if getattr(definition, "name", None) != "inspect_source"]
+    if source_progress_forced(state):
+        return [definition for definition in definitions if getattr(definition, "name", None) in (EDIT_TOOLS | LOCAL_INSPECTION_TOOLS)]
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
-        if state.targeted_repair_phase == "edit_forced":
-            return [definition for definition in definitions if getattr(definition, "name", None) in EDIT_TOOLS]
-        forbidden = targeted_repair_hard_forbidden_tools(state)
-        return [definition for definition in definitions if getattr(definition, "name", None) not in forbidden]
+        allowed = targeted_repair_allowed_tools_for_phase(state) - targeted_repair_hard_forbidden_tools(state)
+        if source_continuation:
+            allowed.add("inspect_source")
+        return [definition for definition in definitions if getattr(definition, "name", None) in allowed]
     status_output = state.latest_git_status.output if state.latest_git_status is not None else ""
     workflow = workflow_snapshot(state, status_output)
     if crawler_source_research_priority_active(state, workflow):
@@ -1554,10 +2289,14 @@ def allowed_tool_definitions_for_state(definitions: list[Any], state: AgentState
 
 def repair_mode_tool_block(state: AgentState, tool_name: str) -> str:
     refresh_targeted_repair_phase(state)
+    if tool_name == "inspect_source" and continuation_allowed(state):
+        return ""
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         if tool_name in targeted_repair_hard_forbidden_tools(state):
             return repair_mode_forbidden_detail(state, tool_name)
-        return ""
+        if tool_name in targeted_repair_allowed_tools_for_phase(state):
+            return ""
+        return repair_mode_forbidden_detail(state, tool_name)
     if state.repair_mode not in {"must_edit", "quality_repair", "targeted_repair"}:
         return ""
     allowed = allowed_tools_for_repair_mode(state)
@@ -1580,44 +2319,9 @@ def targeted_repair_hard_forbidden_tools(state: AgentState) -> set[str]:
 
 
 def targeted_repair_allowed_tools_for_phase(state: AgentState) -> set[str]:
-    action = state.active_repair_action or {}
-
-    # 一旦 target file 已经在本轮 repair 后被修改，才允许 rerun command。
     if targeted_repair_modified_target(state):
         return {"run_command", "git_status", "git_diff"}
-
-    # target file 还没改之前，绝对不要暴露 run_command。
-    # inspect_allowed 允许读一次，也允许模型直接改。
-    if state.targeted_repair_phase == "inspect_allowed":
-        return {
-            "read_file",
-            "read_file_range",
-            "read_symbol",
-            "edit_file",
-            "write_file",
-            "replace_in_file",
-            "apply_patch",
-            "git_status",
-            "git_diff",
-        }
-
-    # edit_forced 阶段只允许修改，不允许继续读/搜/跑测试。
-    if state.targeted_repair_phase == "edit_forced":
-        return {
-            "edit_file",
-            "write_file",
-            "replace_in_file",
-            "apply_patch",
-        }
-
-    # fallback：保守处理，不允许 run_command
-    return {
-        "read_file",
-        "edit_file",
-        "write_file",
-        "replace_in_file",
-        "apply_patch",
-    }
+    return FOCUSED_REPAIR_READ_TOOLS | EDIT_TOOLS | TARGETED_REPAIR_GIT_TOOLS
 
 
 def allowed_tools_for_repair_mode_name(repair_mode: str | None) -> set[str]:
@@ -1631,9 +2335,15 @@ def allowed_tools_for_repair_mode_name(repair_mode: str | None) -> set[str]:
 def repair_mode_forbidden_detail(state: AgentState, tool_name: str) -> str:
     if state.repair_mode == "targeted_repair" and state.active_repair_action:
         instruction = str(state.active_repair_action.get("instruction") or "")
+        if not targeted_repair_modified_target(state):
+            return (
+                f"{tool_name} is blocked until an active target file is modified. "
+                "Use focused target reads, edit tools, git_status, or git_diff now.\n"
+                f"{instruction}"
+            )
         return (
             f"{tool_name} is blocked by the active targeted repair action.\n"
-            f"Use local read/edit/run_command/git tools for this repair instead.\n{instruction}"
+            f"Rerun the exact repair command or inspect git status/diff now.\n{instruction}"
         )
     if state.repair_mode == "must_edit":
         return (
@@ -1660,13 +2370,85 @@ def targeted_repair_action_block(state: AgentState, tool_name: str, args: dict[s
     return ""
 
 
+def targeted_repair_read_policy_result(
+    state: AgentState,
+    tool_name: str,
+    args: dict[str, object],
+) -> ToolResult | None:
+    if (
+        state.repair_mode != "targeted_repair"
+        or not state.active_repair_action
+        or tool_name not in FOCUSED_REPAIR_READ_TOOLS
+    ):
+        return None
+    path = normalize_workspace_relative_path(str(args.get("path") or ""))
+    targets = targeted_repair_targets(state)
+    if targets and not any(status_change_covers_target(path, target) for target in targets):
+        return repair_read_blocked_result(
+            tool_name,
+            path,
+            "repair_read_not_targeted",
+            targets,
+            "Read one of the active target files or edit the most likely source target.",
+        )
+    if repeated_targeted_repair_read(state, tool_name, args):
+        return repair_read_blocked_result(
+            tool_name,
+            path,
+            "repair_read_repeated",
+            targets,
+            "Use a different range/symbol if the prior output was truncated; otherwise edit the target now.",
+        )
+    budget = targeted_repair_inspection_budget(state)
+    observed = targeted_repair_read_count(state)
+    if observed < budget or not usable_targeted_repair_read_exists(state):
+        return None
+    if truncated_read_followup_allowed(state, tool_name, path):
+        return None
+    return repair_read_blocked_result(
+        tool_name,
+        path,
+        "repair_read_budget_exhausted",
+        targets,
+        "The focused read budget is exhausted. Edit the target file now, then rerun the required command.",
+        observed=observed,
+        budget=budget,
+    )
+
+
+def repair_read_blocked_result(
+    tool_name: str,
+    path: str,
+    reason: str,
+    targets: set[str],
+    next_action: str,
+    *,
+    observed: int | None = None,
+    budget: int | None = None,
+) -> ToolResult:
+    target_text = ", ".join(sorted(targets)) or "<unspecified>"
+    output = f"{reason}: read not executed. Target files: {target_text}. {next_action}"
+    metadata: dict[str, Any] = {
+        "path": path,
+        "blocked": True,
+        "reason": reason,
+        "target_files": sorted(targets),
+        "next_action": next_action,
+    }
+    if observed is not None:
+        metadata["observed_reads"] = observed
+    if budget is not None:
+        metadata["read_budget"] = budget
+    return ToolResult(tool=tool_name, output=output, exit_code=0, metadata=metadata)
+
+
 def note_targeted_repair_tool_result(state: AgentState, result: ToolResult) -> None:
     if state.repair_mode != "targeted_repair" or not state.active_repair_action:
         return
     if not result.ok:
         refresh_targeted_repair_phase(state)
         return
-    if result.tool in {"read_file", "read_file_range", "read_symbol", "search", "list_files"}:
+    if result.tool in FOCUSED_REPAIR_READ_TOOLS and useful_targeted_repair_read_result(state, result):
         state.targeted_repair_inspections += 1
     elif result.tool in {"edit_file", "write_file", "replace_in_file", "apply_patch"}:
         state.targeted_repair_edits += 1
@@ -1735,9 +2517,93 @@ def targeted_repair_read_count(state: AgentState) -> int:
         return 0
     count = 0
     for message in state.messages[state.active_repair_started_at :]:
-        if message.get("role") == "tool" and message.get("tool") in {"read_file", "read_file_range", "read_symbol", "search", "list_files"}:
+        if useful_targeted_repair_read_message(state, message):
             count += 1
     return count
+
+
+def useful_targeted_repair_read_result(state: AgentState, result: ToolResult) -> bool:
+    return useful_targeted_repair_read_message(
+        state,
+        {
+            "role": "tool",
+            "tool": result.tool,
+            "exit_code": result.exit_code,
+            "output": result.output,
+            "truncated": result.truncated,
+            "metadata": result.metadata or {},
+        },
+    )
+
+
+def useful_targeted_repair_read_message(state: AgentState, message: dict[str, Any]) -> bool:
+    if (
+        message.get("role") != "tool"
+        or message.get("tool") not in FOCUSED_REPAIR_READ_TOOLS
+        or int(message.get("exit_code") or 0) != 0
+        or not str(message.get("output") or "").strip()
+    ):
+        return False
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    if metadata.get("blocked"):
+        return False
+    path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+    targets = targeted_repair_targets(state)
+    return bool(path) and (not targets or any(status_change_covers_target(path, target) for target in targets))
+
+
+def usable_targeted_repair_read_exists(state: AgentState) -> bool:
+    return any(
+        useful_targeted_repair_read_message(state, message)
+        for message in state.messages[state.active_repair_started_at :]
+    )
+
+
+def repeated_targeted_repair_read(state: AgentState, tool_name: str, args: dict[str, object]) -> bool:
+    requested = targeted_repair_read_identity(tool_name, args)
+    for message in state.messages[state.active_repair_started_at :]:
+        if message.get("role") != "tool" or message.get("tool") != tool_name or int(message.get("exit_code") or 0) != 0:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if metadata.get("blocked"):
+            continue
+        if targeted_repair_read_identity(tool_name, metadata) == requested:
+            return True
+    return False
+
+
+def targeted_repair_read_identity(tool_name: str, values: dict[str, object]) -> tuple[object, ...]:
+    path = normalize_workspace_relative_path(str(values.get("path") or ""))
+    if tool_name == "read_file_range":
+        return tool_name, path, int_or_default(values.get("start_line"), 1), int_or_default(values.get("end_line"), 120)
+    if tool_name == "read_symbol":
+        return tool_name, path, str(values.get("symbol") or ""), int_or_default(values.get("context_lines"), 5)
+    return tool_name, path
+
+
+def int_or_default(value: object, default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def truncated_read_followup_allowed(state: AgentState, tool_name: str, path: str) -> bool:
+    if tool_name not in {"read_file_range", "read_symbol"}:
+        return False
+    for message in reversed(state.messages[state.active_repair_started_at :]):
+        if message.get("role") != "tool" or message.get("tool") not in FOCUSED_REPAIR_READ_TOOLS:
+            continue
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        seen_path = normalize_workspace_relative_path(str(metadata.get("path") or ""))
+        if seen_path != path or metadata.get("blocked"):
+            continue
+        return bool(
+            message.get("truncated")
+            or metadata.get("source_truncated")
+            or metadata.get("prompt_output_truncated")
+        )
+    return False
 
 
 def targeted_repair_modified_target(state: AgentState) -> bool:
@@ -1893,10 +2759,6 @@ def path_changed_after_message(state: AgentState, path: str, index: int) -> bool
 def crawler_source_research_priority_active(state: AgentState, workflow: Any) -> bool:
     if workflow.phase != WorkflowPhase.EDIT_REQUIRED:
         return False
-    if successful_edit_tool_called(state):
-        return False
-    if exploratory_tool_calls(state) >= INITIAL_NO_DIFF_EXPLORATION_BUDGET:
-        return False
     if not is_crawler_instruction(state.job.instruction):
         return False
     if not instruction_source_urls(state.job.instruction):
@@ -1905,27 +2767,30 @@ def crawler_source_research_priority_active(state: AgentState, workflow: Any) ->
 
 
 def initial_crawler_source_tools(state: AgentState) -> set[str]:
-    base = {"write_file", "edit_file", "replace_in_file", "apply_patch"}
-    if explicit_source_fetch_attempted(state):
+    base = {"inspect_source", "git_status", "read_file", "read_file_range", "read_symbol", "list_files"}
+    if attempted_source_urls(state.messages):
         return base | {"fetch_url", "web_search"}
-    return base | {"fetch_url"}
-
-
-def instruction_source_urls(instruction: str) -> list[str]:
-    urls: list[str] = []
-    for match in re.findall(r"https?://[^\s'\"`)>]+", instruction or ""):
-        cleaned = match.rstrip(".,;:")
-        if cleaned and cleaned not in urls:
-            urls.append(cleaned)
-    return urls
+    return base
 
 
 def source_research_succeeded(state: AgentState) -> bool:
-    return any(
-        message.get("role") == "tool"
-        and message.get("tool") in {"fetch_url", "web_search"}
-        and int(message.get("exit_code") or 0) == 0
-        for message in state.messages
+    return successful_source_inspection(state.messages, state.job.instruction) is not None
+
+
+def source_inspection_required_tool_block(state: AgentState, tool_name: str) -> str:
+    if not crawler_source_inspection_required(state.job.instruction):
+        return ""
+    if successful_source_inspection(state.messages, state.job.instruction) is not None:
+        return ""
+    allowed = initial_crawler_source_tools(state)
+    if tool_name in allowed:
+        return ""
+    candidates = instruction_source_urls(state.job.instruction)
+    candidate_text = ", ".join(candidates[:3]) or "the literal source URL"
+    return (
+        "Source inspection is required before editing or running verification commands. The current diff must remain empty. "
+        f"Call inspect_source from the sandbox for one of these literal candidates: {candidate_text}. "
+        "A local scaffold read, web_search, or host fetch_url does not satisfy this stage."
     )
 
 
@@ -1972,6 +2837,8 @@ def normalize_workspace_path(path: str) -> str:
 
 
 def required_test_tool_block(state: AgentState, workflow: Any, tool_name: str, args: dict[str, object]) -> str:
+    if tool_name == "inspect_source" and continuation_allowed(state, getattr(workflow, "phase", None)):
+        return ""
     if workflow.phase != WorkflowPhase.TEST_REQUIRED:
         return ""
     missing = getattr(workflow, "missing_commands", None) or []
@@ -2045,9 +2912,7 @@ def duplicate_inspection_pressure_tool_block(state: AgentState, workflow: Any, t
 
 
 def duplicate_inspection_required_command_retarget(state: AgentState, workflow: Any) -> str:
-    if getattr(workflow, "diff_exists", False):
-        return ""
-    if successful_edit_tool_called(state) or edit_tool_attempted(state):
+    if workflow.phase != WorkflowPhase.TEST_REQUIRED or not getattr(workflow, "diff_exists", False):
         return ""
     contract = state.task_contract
     commands = list(contract.must_run_commands if contract is not None else [])
@@ -2111,6 +2976,8 @@ def cached_read_excerpt(state: AgentState, index: int | None, *, max_lines: int 
 
 
 def duplicate_inspection_edit_forced(state: AgentState, workflow: Any) -> bool:
+    if source_progress_forced(state):
+        return True
     if workflow.phase != WorkflowPhase.EDIT_REQUIRED or getattr(workflow, "diff_exists", False):
         return False
     return not successful_edit_tool_called(state) and duplicate_inspection_rejection_count(state) > 0
@@ -2180,19 +3047,18 @@ def next_targeted_repair_rerun_command(state: AgentState) -> str:
 
 
 def controller_owned_required_command(state: AgentState, workflow: Any) -> str:
-    contract_commands = [
-        str(command)
-        for command in (state.task_contract.must_run_commands if state.task_contract is not None else [])
-        if str(command)
-    ]
-    if not contract_commands:
+    if state.verification_scheduler is None:
+        commands = [str(command) for command in (state.task_contract.must_run_commands if state.task_contract is not None else []) if str(command)]
+        state.verification_scheduler = VerificationScheduler.from_explicit_commands(commands)
+    scheduler = state.verification_scheduler
+    if not scheduler.commands:
         return ""
-
+    for node in scheduler.commands:
+        if command_was_run(state, node.command) and not scheduler.is_fresh_success(node.command):
+            scheduler.record(node.command, True)
     if state.active_repair_action:
         if state.repair_mode != "targeted_repair" or not targeted_repair_modified_target(state):
             return ""
-        rerun = next_targeted_repair_rerun_command(state)
-        command = next((item for item in contract_commands if commands_equivalent(item, rerun)), "")
     else:
         if state.repair_mode is not None or workflow.phase != WorkflowPhase.TEST_REQUIRED:
             return ""
@@ -2200,14 +3066,13 @@ def controller_owned_required_command(state: AgentState, workflow: Any) -> str:
             return ""
         if missing_must_modify_targets(state):
             return ""
-        missing = list(getattr(workflow, "missing_commands", None) or [])
-        command = str(missing[0]) if missing else ""
-
-    if not command or not any(commands_equivalent(command, item) for item in contract_commands):
+    command = scheduler.next_command() or ""
+    if not command:
         return ""
-    if "\n" not in command and heredoc_delimiter_from_command(command) is None:
-        return ""
-    return command
+    profile = state.profile or select_task_profile(state.job.instruction)
+    if profile.name == "crawler":
+        return command
+    return command if "\n" in command or heredoc_delimiter_from_command(command) is not None else ""
 
 
 def targeted_repair_forced_tool(
@@ -2281,122 +3146,7 @@ def patch_paths(patch: str) -> list[str]:
 
 
 def crawler_external_source_tool_block(state: AgentState, tool_name: str, args: dict[str, object]) -> str:
-    if not is_crawler_instruction(state.job.instruction):
-        return ""
-    allowed = instruction_source_domains(state.job.instruction)
-    if not allowed:
-        return ""
-    if tool_name == "fetch_url":
-        raw_url = str(args.get("url") or "")
-        host = urlparse(raw_url).hostname or ""
-        if host and source_domain_allowed(host, allowed):
-            return ""
-        return (
-            f"fetch_url is blocked for {host or '<missing host>'}. "
-            f"This crawler task may only inspect the planned source domain(s): {', '.join(sorted(allowed))}."
-        )
-    if tool_name == "web_search":
-        query = str(args.get("query") or args.get("q") or "").lower()
-        blocked_terms = {"cisa.gov", "cisa", "cis benchmark", "cis control", "security advisory"}
-        if any(term in query for term in blocked_terms):
-            return (
-                "web_search is blocked because the query drifted to CISA/CIS security content. "
-                f"Keep research anchored to the planned source domain(s): {', '.join(sorted(allowed))}."
-            )
-    if tool_name in {"write_file", "edit_file", "replace_in_file"}:
-        content = str(args.get("content") or args.get("new_text") or args.get("replacement") or "")
-        blocked = blocked_domains_in_text(content, allowed)
-        if blocked:
-            return (
-                f"{tool_name} content references source domain(s) outside the plan: {', '.join(blocked)}. "
-                f"Rewrite the file for the planned source domain(s): {', '.join(sorted(allowed))}."
-            )
-    if tool_name == "apply_patch":
-        patch = str(args.get("patch") or "")
-        blocked = blocked_domains_in_text(patch, allowed)
-        if blocked:
-            return (
-                f"apply_patch content references source domain(s) outside the plan: {', '.join(blocked)}. "
-                f"Patch only for the planned source domain(s): {', '.join(sorted(allowed))}."
-            )
-    return ""
-
-
-def crawler_corrected_fetch_url_args(state: AgentState, tool_name: str, args: dict[str, object]) -> dict[str, object] | None:
-    if tool_name != "fetch_url" or not is_crawler_instruction(state.job.instruction):
-        return None
-    source_urls = instruction_source_urls(state.job.instruction)
-    allowed = instruction_source_domains(state.job.instruction)
-    if not source_urls or not allowed:
-        return None
-    raw_url = str(args.get("url") or "")
-    host = urlparse(raw_url).hostname or ""
-    if host and source_domain_allowed(host, allowed):
-        return None
-    corrected = dict(args)
-    corrected["url"] = source_urls[0]
-    corrected["goal"] = (
-        f"Inspect the planned crawler source {source_urls[0]} and derive selectors/fields for the requested target. "
-        "Ignore unrelated CIS/CISA/security-control interpretations."
-    )
-    return corrected
-
-
-def instruction_source_domains(instruction: str) -> set[str]:
-    domains: set[str] = set()
-    for url in instruction_source_urls(instruction):
-        host = urlparse(url).hostname
-        if host:
-            normalized = normalize_detected_host(host)
-            if normalized:
-                domains.add(normalized)
-    for match in re.finditer(r'"allowed_domains"\s*:\s*\[([^\]]+)\]', instruction or ""):
-        for domain in re.findall(r'"([^"]+)"', match.group(1)):
-            normalized = normalize_detected_host(domain)
-            if normalized:
-                domains.add(normalized)
-    return domains
-
-
-def normalize_detected_host(host: str) -> str:
-    normalized = host.lower().strip(".")
-    if "${" in normalized:
-        normalized = normalized.split("${", 1)[0].rstrip(".")
-    if "{" in normalized:
-        normalized = normalized.split("{", 1)[0].rstrip(".")
-    return normalized
-
-
-def source_domain_allowed(host: str, allowed: set[str]) -> bool:
-    normalized = normalize_detected_host(host)
-    if not normalized:
-        return False
-    return any(normalized == domain or normalized.endswith(f".{domain}") for domain in allowed)
-
-
-def blocked_domains_in_text(text: str, allowed: set[str]) -> list[str]:
-    blocked: list[str] = []
-    candidates: list[str] = []
-    for match in re.finditer(r"https?://[^\s'\"`)>]+", text.lower()):
-        host = urlparse(match.group(0).rstrip(".,;:")).hostname
-        if host:
-            candidates.append(host)
-    for match in re.finditer(r"\b(?:source_url|url|domain|host)\s*=\s*[\"']([^\"']+)[\"']", text.lower()):
-        value = match.group(1).strip()
-        host = urlparse(value).hostname or value
-        if "." in host:
-            candidates.append(host)
-    for host in candidates:
-        host = normalize_detected_host(host)
-        if not host:
-            continue
-        if source_domain_allowed(host, allowed):
-            continue
-        if host in {"example.com", "localhost"} or host.endswith(".example"):
-            continue
-        if host not in blocked:
-            blocked.append(host)
-    return blocked[:5]
+    return source_tool_block(state, tool_name, args)
 
 
 def latest_failed_required_command(state: AgentState) -> ToolResult | None:

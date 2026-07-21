@@ -8,7 +8,8 @@ from urllib.parse import urlparse
 
 from docode.agent.inspector import ProjectInspection
 from docode.agent.stuck import git_status_clean
-from docode.agent.task_contract import TaskContract
+from docode.agent.source_inspection import instruction_source_urls, source_inspection_evidence
+from docode.agent.task_contract import TaskContract, is_crawler_instruction
 from docode.agent.workflow import display_command
 from docode.dobox.types import ToolResult
 from docode.git_changes import changed_paths_from_status, strip_ansi
@@ -18,9 +19,11 @@ from docode.storage.models import CodingJob
 @dataclass(frozen=True, slots=True)
 class ContextPack:
     task_contract: str
+    runtime_context: str
     repo_map: str
     working_memory: str
     file_memory: str
+    source_inspection: str
     action_summary: str
     latest_evidence: str
     recent_messages: list[dict[str, Any]] = field(default_factory=list)
@@ -28,9 +31,11 @@ class ContextPack:
     def render(self) -> str:
         sections = [
             ("Task Contract", self.task_contract),
+            ("Runtime Profile and Task Graph", self.runtime_context),
             ("Repo Map", self.repo_map),
             ("Working Memory", self.working_memory),
             ("File Memory", self.file_memory),
+            ("Source Inspection", self.source_inspection),
             ("Action Summary", self.action_summary),
             ("Latest Evidence", self.latest_evidence),
         ]
@@ -58,6 +63,10 @@ class ContextManager:
         active_repair_action: dict[str, Any] | None = None,
         targeted_repair_phase: str | None = None,
         workflow_phase: str | None = None,
+        include_source_body: bool = True,
+        profile: Any | None = None,
+        repository_context: Any | None = None,
+        task_graph: Any | None = None,
     ) -> ContextPack:
         repair_active = repair_mode == "targeted_repair" and active_repair_action is not None
         compact_mode = (workflow_phase in {"EDIT_REQUIRED", "TEST_REQUIRED", "FINAL_READY"}) and not repair_active
@@ -81,6 +90,7 @@ class ContextManager:
             llm_cost_used=llm_cost_used,
         )
         file_memory = self.file_memory(inspection, messages, repair_active=repair_active)
+        source_inspection = self.source_inspection(job, messages, include_body=include_source_body)
         action_summary = self.action_summary(
             job=job,
             messages=messages,
@@ -101,13 +111,47 @@ class ContextManager:
         ]
         return ContextPack(
             task_contract=clip_text(task_contract_text, 1_600 if compact_mode else section_bytes),
+            runtime_context=clip_text(self.runtime_context(profile, repository_context, task_graph), 2_400),
             repo_map=clip_text(repo_map, 700 if compact_mode else section_bytes),
             working_memory=clip_text(working_memory, 900 if compact_mode else section_bytes),
             file_memory=clip_text(file_memory, 700 if compact_mode else (3_000 if repair_active else section_bytes)),
+            source_inspection=clip_text(source_inspection, 6_000 if include_source_body else 3_500),
             action_summary=clip_text(action_summary, 900 if compact_mode else 1_600),
             latest_evidence=clip_text(latest_evidence, 1_000 if compact_mode else (8_000 if repair_active else section_bytes)),
             recent_messages=recent_messages,
         )
+
+    def runtime_context(self, profile: Any | None, repository_context: Any | None, task_graph: Any | None) -> str:
+        parts: list[str] = []
+        if profile is not None:
+            parts.append(
+                "Active Profile:\n"
+                f"- name: {profile.name}\n"
+                f"- source_inspection_required: {profile.source_inspection_required}\n"
+                f"- allowed_source_schemes: {', '.join(profile.allowed_source_schemes) or 'none'}\n"
+                f"- source_request_limit: {profile.budget_policy.maximum_source_requests}\n"
+                f"- identical_failure_limit: {profile.repair_policy.maximum_identical_failures}"
+            )
+        if repository_context is not None:
+            repo_map = repository_context.repository_map
+            parts.append(
+                "Repository Summary:\n"
+                f"- files_indexed: {len(repository_context.files)}\n"
+                f"- symbols_indexed: {len(repository_context.symbols)}\n"
+                f"- languages: {json.dumps(repo_map.languages, sort_keys=True)}\n"
+                f"- entrypoints: {', '.join(repo_map.entrypoints[:12]) or 'none'}\n"
+                f"- manifests: {', '.join(repo_map.manifests[:12]) or 'none'}\n"
+                "Relevant Symbols:\n"
+                + "\n".join(f"- {item.kind} {item.symbol} ({item.file}:{item.start_line})" for item in repository_context.symbols[:20])
+            )
+        if task_graph is not None:
+            ready = {node.id for node in task_graph.ready()}
+            lines = []
+            for node in task_graph.nodes.values():
+                marker = "current/ready" if node.id in ready else node.status.value
+                lines.append(f"- {node.id}: {marker}; goal={node.goal}; verification={', '.join(node.verification) or 'none'}")
+            parts.append("Task Graph:\n" + "\n".join(lines))
+        return "\n\n".join(parts)
 
     def task_contract(
         self,
@@ -150,8 +194,8 @@ class ContextManager:
                 "Source Guidance:\n"
                 + "\n".join(f"- preferred_source_url: {url}" for url in source_urls[:5])
                 + ("\n" + "\n".join(f"- preferred_source_domain: {domain}" for domain in domains[:5]) if domains else "")
-                + "\n- First inspect these sources with fetch_url before broadening to web_search."
-                + "\n- If web_search becomes necessary, keep queries anchored to these URLs/domains and the requested target."
+                + "\n- Inspect a literal source with sandbox-native inspect_source before editing."
+                + "\n- fetch_url and web_search are supplemental discovery tools and do not satisfy sandbox source inspection."
             )
         if repair_mode:
             parts.append(
@@ -162,7 +206,7 @@ class ContextManager:
         if active_repair_action:
             phase = targeted_repair_phase or "inspect_allowed"
             targets = ", ".join(str(path) for path in active_repair_action.get("target_files") or []) or "the target file"
-            next_action = f"inspect or modify {targets}, then rerun the relevant command when useful"
+            next_action = targeted_repair_phase_guidance(phase, targets, active_repair_action)
             parts.append(
                 "Active Targeted Repair:\n"
                 + json.dumps(display_repair_action(active_repair_action), ensure_ascii=False, indent=2)
@@ -215,6 +259,55 @@ class ContextManager:
             if snippets:
                 parts.append("Repair file snippets already available in context:\n" + snippets)
         return "\n\n".join(parts) if parts else "No file memory yet."
+
+    def source_inspection(self, job: CodingJob, messages: list[dict[str, Any]], *, include_body: bool) -> str:
+        candidates = instruction_source_urls(job.instruction)
+        if not candidates:
+            return ""
+        evidence = source_inspection_evidence(messages, job.instruction)
+        lines = ["Literal source candidates:", *(f"- {url}" for url in candidates[:5])]
+        if not evidence:
+            lines.extend(
+                [
+                    "Status: pending",
+                    "Required next action: inspect_source must run in the sandbox before any edit or verification command.",
+                ]
+            )
+            return "\n".join(lines)
+        usable = [item for item in evidence if item.usable]
+        excerpt_total = 0
+        lines.extend(
+            [
+                f"Status: {'usable' if usable else 'failed'}",
+                "source_memory_included: true",
+                f"usable_source_count: {len(usable)}",
+            ]
+        )
+        for number, item in enumerate(usable, start=1):
+            limit = (2_500 if item.source_role == "initial" else 1_500) if include_body else (900 if item.source_role == "initial" else 600)
+            excerpt = clip_text(item.body, limit) if item.body else ""
+            excerpt_total += len(excerpt.encode("utf-8"))
+            lines.extend(
+                [
+                    "",
+                    f"Source {number} — {item.source_role}",
+                    f"URL: {item.requested_url}",
+                    f"Final URL: {item.final_url}",
+                    "Status: usable",
+                    f"HTTP status: {item.status_code}",
+                    f"Content type: {(item.structure_summary or {}).get('kind', '<unknown>')}",
+                    f"Structure summary: {json.dumps(item.structure_summary or {}, ensure_ascii=False)}",
+                ]
+            )
+            if item.parent_url:
+                lines.append(f"Parent URL: {item.parent_url}")
+            if excerpt:
+                lines.extend(["Retained source excerpt:", excerpt])
+        failed = [item for item in evidence if not item.usable]
+        if failed:
+            lines.append(f"Optional failed inspections: {len(failed)} (successful source memory above remains usable).")
+        lines.append(f"source_excerpt_bytes: {excerpt_total}")
+        return "\n".join(lines)
 
     def action_summary(
         self,
@@ -309,7 +402,7 @@ class ContextManager:
                 f"- phase: {targeted_repair_phase or 'inspect_allowed'}\n"
                 f"- target_files: {target_files}\n"
                 f"- rerun: {rerun}\n"
-                "- suggested_next_action: inspect, edit, or rerun based on the latest failure output"
+                f"- suggested_next_action: {targeted_repair_phase_guidance(targeted_repair_phase or 'inspect_allowed', target_files, active_repair_action)}"
                 + ("\n\nRepair file snippets:\n" + snippets if snippets else "")
             )
         return (
@@ -356,27 +449,24 @@ def compact_message(message: dict[str, Any], *, content_limit: int = 1200) -> di
     if "content" in message:
         compact["content"] = clip_text(str(message["content"]), content_limit)
     if "output" in message:
-        compact["output"] = clip_text(str(message["output"]), content_limit)
+        compact["output"] = (
+            "<source body represented in Source Inspection>"
+            if message.get("tool") == "inspect_source"
+            else clip_text(str(message["output"]), content_limit)
+        )
     metadata = message.get("metadata")
     if isinstance(metadata, dict):
         compact["metadata"] = compact_metadata(metadata)
     return compact
 
 
-def instruction_source_urls(instruction: str) -> list[str]:
-    urls: list[str] = []
-    for match in re.findall(r"https?://[^\s'\"`)>]+", instruction or "", flags=re.IGNORECASE):
-        cleaned = match.rstrip(".,;:")
-        if cleaned and cleaned not in urls:
-            urls.append(cleaned)
-    return urls
-
-
 def tool_evidence(message: dict[str, Any], *, output_limit: int = 900) -> str:
     tool = str(message.get("tool") or "tool")
     exit_code = int(message.get("exit_code") or 0)
     metadata = compact_metadata(message.get("metadata") if isinstance(message.get("metadata"), dict) else {})
-    if message.get("truncated") and output_limit <= 200:
+    if tool == "inspect_source":
+        output = "<source body represented in Source Inspection>"
+    elif message.get("truncated") and output_limit <= 200:
         original = metadata.get("original_output_bytes")
         output = f"<truncated output: {original} bytes>" if original else "<truncated output>"
     else:
@@ -396,6 +486,8 @@ def repair_file_snippets(messages: list[dict[str, Any]], *, output_limit: int = 
         if tool not in {"read_file", "read_file_range", "read_symbol"}:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        if metadata.get("blocked"):
+            continue
         path = str(metadata.get("path") or metadata.get("resolved_path") or "<unknown>")
         symbol = str(metadata.get("symbol") or "")
         key = (path, symbol or tool)
@@ -420,7 +512,12 @@ def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "command",
         "detected",
         "rejected",
+        "blocked",
         "reason",
+        "read_budget",
+        "observed_reads",
+        "target_files",
+        "next_action",
         "url",
         "status_code",
         "content_type",
@@ -433,6 +530,18 @@ def compact_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         if key in metadata:
             keep[key] = display_command(str(metadata[key])) if key == "command" else metadata[key]
     return keep
+
+
+def targeted_repair_phase_guidance(phase: str, targets: str, action: dict[str, Any]) -> str:
+    if phase == "rerun_required":
+        commands = [display_command(str(command)) for command in action.get("rerun_commands") or [] if str(command)]
+        return "rerun the exact repair command now" + (f": {commands[0]}" if commands else "; inspect git status/diff afterward")
+    if phase == "edit_forced":
+        return (
+            f"edit {targets} now. Focused target reads remain available, but repeated or over-budget reads return structured "
+            "repair_read_budget_exhausted feedback; run_command stays blocked until an edit succeeds"
+        )
+    return f"read only the relevant portions of {targets}, then edit; run_command stays blocked until an edit succeeds"
 
 
 def display_repair_action(action: dict[str, Any]) -> dict[str, Any]:
@@ -600,11 +709,6 @@ def final_candidate_reason(clean: bool, repair_mode: str | None) -> str:
     if repair_mode == "must_edit":
         return " because repair_mode requires an edit confirmation first"
     return " after tests pass"
-
-
-def is_crawler_instruction(instruction: str) -> bool:
-    lowered = (instruction or "").lower()
-    return any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "数据源"))
 
 
 def crawler_contract_requirements() -> list[str]:

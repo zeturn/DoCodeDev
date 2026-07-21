@@ -9,6 +9,7 @@ from unittest import IsolatedAsyncioTestCase
 
 from docode.runtime.python_cmd import local_python_command_args
 from docode.agent.verifier import (
+    CommandEvidence,
     CodingVerifier,
     VerificationEvidence,
     build_verification_plan,
@@ -649,7 +650,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
 
         self.assertTrue(result.passed)
 
-    async def test_public_url_crawler_rejects_unrelated_or_print_only_url_command(self) -> None:
+    async def test_public_url_crawler_reruns_missing_exact_command_despite_unrelated_evidence(self) -> None:
         required = "python crawler.py --url https://example.test/products --output out.json --dry-run"
         diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('JSON outputs: out.json')\n"
         instruction = (
@@ -671,7 +672,10 @@ class VerifierTests(IsolatedAsyncioTestCase):
                     ),
                 )
 
-                self.assertFalse(result.passed)
+                self.assertTrue(result.passed)
+                explicit = (result.explicit_results or [])[0]
+                self.assertEqual(explicit.metadata["command"], required)
+                self.assertFalse(explicit.metadata["reused_evidence"])
 
     async def test_crawler_output_flag_alone_does_not_verify_artifact(self) -> None:
         diff = "diff --git a/crawler.py b/crawler.py\n+def main():\n+    print('done')\n"
@@ -775,7 +779,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertEqual(result.smoke_result.exit_code, 0)
         self.assertIn("<truncated>", result.smoke_result.output)
 
-    async def test_truncated_smoke_failure_is_allowed_when_standard_tests_passed(self) -> None:
+    async def test_failed_explicit_command_is_not_hidden_by_standard_tests(self) -> None:
         class TruncatedFailureTools(NoDetectedPythonVerifierTools):
             async def run_tests(self) -> ToolResult:
                 return ToolResult(tool="run_tests", output="OK", exit_code=0, metadata={"detected": True, "command": "python3 -m unittest discover -s tests"})
@@ -801,7 +805,8 @@ class VerifierTests(IsolatedAsyncioTestCase):
             TruncatedFailureTools(smoke_exit_code=1),
         )
 
-        self.assertTrue(result.passed)
+        self.assertFalse(result.passed)
+        self.assertIn("fix failing explicit verification command", result.required_fixes)
         self.assertEqual(result.smoke_result.exit_code, 0)
 
     async def test_python_crawler_404_output_requires_endpoint_reinspection(self) -> None:
@@ -927,7 +932,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            plan.smoke_commands,
+            plan.explicit_commands,
             [
                 "python -m unittest discover -s tests",
                 "python crawler.py fixtures/products.html --output out.json",
@@ -973,7 +978,8 @@ class VerifierTests(IsolatedAsyncioTestCase):
             "- verify with: python3 cli.py --name Ada"
         )
 
-        self.assertEqual(plan.smoke_commands, ["python3 cli.py --name Ada"])
+        self.assertEqual(plan.explicit_commands, ["python3 cli.py --name Ada"])
+        self.assertEqual(plan.smoke_commands, [])
 
     async def test_cli_verify_with_hint_is_used_for_smoke(self) -> None:
         tools = CliHintVerifierTools()
@@ -991,7 +997,7 @@ class VerifierTests(IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.passed)
-        self.assertIn("python3 cli.py --name Ada", tools.command)
+        self.assertEqual((result.explicit_results or [])[0].metadata["command"], "python3 cli.py --name Ada")
 
     async def test_external_source_requires_tool_evidence_not_diff_url(self) -> None:
         result = await CodingVerifier().verify(
@@ -1045,6 +1051,19 @@ class VerifierTests(IsolatedAsyncioTestCase):
         steps = [
             {
                 "type": "tool_result",
+                "tool": "inspect_source",
+                "exit_code": 0,
+                "metadata": {
+                    "requested_url": "http://127.0.0.1:8765/feed?cursor=",
+                    "final_url": "http://127.0.0.1:8765/feed?cursor=",
+                    "execution_scope": "sandbox",
+                    "mode": "json",
+                    "status_code": 200,
+                    "returned_bytes": 120,
+                },
+            },
+            {
+                "type": "tool_result",
                 "tool": "fetch_url",
                 "exit_code": 0,
                 "metadata": {"url": "https://example.test/docs", "goal": "api auth", "returned_bytes": 100, "status_code": 200},
@@ -1059,6 +1078,8 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertEqual(evidence.successful_fetch_urls, ["https://example.test/docs"])
         self.assertEqual(evidence.relevant_fetch_urls, ["https://example.test/docs"])
         self.assertEqual(evidence.successful_web_search_queries, ["example api docs"])
+        self.assertTrue(evidence.has_sandbox_source_evidence)
+        self.assertEqual(evidence.successful_source_inspections[0]["requested_url"], "http://127.0.0.1:8765/feed?cursor=")
 
     async def test_external_source_rejects_unrelated_fetch_url_evidence(self) -> None:
         result = await CodingVerifier().verify(
@@ -1086,3 +1107,376 @@ class VerifierTests(IsolatedAsyncioTestCase):
         self.assertIsNotNone(result.verification_plan)
         self.assertTrue(result.verification_plan.require_entrypoint_run)
         self.assertIn("python3 crawler.py", result.smoke_result.metadata["command"])
+
+    async def test_fresh_explicit_command_evidence_is_reused_without_rerun(self) -> None:
+        command = "python3 checks/check_contract.py"
+
+        class AuthorityTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 2\n")
+
+        tools = AuthorityTools()
+        evidence = VerificationEvidence(
+            successful_fetch_urls=[],
+            successful_web_search_queries=[],
+            successful_commands=[command],
+            successful_command_outputs=["contract ok\nfull diagnostic output"],
+            command_runs=[CommandEvidence(command, "contract ok\nfull diagnostic output", 0, 2, 1, True)],
+            latest_edit_step_index=1,
+            latest_edit_epoch=1,
+        )
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+            ),
+            tools,
+            evidence=evidence,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertNotIn(command, tools.commands)
+        self.assertEqual((result.explicit_results or [])[0].output, "contract ok\nfull diagnostic output")
+        self.assertTrue((result.explicit_results or [])[0].metadata["reused_evidence"])
+
+    async def test_explicit_evidence_before_latest_edit_is_rerun_exactly(self) -> None:
+        command = "python3 checks/check_contract.py"
+
+        class AuthorityTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 3\n")
+
+        tools = AuthorityTools()
+        evidence = VerificationEvidence(
+            successful_fetch_urls=[],
+            successful_web_search_queries=[],
+            command_runs=[CommandEvidence(command, "stale success", 0, 2, 1, True)],
+            latest_edit_step_index=3,
+            latest_edit_epoch=2,
+        )
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+            ),
+            tools,
+            evidence=evidence,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(tools.commands.count(command), 1)
+        self.assertFalse((result.explicit_results or [])[0].metadata["reused_evidence"])
+
+    async def test_fresh_failed_explicit_command_blocks_without_rerun(self) -> None:
+        command = "python3 checks/check_contract.py"
+
+        class AuthorityTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 4\n")
+
+        tools = AuthorityTools()
+        evidence = VerificationEvidence(
+            successful_fetch_urls=[],
+            successful_web_search_queries=[],
+            command_runs=[CommandEvidence(command, "contract mismatch", 7, 2, 1, True)],
+            latest_edit_step_index=1,
+            latest_edit_epoch=1,
+        )
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+            ),
+            tools,
+            evidence=evidence,
+        )
+
+        self.assertFalse(result.passed)
+        self.assertNotIn(command, tools.commands)
+        self.assertIn("fix failing explicit verification command", result.required_fixes)
+
+    async def test_no_detected_test_does_not_invent_test_command(self) -> None:
+        class NoFrameworkTools(NoDetectedPythonVerifierTools):
+            def __init__(self):
+                super().__init__()
+                self.tests_called = 0
+
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def run_tests(self) -> ToolResult:
+                self.tests_called += 1
+                return await super().run_tests()
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 5\n")
+
+        tools = NoFrameworkTools()
+        result = await CodingVerifier().verify(
+            CodingJob(id=new_id("job"), user_id="u1", instruction="Update source.py."),
+            tools,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(tools.tests_called, 0)
+        self.assertTrue(result.test_result.metadata["skipped"])
+
+    def test_command_evidence_preserves_duplicate_runs_and_full_outputs(self) -> None:
+        command = "python3 checks/check_contract.py"
+        steps = [
+            {"type": "tool_result", "tool": "write_file", "exit_code": 0, "metadata": {"path": "source.py"}},
+            {"type": "tool_result", "tool": "run_command", "exit_code": 1, "metadata": {"command": command}, "output": "first failure"},
+            {"type": "tool_result", "tool": "run_command", "exit_code": 0, "metadata": {"command": command}, "output": "second success\nwith details"},
+        ]
+
+        evidence = verification_evidence_from_steps(steps, explicit_commands=[command])
+
+        self.assertEqual(len(evidence.command_runs or []), 2)
+        self.assertEqual([run.exit_code for run in evidence.command_runs or []], [1, 0])
+        self.assertEqual((evidence.command_runs or [])[-1].output, "second success\nwith details")
+        self.assertTrue(all(run.explicit for run in evidence.command_runs or []))
+        self.assertEqual(evidence.latest_edit_epoch, 1)
+
+    async def test_controller_heredoc_evidence_is_reused_with_safe_newline_normalization(self) -> None:
+        command = "python - <<'PY'\nprint('verified')\nPY"
+
+        class HeredocTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 6\n")
+
+        tools = HeredocTools()
+        observed = command.replace("\n", "\r\n")
+        evidence = VerificationEvidence(
+            successful_fetch_urls=[],
+            successful_web_search_queries=[],
+            command_runs=[CommandEvidence(observed, "verified\n", 0, 2, 1, True)],
+            latest_edit_step_index=1,
+            latest_edit_epoch=1,
+        )
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+            ),
+            tools,
+            evidence=evidence,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertNotIn(command, tools.commands)
+        self.assertTrue((result.explicit_results or [])[0].metadata["reused_evidence"])
+
+    async def test_incomplete_or_different_heredoc_evidence_does_not_match(self) -> None:
+        command = "python - <<'PY'\nprint('required')\nPY"
+
+        class HeredocTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return None
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 7\n")
+
+        for observed in ("python - <<'PY'", "python - <<'PY'\nprint('different')\nPY"):
+            with self.subTest(observed=observed):
+                tools = HeredocTools()
+                evidence = VerificationEvidence(
+                    successful_fetch_urls=[],
+                    successful_web_search_queries=[],
+                    command_runs=[CommandEvidence(observed, "unrelated\n", 0, 2, 1, False)],
+                    latest_edit_step_index=1,
+                    latest_edit_epoch=1,
+                )
+                result = await CodingVerifier().verify(
+                    CodingJob(
+                        id=new_id("job"),
+                        user_id="u1",
+                        instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+                    ),
+                    tools,
+                    evidence=evidence,
+                )
+
+                self.assertTrue(result.passed)
+                self.assertEqual(tools.commands.count(command), 1)
+                self.assertFalse((result.explicit_results or [])[0].metadata["reused_evidence"])
+
+    async def test_explicit_success_does_not_suppress_detected_failing_test(self) -> None:
+        command = "python checks/check_contract.py"
+
+        class FailingDetectedTestTools(NoDetectedPythonVerifierTools):
+            async def detect_test_command(self):
+                return "pytest"
+
+            async def detect_build_command(self):
+                return None
+
+            async def detect_lint_command(self):
+                return None
+
+            async def run_tests(self) -> ToolResult:
+                return ToolResult(tool="run_tests", output="1 failed", exit_code=1, metadata={"detected": True, "command": "pytest"})
+
+            async def git_diff(self) -> ToolResult:
+                return ToolResult(tool="git_diff", output="diff --git a/source.py b/source.py\n+VALUE = 8\n")
+
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction=f"Update source.py.\nVerification commands:\n1. {command}",
+            ),
+            FailingDetectedTestTools(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIn("fix failing verification command", result.required_fixes)
+
+
+class GitPollutedDiffTools(PassingVerifierTools):
+    """Simulates a workspace where ``prepare_workspace_for_diff`` has run
+    ``git init``, causing git's own ``.git`` metadata (HEAD, hook sample
+    templates with TODO comments) to appear in the raw git output alongside a
+    real deliverable file (``guidebook.md``)."""
+
+    async def git_status(self) -> ToolResult:
+        return ToolResult(
+            tool="git_status",
+            output=" M .git/HEAD\n M .git/hooks/sendemail-validate.sample\n M guidebook.md\n",
+            exit_code=0,
+        )
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(
+            tool="git_diff",
+            output=(
+                "diff --git a/.git/HEAD b/.git/HEAD\n"
+                "-ref: refs/heads/main\n"
+                "+ref: refs/heads/runtime-v2\n"
+                "diff --git a/.git/hooks/sendemail-validate.sample b/.git/hooks/sendemail-validate.sample\n"
+                "old mode 100644\n"
+                "new mode 100755\n"
+                "+# TODO: Replace with appropriate checks for this patch\n"
+                "diff --git a/guidebook.md b/guidebook.md\n"
+                "+# Guidebook\n"
+                "+Complete guidebook content with operational envelope.\n"
+            ),
+            exit_code=0,
+        )
+
+    async def run_command(self, command: str, cwd: str = "/workspace") -> ToolResult:
+        _ = cwd
+        return ToolResult(tool="run_command", output="ok", exit_code=0, metadata={"command": command})
+
+    async def list_files(self, path: str = ".") -> ToolResult:
+        _ = path
+        return ToolResult(tool="list_files", output="guidebook.md\n", exit_code=0)
+
+
+class OnlyGitDiffTools(GitPollutedDiffTools):
+    """Status/diff contain *only* ``.git`` internals — no real deliverable."""
+
+    async def git_status(self) -> ToolResult:
+        return ToolResult(
+            tool="git_status",
+            output=" M .git/HEAD\n M .git/hooks/sendemail-validate.sample\n",
+            exit_code=0,
+        )
+
+    async def git_diff(self) -> ToolResult:
+        return ToolResult(
+            tool="git_diff",
+            output=(
+                "diff --git a/.git/HEAD b/.git/HEAD\n"
+                "-ref: refs/heads/main\n"
+                "+ref: refs/heads/runtime-v2\n"
+                "diff --git a/.git/hooks/sendemail-validate.sample b/.git/hooks/sendemail-validate.sample\n"
+                "old mode 100644\n"
+                "new mode 100755\n"
+                "+# TODO: Replace with appropriate checks for this patch\n"
+            ),
+            exit_code=0,
+        )
+
+
+class TestGitPollutionVerifier(IsolatedAsyncioTestCase):
+    async def test_verify_passes_when_git_templates_have_todos_but_real_file_exists(self) -> None:
+        """A clean deliverable (guidebook.md) must not fail because git's own
+        hook templates contain TODO comments. The shared ``filter_diff_output``
+        strips ``.git`` hunks before placeholder scanning."""
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="Complete guidebook.md with operational envelope sections",
+            ),
+            GitPollutedDiffTools(),
+        )
+        self.assertTrue(result.passed, msg=result.required_fixes)
+        self.assertNotIn("remove placeholder", " ".join(result.required_fixes))
+
+    async def test_verify_fails_when_only_git_internals_change_no_real_deliverable(self) -> None:
+        """After ``filter_diff_output`` removes ``.git`` hunks the diff becomes
+        empty so ``has_change_evidence`` must be false and the verifier must
+        demand real deliverable changes."""
+        result = await CodingVerifier().verify(
+            CodingJob(
+                id=new_id("job"),
+                user_id="u1",
+                instruction="Complete guidebook.md with operational envelope sections",
+            ),
+            OnlyGitDiffTools(),
+        )
+        self.assertFalse(result.passed)
+        self.assertIn("produce a non-empty git diff or explicit artifact", result.required_fixes)

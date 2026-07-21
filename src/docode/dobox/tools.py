@@ -3,12 +3,24 @@ from __future__ import annotations
 import inspect
 import posixpath
 import difflib
+import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .client import DoBoxClient
 from .file_readers import read_line_range, read_python_symbol
+from .source_inspection import (
+    INSPECT_SOURCE_COMMAND,
+    INSPECT_SOURCE_DEFAULT_BYTES,
+    INSPECT_SOURCE_DEFAULT_TIMEOUT,
+    INSPECT_SOURCE_PROGRAM,
+    compact_json,
+    inspect_source_error_payload,
+    inspect_source_validation_error,
+)
+from .source_cache import SourceResponseCache, cached_source_result
 from .types import FileResult, ToolResult
 from docode.git_changes import filter_diff_output, filter_status_output
 
@@ -97,6 +109,7 @@ class DoBoxTools:
         self.command_timeout_seconds = command_timeout_seconds
         self.output_limit_bytes = output_limit_bytes
         self.command_overrides = dict(command_overrides or {})
+        self.source_cache = SourceResponseCache()
 
     def set_detected_command(self, name: str, command: str | None) -> None:
         if command:
@@ -105,6 +118,17 @@ class DoBoxTools:
     def definitions(self) -> list[ToolDefinition]:
         return [
             ToolDefinition("run_command", "Run a shell command inside the project sandbox.", {"command": "string", "cwd": "string"}, self.run_command),
+            ToolDefinition(
+                "inspect_source",
+                "Fetch and inspect an HTTP/HTTPS source from inside the project sandbox network namespace.",
+                {
+                    "url": "string",
+                    "mode": {"type": "string", "enum": ["raw", "text", "json", "headers"], "default": "raw"},
+                    "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 200000, "default": 50000},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 30, "default": 15},
+                },
+                self.inspect_source,
+            ),
             ToolDefinition("read_file", "Read a file under /workspace.", {"path": "string"}, self.read_file),
             ToolDefinition(
                 "read_file_range",
@@ -171,12 +195,111 @@ class DoBoxTools:
             truncated=result.truncated,
         )
 
+    async def inspect_source(
+        self,
+        url: str,
+        mode: str = "raw",
+        max_bytes: int = INSPECT_SOURCE_DEFAULT_BYTES,
+        timeout: int = INSPECT_SOURCE_DEFAULT_TIMEOUT,
+    ) -> ToolResult:
+        error = inspect_source_validation_error(url, mode, max_bytes, timeout)
+        normalized_url = url.strip() if isinstance(url, str) else str(url or "")
+        normalized_mode = mode if isinstance(mode, str) else str(mode or "")
+        if error:
+            payload = inspect_source_error_payload(url=normalized_url, mode=normalized_mode, error=error)
+            return ToolResult(
+                tool="inspect_source",
+                output=compact_json(payload),
+                exit_code=2,
+                metadata={**payload, "rejected": True},
+            )
+
+        cached = self.source_cache.get(normalized_url, normalized_mode, max_bytes)
+        if cached is not None:
+            return cached
+
+        # Fetch a reusable raw response once; text/json/header modes are local views.
+        config = compact_json({"url": normalized_url, "mode": "raw", "max_bytes": max_bytes, "timeout": timeout})
+        command = [*INSPECT_SOURCE_COMMAND, INSPECT_SOURCE_PROGRAM, config]
+        output_limit = min(1_250_000, max(self.output_limit_bytes, max_bytes * 6 + 16_384))
+        try:
+            result = await self.client.run_command(
+                self.project_id,
+                command,
+                cwd="/workspace",
+                timeout_sec=timeout + 5,
+                output_limit=output_limit,
+                agent_session_id=self.agent_session_id,
+            )
+        except Exception as exc:
+            payload = inspect_source_error_payload(
+                url=normalized_url,
+                mode=normalized_mode,
+                error=f"sandbox execution failed: {type(exc).__name__}: {exc}",
+            )
+            return ToolResult(tool="inspect_source", output=compact_json(payload), exit_code=1, metadata=payload)
+
+        if result.truncated:
+            payload = inspect_source_error_payload(
+                url=normalized_url,
+                mode=normalized_mode,
+                error="sandbox command output was truncated before a complete source result was returned",
+            )
+            return ToolResult(tool="inspect_source", output=compact_json(payload), exit_code=1, metadata=payload, truncated=True)
+        try:
+            payload = json.loads(result.output.strip())
+            if not isinstance(payload, dict):
+                raise ValueError("source result is not a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            payload = inspect_source_error_payload(
+                url=normalized_url,
+                mode=normalized_mode,
+                error=f"invalid sandbox source result: {exc}",
+            )
+            if result.output.strip():
+                payload["sandbox_output"] = result.output.strip()[:2_000]
+            return ToolResult(tool="inspect_source", output=compact_json(payload), exit_code=result.exit_code or 1, metadata=payload)
+
+        payload["execution_scope"] = "sandbox"
+        metadata = {key: value for key, value in payload.items() if key != "body"}
+        raw_result = ToolResult(
+            tool="inspect_source",
+            output=compact_json(payload),
+            exit_code=result.exit_code,
+            metadata=metadata,
+            truncated=bool(payload.get("truncated")),
+        )
+        stored = self.source_cache.put(normalized_url, raw_result)
+        return stored if normalized_mode == "raw" else cached_source_result(stored, normalized_mode, cached=False)
+
     async def read_file(self, path: str) -> ToolResult:
         path_error = workspace_path_error(path)
         if path_error:
             return rejected_tool_result("read_file", path_error, {"path": path})
-        file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+        try:
+            file_result = await self.client.read_file(self.project_id, path, agent_session_id=self.agent_session_id)
+        except Exception as exc:
+            return ToolResult(
+                tool="read_file",
+                output=f"unable to read {path}: {type(exc).__name__}: {exc}",
+                exit_code=1,
+                metadata={"path": path, "error": "path_not_readable", "suggestion": "Use list_files for directories."},
+            )
         if isinstance(file_result, FileResult):
+            expected = normalized_workspace_absolute_path(path)
+            resolved = normalized_workspace_absolute_path(file_result.path or path)
+            if file_result.path and resolved != expected:
+                return ToolResult(
+                    tool="read_file",
+                    output=f"{path} is a directory; use list_files instead.",
+                    exit_code=1,
+                    metadata={
+                        "path": path,
+                        "resolved_path": file_result.path,
+                        "error": "path_is_directory",
+                        "suggestion": "list_files",
+                    },
+                )
             metadata: dict[str, Any] = {"path": path}
             if file_result.path is not None:
                 metadata["resolved_path"] = file_result.path
@@ -263,7 +386,6 @@ class DoBoxTools:
             metadata=result.metadata,
             truncated=result.truncated,
         )
-
     async def apply_patch(self, patch: str) -> ToolResult:
         if not isinstance(patch, str) or not patch.strip():
             return ToolResult(tool="apply_patch", output="patch must be a non-empty unified diff string", exit_code=2)
@@ -278,11 +400,19 @@ class DoBoxTools:
         result = await self.run_command(command, "/workspace")
         if result.exit_code != 0:
             await self.run_command(f"rm -f {patch_path}", "/workspace")
+        paths = []
+        for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+)$", patch, flags=re.MULTILINE):
+            path = match.group(1).strip()
+            if path != "/dev/null" and path not in paths:
+                paths.append(path)
+        metadata = {"patch_bytes": len(patch.encode("utf-8"))}
+        if paths:
+            metadata["paths"] = paths
         return ToolResult(
             tool="apply_patch",
             output=result.output,
             exit_code=result.exit_code,
-            metadata={"patch_bytes": len(patch.encode("utf-8"))},
+            metadata=metadata,
             truncated=result.truncated,
         )
 
@@ -510,6 +640,15 @@ def workspace_path_error(path: str, *, label: str = "path") -> str | None:
     if normalized == ".." or normalized.startswith("../"):
         return f"{label} must stay under {WORKSPACE_ROOT}"
     return None
+
+
+def normalized_workspace_absolute_path(path: str) -> str:
+    normalized = posixpath.normpath(str(path or "").strip())
+    if normalized == WORKSPACE_ROOT:
+        return WORKSPACE_ROOT
+    if normalized.startswith(WORKSPACE_ROOT + "/"):
+        return normalized
+    return posixpath.normpath(posixpath.join(WORKSPACE_ROOT, normalized))
 
 
 def rejected_tool_result(tool: str, reason: str, metadata: dict[str, Any]) -> ToolResult:

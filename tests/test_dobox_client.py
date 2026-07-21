@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+import base64
 from typing import Any
 from unittest import IsolatedAsyncioTestCase
+from unittest.mock import patch
 
-from docode.dobox.client import DoBoxClient, project_path, raise_for_status, session_payload_id
+import httpx
+
+from docode.dobox.client import (
+    DoBoxClient,
+    DoBoxTransportError,
+    build_transport_error,
+    classify_transport_error,
+    operation_label,
+    project_path,
+    raise_for_status,
+    session_payload_id,
+)
 
 
 class RecordingDoBoxClient(DoBoxClient):
@@ -95,3 +108,140 @@ class DoBoxClientTests(IsolatedAsyncioTestCase):
 
         self.assertIn("POST /api/projects failed with HTTP 500", str(raised.exception))
         self.assertIn("sandbox image missing", str(raised.exception))
+
+
+class WriteFileBinaryTests(IsolatedAsyncioTestCase):
+    async def test_write_file_sends_content_base64_when_provided(self) -> None:
+        class Rec(DoBoxClient):
+            def __init__(self) -> None:
+                super().__init__("http://dobox.example", "token")
+                self.sent: dict[str, Any] | None = None
+
+            async def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+                self.sent = json or {}
+                return {}
+
+        client = Rec()
+        await client.write_file("p1", "img.png", content_base64=base64.b64encode(b"\xff\xfe").decode("ascii"))
+        assert client.sent is not None
+        self.assertIn("content_base64", client.sent)
+        self.assertNotIn("content", client.sent)
+        self.assertEqual(base64.b64decode(client.sent["content_base64"]), b"\xff\xfe")
+
+    async def test_write_file_sends_text_content_when_no_base64(self) -> None:
+        class Rec(DoBoxClient):
+            def __init__(self) -> None:
+                super().__init__("http://dobox.example", "token")
+                self.sent: dict[str, Any] | None = None
+
+            async def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+                self.sent = json or {}
+                return {}
+
+        client = Rec()
+        await client.write_file("p1", "a.txt", "hello")
+        assert client.sent is not None
+        self.assertEqual(client.sent.get("content"), "hello")
+        self.assertNotIn("content_base64", client.sent)
+
+    async def test_write_file_empty_content_uploads_zero_bytes(self) -> None:
+        class Rec(DoBoxClient):
+            def __init__(self) -> None:
+                super().__init__("http://dobox.example", "token")
+                self.sent: dict[str, Any] | None = None
+
+            async def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
+                self.sent = json or {}
+                return {}
+
+        client = Rec()
+        await client.write_file("p1", "empty.txt", content_base64="")
+        assert client.sent is not None
+        self.assertEqual(client.sent.get("content_base64"), "")
+
+
+class TransportErrorContextTests(IsolatedAsyncioTestCase):
+    def test_classify_transport_error_kinds(self) -> None:
+        self.assertEqual(classify_transport_error(httpx.RemoteProtocolError("x")), "protocol")
+        self.assertEqual(classify_transport_error(httpx.ConnectError("x")), "connect")
+        self.assertEqual(classify_transport_error(httpx.WriteError("x")), "write")
+        self.assertEqual(classify_transport_error(httpx.ReadError("x")), "read")
+
+    def test_operation_label_maps_known_endpoints(self) -> None:
+        self.assertEqual(
+            operation_label("GET", "/api/projects/1/artifacts/archive?agent_session_id=2"),
+            "archive_workspace",
+        )
+        self.assertEqual(operation_label("POST", "/api/projects/1/files/write"), "write_file")
+        self.assertEqual(operation_label("POST", "/api/projects/1/exec"), "run_command")
+        self.assertEqual(operation_label("POST", "/api/projects"), "create_project")
+
+    def test_build_transport_error_has_context_without_secrets(self) -> None:
+        exc = httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        err = build_transport_error(exc, method="GET", path="/api/projects/1/artifacts/archive")
+
+        self.assertIsInstance(err, DoBoxTransportError)
+        self.assertEqual(err.operation, "archive_workspace")
+        self.assertEqual(err.kind, "protocol")
+        self.assertEqual(err.method, "GET")
+        self.assertEqual(err.path, "/api/projects/1/artifacts/archive")
+        self.assertEqual(err.exception_type, "RemoteProtocolError")
+        message = str(err)
+        self.assertIn("archive_workspace", message)
+        self.assertIn("protocol", message)
+        self.assertIn("Server disconnected", message)
+        self.assertNotIn("token", message.lower())
+        self.assertNotIn("authorization", message.lower())
+
+    async def test_request_wraps_transport_error_with_context(self) -> None:
+        client = DoBoxClient("http://dobox.example", "super-secret-token")
+
+        class BoomClient:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> "BoomClient":
+                return self
+
+            async def __aexit__(self, *args: Any) -> bool:
+                return False
+
+            async def request(self, *args: Any, **kwargs: Any) -> Any:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+
+        with patch("httpx.AsyncClient", BoomClient):
+            with self.assertRaises(DoBoxTransportError) as raised:
+                await client._request("POST", "/api/projects/1/files/write", json={"content": "sensitive-file-body"})
+
+        err = raised.exception
+        self.assertEqual(err.operation, "write_file")
+        self.assertEqual(err.kind, "protocol")
+        self.assertEqual(err.method, "POST")
+        message = str(err)
+        self.assertNotIn("super-secret-token", message)
+        self.assertNotIn("sensitive-file-body", message)
+
+    async def test_archive_workspace_wraps_transport_error(self) -> None:
+        client = DoBoxClient("http://dobox.example", "super-secret-token")
+
+        class BoomClient:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> "BoomClient":
+                return self
+
+            async def __aexit__(self, *args: Any) -> bool:
+                return False
+
+            async def get(self, *args: Any, **kwargs: Any) -> Any:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+
+        with patch("httpx.AsyncClient", BoomClient):
+            with self.assertRaises(DoBoxTransportError) as raised:
+                await client.archive_workspace("1", agent_session_id="2")
+
+        err = raised.exception
+        self.assertEqual(err.operation, "archive_workspace")
+        self.assertEqual(err.kind, "protocol")
+        self.assertNotIn("super-secret-token", str(err))

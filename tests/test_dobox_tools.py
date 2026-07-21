@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import IsolatedAsyncioTestCase
 
 from docode.dobox.tools import DoBoxTools, LocalToolRegistry, build_dobox_tool_registry, register_dobox_tools
@@ -73,6 +78,193 @@ class FakeDoBoxClient:
 
 
 class DoBoxToolsTests(IsolatedAsyncioTestCase):
+    async def test_inspect_source_program_handles_redirect_json_text_truncation_and_http_errors(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/data?cursor=next")
+                    self.end_headers()
+                    return
+                if self.path == "/page":
+                    body = b"<html><script>skip()</script><body><h1>Title</h1><p>Hello world</p></body></html>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                elif self.path == "/binary":
+                    body = b"\x00\x01\xff"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                elif self.path == "/slow":
+                    time.sleep(1.25)
+                    body = b"late"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                elif self.path == "/large":
+                    body = b"x" * 2_048
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                elif self.path == "/missing":
+                    body = b"not found"
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                else:
+                    body = json.dumps({"path": self.path, "items": [1, 2]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    pass
+
+            def log_message(self, format, *args):
+                return
+
+        class LocalCommandClient(FakeDoBoxClient):
+            async def run_command(self, project_id, command, **kwargs):
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                output, _ = await process.communicate()
+                return CommandResult(output.decode(), process.returncode)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        tools = DoBoxTools(LocalCommandClient(), "p1")
+        try:
+            redirected = await tools.inspect_source(base_url + "/redirect", mode="json")
+            text = await tools.inspect_source(base_url + "/page", mode="text")
+            headers = await tools.inspect_source(base_url + "/page", mode="headers")
+            binary = await tools.inspect_source(base_url + "/binary")
+            truncated = await tools.inspect_source(base_url + "/large", max_bytes=1_024)
+            missing = await tools.inspect_source(base_url + "/missing")
+            timed_out = await tools.inspect_source(base_url + "/slow", timeout=1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        redirected_payload = json.loads(redirected.output)
+        self.assertEqual(redirected_payload["status_code"], 200)
+        self.assertTrue(redirected_payload["final_url"].endswith("/data?cursor=next"))
+        self.assertEqual(json.loads(redirected_payload["body"])["path"], "/data?cursor=next")
+        self.assertEqual(json.loads(text.output)["body"], "Title\nHello world")
+        self.assertIn("text/html", json.loads(json.loads(headers.output)["body"])["content-type"])
+        self.assertEqual(json.loads(binary.output)["body_encoding"], "base64")
+        self.assertEqual(json.loads(binary.output)["body"], "AAH/")
+        self.assertTrue(json.loads(truncated.output)["truncated"])
+        self.assertEqual(json.loads(truncated.output)["returned_bytes"], 1_024)
+        self.assertEqual(missing.exit_code, 1)
+        self.assertEqual(json.loads(missing.output)["status_code"], 404)
+        self.assertEqual(timed_out.exit_code, 1)
+        self.assertIn("error", json.loads(timed_out.output))
+
+    async def test_inspect_source_is_registered_with_bounded_schema(self) -> None:
+        tools = DoBoxTools(FakeDoBoxClient(), "p1")
+
+        definition = next(item for item in tools.definitions() if item.name == "inspect_source")
+        schema = definition.input_schema()
+
+        self.assertEqual(schema["required"], ["url"])
+        self.assertEqual(schema["properties"]["mode"]["enum"], ["raw", "text", "json", "headers"])
+        self.assertEqual(schema["properties"]["max_bytes"]["maximum"], 200_000)
+        self.assertEqual(schema["properties"]["timeout"]["maximum"], 30)
+
+    async def test_inspect_source_runs_in_sandbox_and_returns_structured_metadata(self) -> None:
+        class SourceClient(FakeDoBoxClient):
+            async def run_command(
+                self,
+                project_id,
+                command,
+                cwd="/workspace",
+                timeout_sec=120,
+                output_limit=1_000_000,
+                agent_session_id=None,
+            ):
+                self.agent_session_ids.append(agent_session_id)
+                self.source_command = command
+                self.source_timeout = timeout_sec
+                self.source_output_limit = output_limit
+                payload = {
+                    "requested_url": "http://127.0.0.1:8765/feed?cursor=abc",
+                    "final_url": "http://127.0.0.1:8765/feed?cursor=abc",
+                    "status_code": 200,
+                    "content_type": "application/json; charset=utf-8",
+                    "mode": "json",
+                    "body": '{"items":[1]}',
+                    "original_bytes": 13,
+                    "returned_bytes": 13,
+                    "truncated": False,
+                    "execution_scope": "sandbox",
+                }
+                return CommandResult(json.dumps(payload), 0)
+
+        client = SourceClient()
+        tools = DoBoxTools(client, "project-123", agent_session_id="session-7")
+
+        result = await tools.inspect_source(
+            "http://127.0.0.1:8765/feed?cursor=abc",
+            mode="json",
+            max_bytes=4_096,
+            timeout=7,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(json.loads(result.output)["body"], '{"items":[1]}')
+        self.assertEqual(result.metadata["execution_scope"], "sandbox")
+        self.assertEqual(result.metadata["status_code"], 200)
+        self.assertNotIn("body", result.metadata)
+        self.assertEqual(client.source_command[:4], ["bash", "-lc", client.source_command[2], "inspect_source"])
+        self.assertNotIn("127.0.0.1", client.source_command[2])
+        self.assertEqual(json.loads(client.source_command[-1])["url"], "http://127.0.0.1:8765/feed?cursor=abc")
+        self.assertEqual(client.source_timeout, 12)
+        self.assertEqual(client.agent_session_ids, ["session-7"])
+
+    async def test_inspect_source_rejects_unsafe_or_unsupported_urls_before_sandbox_call(self) -> None:
+        client = FakeDoBoxClient()
+        tools = DoBoxTools(client, "p1")
+
+        results = [
+            await tools.inspect_source("file:///etc/passwd"),
+            await tools.inspect_source("/workspace/fixture.html"),
+            await tools.inspect_source("ftp://example.com/feed"),
+            await tools.inspect_source("https://example.com/feed;rm -rf /"),
+            await tools.inspect_source("https://user:secret@example.com/feed"),
+        ]
+
+        self.assertTrue(all(result.exit_code == 2 for result in results))
+        self.assertTrue(all(json.loads(result.output)["execution_scope"] == "sandbox" for result in results))
+        self.assertEqual(client.commands, [])
+
+    async def test_inspect_source_rejects_out_of_range_arguments(self) -> None:
+        client = FakeDoBoxClient()
+        tools = DoBoxTools(client, "p1")
+
+        too_small = await tools.inspect_source("https://example.com", max_bytes=1_023)
+        too_large = await tools.inspect_source("https://example.com", max_bytes=200_001)
+        bad_timeout = await tools.inspect_source("https://example.com", timeout=31)
+        bad_mode = await tools.inspect_source("https://example.com", mode="yaml")
+
+        self.assertTrue(all(result.exit_code == 2 for result in [too_small, too_large, bad_timeout, bad_mode]))
+        self.assertEqual(client.commands, [])
+
+    async def test_inspect_source_wraps_non_json_sandbox_failures_as_valid_json(self) -> None:
+        class BrokenSourceClient(FakeDoBoxClient):
+            async def run_command(self, *args, **kwargs):
+                return CommandResult("python interpreter unavailable\n", 127)
+
+        result = await DoBoxTools(BrokenSourceClient(), "p1").inspect_source("https://example.com")
+        payload = json.loads(result.output)
+
+        self.assertEqual(result.exit_code, 127)
+        self.assertEqual(payload["execution_scope"], "sandbox")
+        self.assertIn("invalid sandbox source result", payload["error"])
+
     async def test_run_command_adds_python3_fallback_but_preserves_original_metadata(self) -> None:
         client = FakeDoBoxClient()
         tools = DoBoxTools(client, "p1")
@@ -172,6 +364,25 @@ class DoBoxToolsTests(IsolatedAsyncioTestCase):
             result.metadata,
             {"path": "large.txt", "resolved_path": "/workspace/large.txt", "file_name": "large.txt", "bytes": 7},
         )
+
+    async def test_read_file_directory_result_is_structured_and_never_returns_nested_git_file(self) -> None:
+        class DirectoryClient(FakeDoBoxClient):
+            async def read_file(self, project_id, path, agent_session_id=None):
+                return FileResult(
+                    content="commit message",
+                    path="/workspace/.git/COMMIT_EDITMSG" if path == "/workspace" else "/workspace/pkg/module.py",
+                    file_name="COMMIT_EDITMSG",
+                )
+
+        tools = DoBoxTools(DirectoryClient(), "p1")
+
+        root = await tools.read_file("/workspace")
+        nested = await tools.read_file("pkg")
+
+        self.assertEqual(root.exit_code, 1)
+        self.assertEqual(nested.exit_code, 1)
+        self.assertEqual(root.metadata["error"], "path_is_directory")
+        self.assertNotIn("commit message", root.output)
 
     async def test_tool_calls_include_agent_session_id(self) -> None:
         client = FakeDoBoxClient()

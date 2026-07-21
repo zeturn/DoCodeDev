@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest import TestCase
 
 from docode.agent.context import ContextManager
@@ -10,6 +11,82 @@ from docode.storage.models import CodingJob, new_id
 
 
 class ContextManagerTests(TestCase):
+    def test_source_inspection_body_remains_available_then_compacts_after_edit(self) -> None:
+        instruction = "Build a collector for source https://example.test/feed.xml and update collector.py."
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction=instruction)
+        payload = {
+            "requested_url": "https://example.test/feed.xml",
+            "final_url": "https://example.test/feed.xml",
+            "status_code": 200,
+            "execution_scope": "sandbox",
+            "mode": "raw",
+            "body": "<rss><item><title>Observed title</title></item></rss>",
+        }
+        messages = [
+            {
+                "role": "tool",
+                "tool": "inspect_source",
+                "exit_code": 0,
+                "output": json.dumps(payload),
+                "metadata": {key: value for key, value in payload.items() if key != "body"},
+            }
+        ]
+        manager = ContextManager()
+        kwargs = {
+            "job": job,
+            "inspection": ProjectInspection(listing="collector.py\n"),
+            "messages": messages,
+            "git_status": ToolResult(tool="git_status", output=""),
+            "iteration": 1,
+            "tool_calls_count": 1,
+            "llm_tokens_used": 0,
+            "llm_cost_used": 0.0,
+            "task_contract": task_contract_from_instruction(instruction),
+        }
+
+        first = manager.build_pack(**kwargs, include_source_body=True)
+        later = manager.build_pack(**kwargs, include_source_body=False)
+
+        self.assertIn("Retained source excerpt", first.source_inspection)
+        self.assertIn("Observed title", first.source_inspection)
+        self.assertIn("Observed title", later.source_inspection)
+        self.assertIn("source_memory_included: true", later.source_inspection)
+        self.assertEqual(first.recent_messages[0]["output"], "<source body represented in Source Inspection>")
+
+    def test_context_renders_initial_and_same_origin_derived_sources_as_usable(self) -> None:
+        instruction = "Build a cursor collector from http://127.0.0.1:8765/items?cursor="
+        job = CodingJob(id=new_id("job"), user_id="u1", instruction=instruction)
+        messages = []
+        for url, body in (
+            ("http://127.0.0.1:8765/items?cursor=", '{"rows":[1],"next":"two"}'),
+            ("http://127.0.0.1:8765/items?cursor=two", '{"rows":[2],"next":null}'),
+        ):
+            payload = {
+                "requested_url": url,
+                "final_url": url,
+                "status_code": 200,
+                "execution_scope": "sandbox",
+                "mode": "raw",
+                "body": body,
+                "structure_summary": {"kind": "json_object", "top_level_keys": ["rows", "next"]},
+            }
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool": "inspect_source",
+                    "exit_code": 0,
+                    "output": json.dumps(payload),
+                    "metadata": {key: value for key, value in payload.items() if key != "body"},
+                }
+            )
+
+        rendered = ContextManager().source_inspection(job, messages, include_body=True)
+
+        self.assertIn("Source 1 — initial", rendered)
+        self.assertIn("Source 2 — derived", rendered)
+        self.assertEqual(rendered.count("Status: usable"), 3)
+        self.assertNotIn("Status: failed", rendered)
+
     def test_task_contract_does_not_require_natural_language_git_diff_check(self) -> None:
         contract = task_contract_from_instruction(
             "Make a minimal code change.\n\n"

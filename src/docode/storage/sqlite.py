@@ -52,6 +52,7 @@ class SQLiteJobRepository(JobRepository):
                 sandbox_network_mode TEXT NOT NULL DEFAULT 'project',
                 result_summary TEXT,
                 failure_reason TEXT,
+                terminal_result TEXT,
                 artifact_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -92,6 +93,7 @@ class SQLiteJobRepository(JobRepository):
         self._ensure_column("docode_jobs", "base_branch", "TEXT NOT NULL DEFAULT 'main'")
         self._ensure_column("docode_jobs", "apicred_access_token", "TEXT")
         self._ensure_column("docode_jobs", "quality", "TEXT NOT NULL DEFAULT 'balanced'")
+        self._ensure_column("docode_jobs", "terminal_result", "TEXT")
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -110,11 +112,11 @@ class SQLiteJobRepository(JobRepository):
                 INSERT INTO docode_jobs (
                     id, user_id, instruction, repo_url, branch, github_repo, base_branch,
                     dobox_project_id, dobox_sandbox_id, dobox_agent_session_id, provider, model, quality, apicred_access_token, status, max_iterations,
-                    max_runtime_seconds, max_consecutive_failures, max_tool_calls, max_llm_tokens, max_llm_cost, artifact_mode, sandbox_network_mode, result_summary, failure_reason,
+                    max_runtime_seconds, max_consecutive_failures, max_tool_calls, max_llm_tokens, max_llm_cost, artifact_mode, sandbox_network_mode, result_summary, failure_reason, terminal_result,
                     artifact_id, created_at,
                     updated_at, completed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 job_to_row(job),
             )
@@ -172,7 +174,7 @@ class SQLiteJobRepository(JobRepository):
                     base_branch = ?, dobox_project_id = ?, dobox_sandbox_id = ?, dobox_agent_session_id = ?, provider = ?, model = ?,
                     quality = ?, apicred_access_token = ?, status = ?, max_iterations = ?, max_runtime_seconds = ?, max_consecutive_failures = ?, max_tool_calls = ?,
                     max_llm_tokens = ?, max_llm_cost = ?, artifact_mode = ?, sandbox_network_mode = ?, result_summary = ?,
-                    failure_reason = ?, artifact_id = ?, created_at = ?, updated_at = ?, completed_at = ?
+                    failure_reason = ?, terminal_result = ?, artifact_id = ?, created_at = ?, updated_at = ?, completed_at = ?
                 WHERE id = ?
                 """,
                 job_update_row(updated),
@@ -279,6 +281,7 @@ def job_to_row(job: CodingJob) -> tuple[object, ...]:
         job.sandbox_network_mode,
         job.result_summary,
         job.failure_reason,
+        json.dumps(job.terminal_result, ensure_ascii=False) if job.terminal_result is not None else None,
         job.artifact_id,
         iso(job.created_at),
         iso(job.updated_at),
@@ -317,6 +320,7 @@ def job_from_row(row: sqlite3.Row) -> CodingJob:
         sandbox_network_mode=str(row["sandbox_network_mode"]) if "sandbox_network_mode" in row.keys() else "project",
         result_summary=row["result_summary"],
         failure_reason=row["failure_reason"],
+        terminal_result=json.loads(row["terminal_result"]) if "terminal_result" in row.keys() and row["terminal_result"] else None,
         artifact_id=row["artifact_id"],
         created_at=parse_datetime(row["created_at"]) or utcnow(),
         updated_at=parse_datetime(row["updated_at"]) or utcnow(),

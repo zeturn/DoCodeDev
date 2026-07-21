@@ -63,6 +63,7 @@ class CodingJob:
     sandbox_network_mode: str = "project"
     result_summary: str | None = None
     failure_reason: str | None = None
+    terminal_result: dict[str, Any] | None = None
     artifact_id: str | None = None
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)

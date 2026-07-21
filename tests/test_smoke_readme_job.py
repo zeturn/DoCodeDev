@@ -13,6 +13,7 @@ from docode.dobox.types import ToolResult
 from docode.llm.runtime import AgentDecision
 from docode.storage.models import CodingJob, JobStatus, new_id
 from docode.storage.repository import InMemoryJobRepository
+from tests.support.repository import RecordingRepository
 
 
 FORBIDDEN_SMOKE_STRINGS = (
@@ -23,18 +24,6 @@ FORBIDDEN_SMOKE_STRINGS = (
     "stars today",
     "crawler.py",
 )
-
-
-class RecordingRepository(InMemoryJobRepository):
-    def __init__(self) -> None:
-        super().__init__()
-        self.status_updates: list[JobStatus] = []
-
-    async def update_job(self, job_id: str, **changes: object) -> CodingJob:
-        updated = await super().update_job(job_id, **changes)
-        if "status" in changes:
-            self.status_updates.append(updated.status)
-        return updated
 
 
 class ReadmeSmokeLLM:

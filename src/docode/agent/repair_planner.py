@@ -37,6 +37,15 @@ class RepairAction:
     rerun_commands: list[str] = field(default_factory=list)
     exploration_forbidden: bool = True
     initial_inspection_budget: int = 2
+    failure_class: str = ""
+    producer_semantic_result: str = ""
+    artifact_path: str | None = None
+    artifact_ownership: str | None = None
+    producer_command_id: str | None = None
+    producer_command: str | None = None
+    validator_id: str | None = None
+    failure_details: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +59,15 @@ class RepairAction:
             "rerun_commands": self.rerun_commands,
             "exploration_forbidden": self.exploration_forbidden,
             "initial_inspection_budget": self.initial_inspection_budget,
+            "failure_class": self.failure_class,
+            "producer_semantic_result": self.producer_semantic_result,
+            "artifact_path": self.artifact_path,
+            "artifact_ownership": self.artifact_ownership,
+            "producer_command_id": self.producer_command_id,
+            "producer_command": self.producer_command,
+            "validator_id": self.validator_id,
+            "failure_details": self.failure_details,
+            "evidence_refs": self.evidence_refs,
         }
 
 
@@ -79,15 +97,8 @@ INVALID_INT_LITERAL_RE = re.compile(
 )
 
 FIELD_DEFAULT_HINTS = {
-    "language": '""',
-    "description": '""',
-    "repository": '""',
     "url": '"https://..."',
-    "stars": "0",
-    "forks": "0",
-    "stars_today": "0",
     "name": '""',
-    "owner": '""',
     "id": '""',
     "title": '""',
     "status": '""',
@@ -256,7 +267,13 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
     if actual is None or expected is None:
         return None
     field = assertion_field_name(output)
-    targets = unique_preserving_order([*inferred_source_targets(output, command), *infer_named_fixture_files(output, command)])
+    targets = unique_preserving_order(
+        [
+            *inferred_source_targets(output, command),
+            *inferred_test_targets(output, command),
+            *infer_named_fixture_files(output, command),
+        ]
+    )
     rerun = command or "python3 -m unittest discover -s tests"
     field_line = f"Field under test: `{field}`\n" if field else ""
     return RepairAction(
@@ -283,7 +300,7 @@ def plan_parsed_value_mismatch(*, output: str, command: str) -> RepairAction | N
             "5. Do not call web_search or fetch_url for this repair.\n"
             f"6. Rerun exactly: `{rerun}`."
         ),
-        initial_inspection_budget=0 if field in {"stars_today", "stars", "forks", "total_stars", "owner", "repository", "repository_name"} else 1,
+        initial_inspection_budget=1,
     )
 
 
@@ -514,15 +531,11 @@ def plan_json_semantic_failure(*, output: str, command: str) -> RepairAction | N
     markers = (
         "json_required_field_empty",
         "json_url_invalid",
-        "json_github_url_invalid",
         "json_records_empty",
         "json_repository_invalid",
         "json_repository_invalid_format",
         "json_repository_url_mismatch",
         "required field",
-        "repository is empty",
-        "repository has invalid format",
-        "does not match url",
         "url is empty",
     )
     if not any(marker in lowered for marker in markers):
@@ -634,6 +647,10 @@ def format_repair_action(action: RepairAction, repeated_count: int = 1) -> str:
         "",
         action.instruction,
     ]
+    if action.failure_class:
+        lines.append(f"Failure class: {action.failure_class}")
+    if action.producer_semantic_result:
+        lines.append(f"Producer semantic result: {action.producer_semantic_result}")
     if repeated_count >= 2:
         lines.extend(
             [

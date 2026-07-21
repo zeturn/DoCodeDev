@@ -101,8 +101,31 @@ class DoBoxClient:
             truncated=bool(data.get("truncated", False)),
         )
 
-    async def write_file(self, project_id: str, path: str, content: str, agent_session_id: str | None = None) -> None:
-        await self._request("POST", f"/api/projects/{project_id}/files/write", json={"path": path, "content": content, "agent_session_id": session_payload_id(agent_session_id)})
+    async def write_file(
+        self,
+        project_id: str,
+        path: str,
+        content: str | None = None,
+        *,
+        content_base64: str | None = None,
+        agent_session_id: str | None = None,
+    ) -> None:
+        """Write ``content`` (text) or ``content_base64`` (binary-safe) to a file.
+
+        The DoBox backend accepts either a UTF-8 ``content`` string or a
+        ``content_base64`` blob; when ``content_base64`` is supplied it takes
+        precedence and is decoded to raw bytes server-side. Callers that upload
+        arbitrary repository bytes (e.g. the evaluation fixture seeder) must use
+        ``content_base64`` so that non-UTF-8 files (images, compiled artifacts,
+        corrupted samples) are preserved byte-for-byte instead of being decoded
+        as UTF-8 and raising ``UnicodeDecodeError``.
+        """
+        payload: dict[str, Any] = {"path": path, "agent_session_id": session_payload_id(agent_session_id)}
+        if content_base64 is not None:
+            payload["content_base64"] = content_base64
+        elif content is not None:
+            payload["content"] = content
+        await self._request("POST", f"/api/projects/{project_id}/files/write", json=payload)
 
     async def list_files(self, project_id: str, path: str = ".", agent_session_id: str | None = None) -> CommandResult:
         data = await self._request("POST", f"/api/projects/{project_id}/files/list", json={"path": path, "agent_session_id": session_payload_id(agent_session_id)})
@@ -149,26 +172,118 @@ class DoBoxClient:
         import httpx
 
         path = project_path(project_id, "artifacts/archive", agent_session_id=agent_session_id)
-        async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.get(f"{self.base_url}{path}", headers=self.headers)
-            raise_for_status(response, "GET", path)
-            return response.content
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                response = await client.get(f"{self.base_url}{path}", headers=self.headers)
+        except httpx.HTTPError as exc:
+            raise build_transport_error(exc, method="GET", path=path) from exc
+        raise_for_status(response, "GET", path)
+        return response.content
 
     async def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: float = 60) -> dict[str, Any]:
         import httpx
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.request(
-                method,
-                f"{self.base_url}{path}",
-                json={k: v for k, v in (json or {}).items() if v is not None},
-                headers=self.headers,
-            )
-            raise_for_status(response, method, path)
-            if not response.content:
-                return {}
-            payload = response.json()
-            return payload if isinstance(payload, dict) else {"data": payload}
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.request(
+                    method,
+                    f"{self.base_url}{path}",
+                    json={k: v for k, v in (json or {}).items() if v is not None},
+                    headers=self.headers,
+                )
+        except httpx.HTTPError as exc:
+            raise build_transport_error(exc, method=method, path=path) from exc
+        raise_for_status(response, method, path)
+        if not response.content:
+            return {}
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"data": payload}
+
+
+class DoBoxTransportError(RuntimeError):
+    """Raised when a DoBox HTTP request fails at the transport layer.
+
+    Carries non-sensitive diagnostic context (operation, method, path, error
+    kind and originating exception type). It never includes the Authorization
+    header, token, or request body contents.
+    """
+
+    def __init__(self, message: str, *, operation: str, method: str, path: str, kind: str, exception_type: str) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.method = method
+        self.path = path
+        self.kind = kind
+        self.exception_type = exception_type
+
+
+def classify_transport_error(exc: BaseException) -> str:
+    """Classify an httpx transport exception into a coarse kind.
+
+    Uses class-name matching so we do not depend on httpx being importable at
+    module load time. Returns one of: connect, read, write, protocol, timeout,
+    other.
+    """
+    name = type(exc).__name__.lower()
+    if "protocol" in name:
+        return "protocol"
+    if "connect" in name:
+        return "connect"
+    if "write" in name:
+        return "write"
+    if "read" in name:
+        return "read"
+    if "timeout" in name:
+        return "timeout"
+    return "other"
+
+
+def operation_label(method: str, path: str) -> str:
+    """Derive a short, non-sensitive operation label from method + path."""
+    base = path.split("?", 1)[0].rstrip("/")
+    suffix_map = {
+        "/exec": "run_command",
+        "/files/read": "read_file",
+        "/files/write": "write_file",
+        "/files/list": "list_files",
+        "/files/search": "search",
+        "/git/status": "git_status",
+        "/git/diff": "git_diff",
+        "/git/commit": "git_commit",
+        "/preview": "preview",
+        "/logs": "logs",
+        "/artifacts/archive": "archive_workspace",
+        "/agent/sessions": "create_agent_session",
+    }
+    for suffix, label in suffix_map.items():
+        if base.endswith(suffix):
+            return label
+    if base.endswith("/api/projects"):
+        return "create_project" if method.upper() == "POST" else "list_projects"
+    if base.count("/") == 3 and base.startswith("/api/projects/"):
+        return "get_project" if method.upper() == "GET" else "modify_project"
+    return f"{method.lower()}_request"
+
+
+def build_transport_error(exc: BaseException, *, method: str, path: str) -> DoBoxTransportError:
+    """Wrap an httpx transport exception with non-sensitive DoBox context."""
+    kind = classify_transport_error(exc)
+    operation = operation_label(method, path)
+    exception_type = type(exc).__name__
+    detail = str(exc).strip()
+    detail_suffix = f": {detail}" if detail else ""
+    message = (
+        f"DoBox {operation} transport error ({kind}) on {method} {path} "
+        f"[{exception_type}]{detail_suffix}"
+    )
+    return DoBoxTransportError(
+        message,
+        operation=operation,
+        method=method,
+        path=path,
+        kind=kind,
+        exception_type=exception_type,
+    )
 
 
 def session_payload_id(agent_session_id: str | None) -> int | None:

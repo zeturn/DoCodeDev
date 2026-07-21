@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "node_bugfix",
+  "title": "Fix a Node.js arithmetic bug",
+  "category": "bugfix",
+  "difficulty": "easy",
+  "language": "node",
+  "workspace": "workspace",
+  "instruction": "instruction.md",
+  "checker": "checker.py",
+  "required_commands": ["node tests/calc.test.js"],
+  "expected_terminal": "succeeded",
+  "network_mode": "no_internet",
+  "tags": ["node", "javascript"]
+}

@@ -1,0 +1,97 @@
+{
+  "case": "violet_prism",
+  "title": "Build a namespace-tolerant RSS collector.",
+  "language": "Python/HTTP",
+  "mode": "real_deepseek_real_dobox",
+  "run": 3,
+  "network_mode": "no_internet",
+  "status": "failed",
+  "failure_reason": "max_iterations_exceeded",
+  "iterations": 35,
+  "llm_decisions": 35,
+  "tool_calls": 16,
+  "commands_run": 4,
+  "successful_commands": 0,
+  "repair_actions": 4,
+  "successful_edits": 4,
+  "successful_reads": 26,
+  "final_candidate_attempted": false,
+  "read_before_edit": true,
+  "whole_file_rewrite": true,
+  "verifier_result": null,
+  "quality_gate_result": null,
+  "artifact_export_result": true,
+  "changed_files": [
+    "prism_feed.py",
+    "prism_entries.json"
+  ],
+  "functionally_correct": false,
+  "required_commands_passed": false,
+  "required_command_evidence": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+      "exit_codes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "passed": false
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('prism_entries.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 7, len(records)\nassert all(set(record) == set(('headline', 'link', 'published', 'source', 'summary')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/prism/feed'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_codes": [],
+      "passed": false
+    }
+  ],
+  "source_inspected_before_edit": false,
+  "strict_success": false,
+  "independent_failures": [
+    "payload mismatch: expected [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00Z', 'source': 'Delta Wire', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00Z', 'source': 'Delta Wire', 'summary': None}], got [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00Z', 'source': 'http://127.0.0.1:8765/prism/feed?variant=2', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00Z', 'source': 'http://127.0.0.1:8765/prism/feed?variant=2', 'summary': ''}]",
+    "request sequence mismatch: expected ['/prism/feed?variant=2'], got None",
+    "request count mismatch: expected 1, got None"
+  ],
+  "independent_results": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py 'http://127.0.0.1:8765/prism/feed?variant=2' prism_entries.json",
+      "exit_code": 0,
+      "output": "Wrote 2 entries to prism_entries.json\r\n"
+    },
+    {
+      "check": "hidden_variant_payload_and_requests",
+      "failures": [
+        "payload mismatch: expected [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00Z', 'source': 'Delta Wire', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00Z', 'source': 'Delta Wire', 'summary': None}], got [{'headline': 'Orchid Current', 'link': 'http://127.0.0.1:8765/bulletins/orchid', 'published': '2026-06-04T03:00:00Z', 'source': 'http://127.0.0.1:8765/prism/feed?variant=2', 'summary': 'Channels converge.'}, {'headline': 'Pewter Dawn', 'link': 'http://127.0.0.1:8765/bulletins/pewter', 'published': '2026-06-04T05:00:00Z', 'source': 'http://127.0.0.1:8765/prism/feed?variant=2', 'summary': ''}]",
+        "request sequence mismatch: expected ['/prism/feed?variant=2'], got None",
+        "request count mismatch: expected 1, got None"
+      ],
+      "metrics": {
+        "metrics_error": "OCI runtime exec failed: exec failed: unable to start container process: exec: \"python\": executable file not found in $PATH: unknown\r\n"
+      }
+    }
+  ],
+  "category": "repair_loop",
+  "short_reason": "max_iterations_exceeded",
+  "trace_path": ".docode/evals/crawler-benchmark-v1-d9579ed/traces/violet_prism-run3-job_0f02671128c74efeabfe1bcba45cbcea.json",
+  "commands": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"/workspace/prism_feed.py\", line 103, in <module>\n    main()\n  File \"/workspace/prism_feed.py\", line 94, in main\n    records = parse_rss(feed_url, raw)\n              ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/prism_feed.py\", line 26, in parse_rss\n    root = ET.fromstring(raw)\n           ^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/xml/etree/ElementTree.py\", line 1335, in XML\n    parser.feed(text)\nxml.etree.ElementTree.ParseError: not well-formed (invalid token): line 1, column 158"
+    },
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"/workspace/prism_feed.py\", line 95, in <module>\n    main()\n  File \"/workspace/prism_feed.py\", line 86, in main\n    records = parse_rss(feed_url, raw)\n              ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/prism_feed.py\", line 50, in parse_rss\n    root = ET.fromstring(raw)\n           ^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/xml/etree/ElementTree.py\", line 1335, in XML\n    parser.feed(text)\nxml.etree.ElementTree.ParseError: not well-formed (invalid token): line 1, column 158"
+    },
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"/workspace/prism_feed.py\", line 92, in <module>\n    main()\n  File \"/workspace/prism_feed.py\", line 85, in main\n    records = parse_rss(feed_url, raw)\n              ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/prism_feed.py\", line 49, in parse_rss\n    root = ET.fromstring(raw)\n           ^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/xml/etree/ElementTree.py\", line 1335, in XML\n    parser.feed(text)\nxml.etree.ElementTree.ParseError: not well-formed (invalid token): line 1, column 158"
+    },
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python prism_feed.py http://127.0.0.1:8765/prism/feed prism_entries.json",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"/workspace/prism_feed.py\", line 99, in <module>\n    main()\n  File \"/workspace/prism_feed.py\", line 90, in main\n    records = parse_rss(feed_url, raw)\n              ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/prism_feed.py\", line 54, in parse_rss\n    root = ET.fromstring(raw)\n           ^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/xml/etree/ElementTree.py\", line 1335, in XML\n    parser.feed(text)\nxml.etree.ElementTree.ParseError: not well-formed (invalid token): line 1, column 120"
+    }
+  ]
+}
