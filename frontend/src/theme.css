@@ -1,0 +1,39 @@
+/* Watercolor design language — minimal, calm, few lines, few shadows, few motions. */
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: #fbfbfd;
+  color: #222222;
+  font-family: Inter, ui-sans-serif, system-ui, "Noto Sans SC", sans-serif;
+  background-image:
+    radial-gradient(60rem 60rem at 0% -10%, rgba(51,132,255,0.05), transparent 55%),
+    radial-gradient(50rem 50rem at 100% 0%, rgba(82,196,26,0.04), transparent 55%);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { font-weight: 600; }
+
+/* Calm motion: keep transitions short and purposeful. */
+*, *::before, *::after { transition-duration: 120ms; }
+
+/* Remove box-shadows from all elements; rely on background separation. */
+.panel, .job-card, .step, .info-card {
+  box-shadow: none !important;
+}
+
+/* Replace heavy gradients with subtle backgrounds. */
+.sidebar, .job-card, .step, .info-card, .panel {
+  border-color: var(--wc-border-default, #ececec);
+}
+
+/* Reduce heavy button transitions. */
+button, .wc-btn {
+  transition-duration: 120ms;
+}
+
+/* Brand mark — watercolor style, no shadow. */
+.brand-mark {
+  background: var(--wc-accent, #3384ff) !important;
+  color: var(--wc-text-on-accent, #fff) !important;
+  box-shadow: none !important;
+}
