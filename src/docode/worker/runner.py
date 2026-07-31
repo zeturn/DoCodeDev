@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from docode.agent.loop import CodingAgentLoop
+from docode.agent.runtime_components import build_runtime_components
+from docode.agent.failure_taxonomy import failed_terminal_result
 from docode.agent.reviewer import IndependentReviewer
 from docode.agent.stop_policy import StopPolicy
 from docode.agent.tools import CompositeAgentTools
@@ -98,7 +100,7 @@ class JobRunnerService:
                     },
                 )
                 artifact_id = await self.export_failure_artifacts(job, reason)
-                await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=reason, artifact_id=artifact_id)
+                await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=reason, terminal_result=failed_terminal_result(reason), artifact_id=artifact_id)
                 return
             await self.repository.add_step(
                 job.id,
@@ -114,7 +116,7 @@ class JobRunnerService:
             if not authorization.allowed:
                 reason = authorization.reason or "apicred_authorization_denied"
                 artifact_id = await self.export_failure_artifacts(job, reason)
-                await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=reason, artifact_id=artifact_id)
+                await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=reason, terminal_result=failed_terminal_result(reason), artifact_id=artifact_id)
                 return
             if await self._is_stopped(job.id):
                 await self.finalize_stopped_job(job.id)
@@ -152,7 +154,7 @@ class JobRunnerService:
             if not probe["passed"]:
                 reason = "infrastructure_failed: workspace_inconsistent"
                 artifact_id = await self.export_failure_artifacts(job, reason, dobox)
-                failed = await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=reason, artifact_id=artifact_id)
+                failed = await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=reason, terminal_result=failed_terminal_result(reason), artifact_id=artifact_id)
                 await self.cleanup_sandbox_if_needed(dobox, failed)
                 return
             bootstrap = await bootstrap_task_workspace(dobox, project.project_id, session.session_id, job.instruction)
@@ -211,6 +213,7 @@ class JobRunnerService:
                 ),
                 usage_meter=runtime.usage_meter,
                 llm_decision_timeout_seconds=self.config.llm_decision_timeout_seconds,
+                runtime_components=build_runtime_components(job.instruction),
             )
             try:
                 completed = await asyncio.wait_for(loop.run(job), timeout=max(1, job.max_runtime_seconds))
@@ -225,6 +228,7 @@ class JobRunnerService:
                     job.id,
                     status=JobStatus.FAILED,
                     failure_reason="max_runtime_exceeded",
+                    terminal_result=failed_terminal_result("max_runtime_exceeded"),
                     artifact_id=artifact_id,
                 )
                 await self.cleanup_sandbox_if_needed(dobox, failed)
@@ -253,7 +257,7 @@ class JobRunnerService:
             if not await self._is_stopped(job.id):
                 current = await self.repository.get_job(job.id) or job
                 artifact_id = await self.export_failure_artifacts(current, str(exc), dobox if "dobox" in locals() else None)
-                failed = await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=str(exc), artifact_id=artifact_id)
+                failed = await self.repository.update_job(job.id, status=JobStatus.FAILED, failure_reason=str(exc), terminal_result=failed_terminal_result(str(exc)), artifact_id=artifact_id)
                 if "dobox" in locals():
                     await self.cleanup_sandbox_if_needed(dobox, failed)
 
@@ -584,7 +588,7 @@ Expected behavior:
 - support `--output` to write JSON results
 - support `--dry-run` for a one-shot verification run
 """,
-    "crawler.py": """from __future__ import annotations
+    "collector.py": """from __future__ import annotations
 
 import argparse
 import json
@@ -677,7 +681,7 @@ async def bootstrap_task_workspace(
                 "git init && "
                 "git config user.email 'dev@docode.ai' && "
                 "git config user.name 'Docode' && "
-                "git add README.md crawler.py fixtures/sample_source.html && "
+                "git add README.md collector.py fixtures/sample_source.html && "
                 "git commit -m 'Initialize crawler scaffold'"
             ),
         ],

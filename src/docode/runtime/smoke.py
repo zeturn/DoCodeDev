@@ -276,6 +276,7 @@ async def managed_local_dobox(
     checker: HealthChecker,
     start_dobox: bool,
     existing_checks: list[SmokeCheck],
+    keep: bool = False,
 ):
     if not start_dobox:
         yield []
@@ -303,7 +304,7 @@ async def managed_local_dobox(
     except Exception as exc:
         yield [SmokeCheck("dobox_autostart", "failed", str(exc))]
     finally:
-        if process is not None:
+        if process is not None and not keep:
             await asyncio.to_thread(stop_process, process)
 
 

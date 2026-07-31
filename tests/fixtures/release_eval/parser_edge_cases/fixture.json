@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "parser_edge_cases",
+  "title": "Fix a key=value parser's edge-case handling",
+  "category": "bugfix",
+  "difficulty": "easy",
+  "language": "python",
+  "workspace": "workspace",
+  "instruction": "instruction.md",
+  "checker": "checker.py",
+  "required_commands": ["python -m unittest -q"],
+  "expected_terminal": "succeeded",
+  "network_mode": "no_internet",
+  "tags": ["parser", "edge-cases"]
+}

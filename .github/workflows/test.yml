@@ -6,7 +6,18 @@ on:
     branches: [main]
 
 jobs:
-  unit:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m compileall -q src
+      - run: PYTHONPATH=src python -c "import docode; assert docode.__version__ == '0.2.0'"
+      - run: PYTHONPATH=src python -m unittest tests.test_architecture_guards
+
+  deterministic:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -14,7 +25,67 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest
+      - id: deterministic
+        continue-on-error: true
+        run: PYTHONPATH=src python -m unittest discover -s tests -t .
+      - name: Diagnose deterministic pollution
+        if: steps.deterministic.outcome == 'failure'
+        run: >
+          PYTHONPATH=src python scripts/find_test_polluter.py
+          --start-dir tests --top-level .
+          --target tests.holdout.test_deterministic_holdout
+          --output artifacts/test-pollution.json
+      - uses: actions/upload-artifact@v4
+        if: steps.deterministic.outcome == 'failure'
+        with:
+          name: deterministic-pollution
+          path: artifacts/test-pollution.json
+      - if: always()
+        run: test "${{ steps.deterministic.outcome }}" = "success"
+
+  holdout-trace:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+            ref: merge
+          - os: ubuntu-latest
+            python: "3.11"
+            ref: head
+          - os: ubuntu-latest
+            python: "3.12"
+            ref: head
+          - os: windows-latest
+            python: "3.11"
+            ref: head
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request' && matrix.ref == 'head'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/checkout@v4
+        if: github.event_name != 'pull_request' || matrix.ref != 'head'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[dev]"
+      - name: Run sable_manual trace
+        id: trace_run
+        shell: bash
+        run: |
+          PYTHONPATH=src python scripts/run_holdout_case.py \
+            --case sable_manual \
+            --trace artifacts/sable-manual-trace.json \
+            --workspace-artifacts artifacts/sable-manual \
+            --keep-workspace --fail-on-unsuccessful
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sable-manual-trace-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.ref }}
+          path: artifacts/sable-manual*
 
   package:
     runs-on: ubuntu-latest
@@ -25,6 +96,20 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install build
       - run: python -m build --wheel
+      - run: python -m venv /tmp/docode-wheel
+      - run: /tmp/docode-wheel/bin/pip install dist/*.whl
+      - run: /tmp/docode-wheel/bin/python -c "import docode; assert docode.__version__ == '0.2.0'"
+      - run: /tmp/docode-wheel/bin/docode --help
+
+  integration-lite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[dev]"
+      - run: PYTHONPATH=src python -m unittest tests.test_runtime_components_integration tests.test_runner_e2e
 
   eval-smoke:
     runs-on: ubuntu-latest

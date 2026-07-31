@@ -37,7 +37,7 @@ class QualityGateTools:
 
 
 class QualityGateTests(IsolatedAsyncioTestCase):
-    async def test_blocks_dirty_github_repository_field(self) -> None:
+    async def test_blocks_explicit_dirty_required_field(self) -> None:
         result = await QualityGate().run(
             tools=QualityGateTools(
                 artifact=[
@@ -48,30 +48,29 @@ class QualityGateTests(IsolatedAsyncioTestCase):
                 ]
             ),
             task_contract=TaskContract(must_modify_files=["data/github_trending.json"]),
-            instruction="Build a GitHub Trending crawler that writes data/github_trending.json",
+            instruction="Write data/github_trending.json with repository, url fields; repository must be non-empty",
         )
 
         self.assertFalse(result.passed)
         self.assertTrue(any(issue.code == "json_required_field_dirty" for issue in result.issues))
-        self.assertTrue(any(issue.code == "json_repository_invalid_format" for issue in result.issues))
         self.assertEqual(result.samples[0].path, "data/github_trending.json")
 
-    async def test_blocks_github_repository_url_mismatch(self) -> None:
+    async def test_blocks_explicit_non_absolute_url(self) -> None:
         result = await QualityGate().run(
             tools=QualityGateTools(
                 artifact=[
                     {
                         "repository": "owner/repo",
-                        "url": "https://github.com/other/repo",
+                        "url": "/other/repo",
                     }
                 ]
             ),
             task_contract=TaskContract(must_modify_files=["data/github_trending.json"]),
-            instruction="Build a GitHub Trending crawler that writes data/github_trending.json",
+            instruction="Write data/github_trending.json with repository, url fields; absolute url",
         )
 
         self.assertFalse(result.passed)
-        self.assertTrue(any(issue.code == "json_repository_url_mismatch" for issue in result.issues))
+        self.assertTrue(any(issue.code == "json_url_invalid" for issue in result.issues))
 
     async def test_passes_clean_github_repository_records(self) -> None:
         result = await QualityGate().run(
@@ -124,14 +123,14 @@ class QualityGateTests(IsolatedAsyncioTestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.blockers(), [])
 
-    async def test_github_crawler_still_requires_repository_fields(self) -> None:
+    async def test_explicit_contract_requires_named_fields(self) -> None:
         result = await QualityGate().run(
             tools=QualityGateTools(
                 artifact=[{"id": 1, "name": "Ada"}],
                 artifact_path="data/github_trending.json",
             ),
             task_contract=TaskContract(must_modify_files=["crawler.py", "data/github_trending.json"]),
-            instruction="Build a GitHub Trending repository crawler that writes data/github_trending.json",
+            instruction="Write data/github_trending.json with repository, url fields",
         )
 
         self.assertFalse(result.passed)

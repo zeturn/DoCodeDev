@@ -242,7 +242,7 @@ class EvalTests(TestCase):
                 },
             )
             crawler_repo = root / "repos" / "crawler"
-            self.assertTrue((crawler_repo / "crawler.py").exists())
+            self.assertTrue((crawler_repo / "collector.py").exists())
             self.assertTrue((root / "manifest.json").exists())
             bugfix = next(case for case in manifest["cases"] if case["name"] == "python-bugfix")
             self.assertEqual(bugfix["hints"]["target_files"], ["calculator.py"])

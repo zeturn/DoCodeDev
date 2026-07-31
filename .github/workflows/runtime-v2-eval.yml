@@ -1,0 +1,36 @@
+name: runtime-v2-real-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Real provider name
+        required: true
+        default: deepseek
+      model:
+        description: Frozen model name
+        required: true
+        default: deepseek-chat
+
+jobs:
+  release-eval:
+    runs-on: [self-hosted, docode-eval]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[dev]"
+      - name: Run frozen Runtime V2 suite
+        env:
+          PYTHONPATH: src
+          DOCODE_PROVIDER: ${{ inputs.provider }}
+          DOCODE_MODEL: ${{ inputs.model }}
+          DOCODE_APICRED_BASE_URL: ${{ secrets.DOCODE_APICRED_BASE_URL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python tests/runtime_v2_release_eval/run_release_eval.py --output .docode/evals/runtime-v2-release
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-v2-release-results
+          path: .docode/evals/runtime-v2-release

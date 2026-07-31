@@ -1,0 +1,104 @@
+{
+  "case": "opal_canopy",
+  "title": "Build a standard-library HTML card collector.",
+  "language": "Python/HTTP",
+  "mode": "real_deepseek_real_dobox",
+  "run": 2,
+  "network_mode": "no_internet",
+  "status": "failed",
+  "failure_reason": "max_iterations_exceeded",
+  "iterations": 32,
+  "llm_decisions": 32,
+  "tool_calls": 19,
+  "commands_run": 5,
+  "successful_commands": 1,
+  "repair_actions": 4,
+  "successful_edits": 4,
+  "successful_reads": 27,
+  "final_candidate_attempted": false,
+  "read_before_edit": true,
+  "whole_file_rewrite": false,
+  "verifier_result": null,
+  "quality_gate_result": null,
+  "artifact_export_result": true,
+  "changed_files": [
+    "aurora_index.py",
+    "aurora_records.json"
+  ],
+  "functionally_correct": false,
+  "required_commands_passed": false,
+  "required_command_evidence": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python aurora_index.py http://127.0.0.1:8765/aurora/cards aurora_records.json",
+      "exit_codes": [
+        0
+      ],
+      "passed": true
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_codes": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "passed": false
+    }
+  ],
+  "source_inspected_before_edit": false,
+  "strict_success": false,
+  "independent_failures": [
+    "payload mismatch: expected [{'sigil': 'VR-12', 'label': 'Pewter Bloom', 'group': 'delta', 'rank': 8, 'detail_url': 'http://127.0.0.1:8765/details/vr-12'}, {'sigil': 'VR-29', 'label': 'Cobalt Wren', 'group': 'gamma', 'rank': 19, 'detail_url': 'http://127.0.0.1:8765/details/vr-29'}, {'sigil': 'VR-44', 'label': 'Amber Flute', 'group': 'delta', 'rank': 2, 'detail_url': 'http://127.0.0.1:8765/details/vr-44'}], got []",
+    "request sequence mismatch: expected ['/aurora/cards?variant=2'], got None",
+    "request count mismatch: expected 1, got None"
+  ],
+  "independent_results": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python aurora_index.py 'http://127.0.0.1:8765/aurora/cards?variant=2' aurora_records.json",
+      "exit_code": 0,
+      "output": "Extracted 0 cards to aurora_records.json\r\n"
+    },
+    {
+      "check": "hidden_variant_payload_and_requests",
+      "failures": [
+        "payload mismatch: expected [{'sigil': 'VR-12', 'label': 'Pewter Bloom', 'group': 'delta', 'rank': 8, 'detail_url': 'http://127.0.0.1:8765/details/vr-12'}, {'sigil': 'VR-29', 'label': 'Cobalt Wren', 'group': 'gamma', 'rank': 19, 'detail_url': 'http://127.0.0.1:8765/details/vr-29'}, {'sigil': 'VR-44', 'label': 'Amber Flute', 'group': 'delta', 'rank': 2, 'detail_url': 'http://127.0.0.1:8765/details/vr-44'}], got []",
+        "request sequence mismatch: expected ['/aurora/cards?variant=2'], got None",
+        "request count mismatch: expected 1, got None"
+      ],
+      "metrics": {
+        "metrics_error": "OCI runtime exec failed: exec failed: unable to start container process: exec: \"python\": executable file not found in $PATH: unknown\r\n"
+      }
+    }
+  ],
+  "category": "repair_loop",
+  "short_reason": "max_iterations_exceeded",
+  "trace_path": ".docode/evals/crawler-benchmark-v1-d9579ed/traces/opal_canopy-run2-job_7c4c87473026495f850662a08ca91a6b.json",
+  "commands": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python aurora_index.py http://127.0.0.1:8765/aurora/cards aurora_records.json",
+      "exit_code": 0,
+      "summary": "Extracted 0 cards to aurora_records.json"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('aurora_records.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 9, len(records)\nassert all(set(record) == set(('sigil', 'label', 'group', 'rank', 'detail_url')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 1, metrics\nassert metrics['requests'] == ['/aurora/cards'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    }
+  ]
+}

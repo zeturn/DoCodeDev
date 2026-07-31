@@ -1,0 +1,122 @@
+{
+  "case": "copper_orbit",
+  "title": "Complete a cursor-based JSON API collector.",
+  "language": "Python/HTTP",
+  "mode": "real_deepseek_real_dobox",
+  "run": 3,
+  "network_mode": "no_internet",
+  "status": "failed",
+  "failure_reason": "max_iterations_exceeded",
+  "iterations": 29,
+  "llm_decisions": 29,
+  "tool_calls": 21,
+  "commands_run": 8,
+  "successful_commands": 1,
+  "repair_actions": 7,
+  "successful_edits": 8,
+  "successful_reads": 20,
+  "final_candidate_attempted": false,
+  "read_before_edit": true,
+  "whole_file_rewrite": false,
+  "verifier_result": null,
+  "quality_gate_result": null,
+  "artifact_export_result": true,
+  "changed_files": [
+    "orbit_cursor.py",
+    "orbit_measurements.json"
+  ],
+  "functionally_correct": false,
+  "required_commands_passed": false,
+  "required_command_evidence": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python orbit_cursor.py http://127.0.0.1:8765/orbit/measurements?cursor= orbit_measurements.json",
+      "exit_codes": [
+        0
+      ],
+      "passed": true
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_codes": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "passed": false
+    }
+  ],
+  "source_inspected_before_edit": false,
+  "strict_success": false,
+  "independent_failures": [
+    "payload mismatch: expected [{'identity': 'NV1', 'title': 'Aster Dial', 'measure': 6, 'origin': 'http://127.0.0.1:8765/sensors/nv1'}, {'identity': 'NV2', 'title': 'Birch Gauge', 'measure': 71, 'origin': 'http://127.0.0.1:8765/sensors/nv2'}, {'identity': 'NV3', 'title': 'Coral Vane', 'measure': 9, 'origin': 'http://127.0.0.1:8765/sensors/nv3'}], got []",
+    "request sequence mismatch: expected ['/orbit/measurements?cursor=&variant=2', '/orbit/measurements?cursor=phase-violet-2&variant=2'], got None",
+    "request count mismatch: expected 2, got None"
+  ],
+  "independent_results": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python orbit_cursor.py 'http://127.0.0.1:8765/orbit/measurements?cursor=&variant=2' orbit_measurements.json",
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "check": "hidden_variant_payload_and_requests",
+      "failures": [
+        "payload mismatch: expected [{'identity': 'NV1', 'title': 'Aster Dial', 'measure': 6, 'origin': 'http://127.0.0.1:8765/sensors/nv1'}, {'identity': 'NV2', 'title': 'Birch Gauge', 'measure': 71, 'origin': 'http://127.0.0.1:8765/sensors/nv2'}, {'identity': 'NV3', 'title': 'Coral Vane', 'measure': 9, 'origin': 'http://127.0.0.1:8765/sensors/nv3'}], got []",
+        "request sequence mismatch: expected ['/orbit/measurements?cursor=&variant=2', '/orbit/measurements?cursor=phase-violet-2&variant=2'], got None",
+        "request count mismatch: expected 2, got None"
+      ],
+      "metrics": {
+        "metrics_error": "OCI runtime exec failed: exec failed: unable to start container process: exec: \"python\": executable file not found in $PATH: unknown\r\n"
+      }
+    }
+  ],
+  "category": "repair_loop",
+  "short_reason": "max_iterations_exceeded",
+  "trace_path": ".docode/evals/crawler-benchmark-v1-d9579ed/traces/copper_orbit-run3-job_774983498e7e40f9b3fe96cfe2050941.json",
+  "commands": [
+    {
+      "command": "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/__reset', timeout=5).read()\" && python orbit_cursor.py http://127.0.0.1:8765/orbit/measurements?cursor= orbit_measurements.json",
+      "exit_code": 0,
+      "summary": ""
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    },
+    {
+      "command": "python - <<'PY'\nimport json\nimport urllib.request\nfrom pathlib import Path\nrecords = json.loads(Path('orbit_measurements.json').read_text(encoding='utf-8'))\nassert isinstance(records, list) and len(records) == 10, len(records)\nassert all(set(record) == set(('identity', 'title', 'measure', 'origin')) for record in records)\n\nwith urllib.request.urlopen('http://127.0.0.1:8765/__metrics', timeout=5) as response:\n    metrics = json.load(response)\nassert metrics['count'] == 2, metrics\nassert metrics['requests'] == ['/orbit/measurements?cursor=', '/orbit/measurements?cursor=phase-amber-2'], metrics\nprint('benchmark validation passed')\nPY",
+      "exit_code": 1,
+      "summary": "Traceback (most recent call last):\n  File \"<stdin>\", line 5, in <module>\nAssertionError: 0"
+    }
+  ]
+}

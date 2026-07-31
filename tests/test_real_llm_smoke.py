@@ -22,7 +22,9 @@ from docode.llm.credentials import APICredCredentialResolver, ProviderCredential
 from docode.llm.runtime import build_docode_llm
 from docode.storage.models import CodingJob, JobStatus, new_id
 
-from tests.test_smoke_readme_job import DiffAcceptingVerifier, RecordingRepository, normalize_path
+from tests.test_smoke_readme_job import DiffAcceptingVerifier
+from tests.support.repository import RecordingRepository
+from tests.support.path_utils import normalize_path
 
 
 REAL_LLM_SMOKE_ENABLED = os.getenv("DOCODE_REAL_LLM_SMOKE", "").lower() in {"1", "true", "yes", "on"}

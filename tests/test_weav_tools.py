@@ -59,6 +59,7 @@ class WeavToolAdapterTests(IsolatedAsyncioTestCase):
         registry = build_agent_tool_registry(composite, LocalToolRegistry())
 
         self.assertIsNotNone(registry.get("run_command"))
+        self.assertIsNotNone(registry.get("inspect_source"))
         self.assertIsNotNone(registry.get("edit_file"))
         self.assertIsNotNone(registry.get("apply_patch"))
         self.assertIsNotNone(registry.get("fetch_url"))

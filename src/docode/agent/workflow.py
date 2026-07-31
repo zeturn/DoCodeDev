@@ -239,7 +239,7 @@ def required_commands(task_contract: TaskContract | None) -> list[str]:
 
 def command_was_run(state: AgentState, command: str) -> bool:
     expected = normalize_command(command)
-    for message in state.messages:
+    for message in state.messages[latest_successful_edit_index(state) + 1 :]:
         if message.get("role") != "tool" or int(message.get("exit_code") or 0) != 0:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
@@ -254,7 +254,7 @@ def command_was_run(state: AgentState, command: str) -> bool:
 
 def command_was_attempted(state: AgentState, command: str) -> bool:
     expected = normalize_command(command)
-    for message in state.messages:
+    for message in state.messages[latest_successful_edit_index(state) + 1 :]:
         if message.get("role") != "tool":
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
@@ -272,7 +272,7 @@ def required_commands_attempted(state: AgentState) -> bool:
     if not commands:
         return False
     expected = [normalize_command(command) for command in commands]
-    for message in state.messages:
+    for message in state.messages[latest_successful_edit_index(state) + 1 :]:
         if message.get("role") != "tool":
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
@@ -284,7 +284,7 @@ def required_commands_attempted(state: AgentState) -> bool:
 
 def latest_failed_required_command_signature(state: AgentState) -> str | None:
     commands = [normalize_command(command) for command in required_commands(state.task_contract)]
-    for message in reversed(state.messages):
+    for message in reversed(state.messages[latest_successful_edit_index(state) + 1 :]):
         if message.get("role") != "tool" or int(message.get("exit_code") or 0) == 0:
             continue
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
@@ -307,6 +307,18 @@ def successful_edit_tool_called(state: AgentState) -> bool:
         and int(message.get("exit_code") or 0) == 0
         for message in state.messages
     )
+
+
+def latest_successful_edit_index(state: AgentState) -> int:
+    for index in range(len(state.messages) - 1, -1, -1):
+        message = state.messages[index]
+        if (
+            message.get("role") == "tool"
+            and message.get("tool") in EDIT_TOOLS
+            and int(message.get("exit_code") or 0) == 0
+        ):
+            return index
+    return -1
 
 
 def normalize_command(command: str) -> str:

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "go_bugfix",
+  "title": "Fix a Go arithmetic bug",
+  "category": "bugfix",
+  "difficulty": "easy",
+  "language": "go",
+  "workspace": "workspace",
+  "instruction": "instruction.md",
+  "checker": "checker.py",
+  "required_commands": ["go test ./..."],
+  "expected_terminal": "succeeded",
+  "network_mode": "no_internet",
+  "tags": ["go", "golang"]
+}

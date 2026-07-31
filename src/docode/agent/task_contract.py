@@ -353,4 +353,7 @@ def unique_preserving_order(values: Iterable[object]) -> list[str]:
 
 def is_crawler_instruction(instruction: str) -> bool:
     lowered = (instruction or "").lower()
-    return any(keyword in lowered for keyword in ("crawler", "scraper", "scrape", "爬虫", "抓取", "采集", "trending"))
+    return any(
+        keyword in lowered
+        for keyword in ("crawler", "crawl", "scraper", "scrape", "collector", "collect", "爬虫", "抓取", "采集", "trending")
+    )

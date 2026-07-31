@@ -1,2 +1,1 @@
-"""Runtime smoke checks and operational helpers."""
-
+"""Runtime state and execution-evidence primitives."""

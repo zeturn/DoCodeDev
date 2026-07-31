@@ -20,14 +20,14 @@ from docode.dobox.tools import DoBoxTools
 from docode.runtime.smoke import check_http_health, ensure_dobox_smoke_token
 from docode.storage.models import CodingJob, JobStatus, new_id
 
-from tests.holdout.definitions import CASES, HoldoutCase
-from tests.holdout.harness import EDIT_TOOLS, READ_TOOLS, materialize_fixture, sanitize, summarize_steps
+from .definitions import CASES, HoldoutCase
+from .harness import EDIT_TOOLS, READ_TOOLS, materialize_fixture, sanitize, summarize_steps
 from tests.test_real_llm_smoke import build_real_llm_or_skip
-from tests.test_smoke_readme_job import RecordingRepository
+from tests.support.repository import RecordingRepository
 
 
 REAL_HOLDOUT_ENABLED = os.getenv("DOCODE_REAL_HOLDOUT", "").lower() in {"1", "true", "yes", "on"}
-RESULT_ROOT = Path(".docode/evals/eff27a7-unseen-holdout")
+RESULT_ROOT = Path(os.getenv("DOCODE_HOLDOUT_RESULT_ROOT", ".docode/evals/eff27a7-unseen-holdout"))
 RESULT_PATH = RESULT_ROOT / "results.json"
 TRACE_ROOT = RESULT_ROOT / "traces"
 
@@ -432,7 +432,7 @@ class RealUnseenHoldoutTests(IsolatedAsyncioTestCase):
         payload = {
             "baseline": "eff27a7cbe70408097591369787105ffc5aea777",
             "tag": "agent-baseline-eff27a7",
-            "branch": "eval/unseen-holdout-eff27a7",
+            "branch": os.getenv("DOCODE_HOLDOUT_RESULT_BRANCH", "eval/unseen-holdout-eff27a7"),
             "provider": os.getenv("DOCODE_REAL_LLM_PROVIDER", "deepseek"),
             "model": os.getenv("DOCODE_REAL_LLM_MODEL", "deepseek-chat"),
             "requested_runs_per_case": requested_runs,

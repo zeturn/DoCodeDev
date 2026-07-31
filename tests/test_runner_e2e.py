@@ -283,7 +283,7 @@ class RunnerE2ETests(IsolatedAsyncioTestCase):
 
             completed = await repo.get_job(job.id)
             assert completed is not None
-            self.assertEqual(completed.status, JobStatus.SUCCEEDED)
+            self.assertEqual(completed.status, JobStatus.SUCCEEDED, completed.failure_reason)
             self.assertEqual(completed.dobox_project_id, "project-1")
             self.assertEqual(completed.dobox_agent_session_id, "7")
             self.assertIn("DOCODE_RESULT.md", fake_dobox.files)
@@ -337,6 +337,7 @@ class RunnerE2ETests(IsolatedAsyncioTestCase):
             self.assertEqual(runtime_step.content["sandbox_network_mode"], "project")
             self.assertEqual(runtime_step.content["dobox_agent_session_id"], "7")
             self.assertIn("run_command", runtime_step.content["tools"])
+            self.assertIn("inspect_source", runtime_step.content["tools"])
             self.assertTrue(any(step.content.get("type") == "apicred_usage_report" for step in steps))
             usage_step = next(step for step in steps if step.content.get("type") == "apicred_usage_report")
             self.assertEqual(usage_step.content["status"], "reported")

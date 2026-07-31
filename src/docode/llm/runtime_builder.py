@@ -31,8 +31,44 @@ async def build_docode_llm(job: CodingJob, resolver: APICredCredentialResolver) 
     return runtime.llm
 
 
+_RELAY_PROVIDER_NAMES = {"external_relay", "relay"}
+
+
+async def _build_relay_runtime(job, tool_registry):
+    """Build a runtime backed by the filesystem ExternalRelayProvider.
+
+    No APICred call is made: the model response is produced by a stateless
+    external responder (e.g. a Codex adapter) over a shared relay directory.
+    provider_client is left None so verifier_judge/reviewer are skipped.
+    """
+    from .relay_provider import ExternalRelayProvider, resolve_relay_config
+
+    cfg = resolve_relay_config(session_id=job.id)
+    provider = ExternalRelayProvider(
+        requests_dir=cfg.requests_dir,
+        responses_dir=cfg.responses_dir,
+        session_id=cfg.session_id,
+        model=job.model or "external_relay",
+        usage_meter=LLMUsageMeter(),
+        poll_interval=cfg.poll_interval,
+        timeout_seconds=cfg.timeout_seconds,
+    )
+    return DocodeRuntime(
+        provider="external_relay",
+        model=job.model or "external_relay",
+        llm=provider,
+        router=LocalLLMRouter(),
+        tools=tool_registry,
+        provider_client=None,
+        usage_sink=None,
+        usage_meter=provider.usage_meter,
+    )
+
+
 async def build_docode_runtime(job: CodingJob, resolver: APICredCredentialResolver, dobox_tools: Any | None = None) -> DocodeRuntime:
     tool_registry = build_agent_tool_registry(dobox_tools) if dobox_tools is not None else None
+    if getattr(job, "provider", None) in _RELAY_PROVIDER_NAMES:
+        return await _build_relay_runtime(job, tool_registry)
     usage_meter = LLMUsageMeter()
     usage_sink = APICredUsageSink(resolver)
     if job.provider in {"scripted", "dev"} or job.model == "scripted":

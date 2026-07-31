@@ -1,0 +1,542 @@
+{
+  "baseline": "eff27a7cbe70408097591369787105ffc5aea777",
+  "tag": "agent-baseline-eff27a7",
+  "branch": "fix/runtime-verification-repair-v1",
+  "runtime_commit": "93842ab2c8d501ce3edd834c19818915491d0d06",
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "requested_runs_per_case": 1,
+  "generated_at": "2026-07-10T10:54:32.803284+00:00",
+  "metrics": {
+    "sample_size": 8,
+    "task_success_rate": 0.75,
+    "pass_at_1": 0.75,
+    "pass_at_3": null,
+    "median_iterations": 13.0,
+    "median_tool_calls": 8.0,
+    "successful_tasks_requiring_repair": 0.8333333333333334,
+    "runs_failed_before_any_edit": 0.125,
+    "runs_failed_after_functional_verification_before_finalization": 0.0
+  },
+  "runs": [
+    {
+      "case": "ivory_quill",
+      "language": "Python",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "failed",
+      "failure_reason": "max_iterations_exceeded",
+      "iterations": 36,
+      "llm_decisions": 36,
+      "tool_calls": 36,
+      "commands_run": 34,
+      "successful_commands": 9,
+      "repair_actions": 25,
+      "final_candidate_attempted": false,
+      "verifier_result": null,
+      "quality_gate_result": null,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "successful_edits": 1,
+      "successful_reads": 1,
+      "artifact_export_result": true,
+      "changed_files": [
+        "nexora/"
+      ],
+      "functionally_correct": false,
+      "independent_failures": [
+        "missing expected file: nexora/codec.py",
+        "missing expected file: nexora/ledger.py",
+        "missing expected file: nexora/__main__.py",
+        "missing expected file: checks/test_ledger.py",
+        "independent command failed: python -m unittest discover -s checks: e 253, in _do_discovery\r\n    self.createTests(from_discovery=True, Loader=Loader)\r\n  File \"/usr/lib/python3.12/unittest/main.py\", line 160, in createTests\r\n    self.test = loader.discover(self.start, self.pattern, self.top)\r\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"/usr/lib/python3.12/unittest/loader.py\", line 307, in discover\r\n    raise ImportError('Start directory is not importable: %r' % start_dir)\r\nImportError: Start directory is not importable: 'checks'\r\n",
+        "independent command failed: python -m nexora \"mist river\": Traceback (most recent call last):\r\n  File \"<frozen runpy>\", line 189, in _run_module_as_main\r\n  File \"<frozen runpy>\", line 148, in _get_module_details\r\n  File \"<frozen runpy>\", line 112, in _get_module_details\r\n  File \"/workspace/nexora/__init__.py\", line 3, in <module>\r\n    from .tokenizer import tokenize, segments_count, checksum\r\nModuleNotFoundError: No module named 'nexora.tokenizer'\r\n"
+      ],
+      "category": "repair_loop",
+      "short_reason": "max_iterations_exceeded",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/ivory_quill-run1-job_a7a0755a4393474aaf13da08d007e4e5.json",
+      "commands": [
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "ls -la /workspace/nexora/",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/; ls -la /workspace/",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py\ntotal 20\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 1 root   root   4096 Jul 10 10:41 ..\ndrwxr-xr-x 8 docode docode 4096 Jul 10 10:41 .git\n-rw-r--r-- 1 docode docode  618 Jul 10 10:41 README.md\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 nexora"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/ 2>/dev/null; ls -la /workspace/ 2>/dev/null",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py\ntotal 20\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 1 root   root   4096 Jul 10 10:41 ..\ndrwxr-xr-x 8 docode docode 4096 Jul 10 10:42 .git\n-rw-r--r-- 1 docode docode  618 Jul 10 10:41 README.md\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 nexora"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "ls -la /workspace/checks/ 2>/dev/null; ls -la /workspace/nexora/ 2>/dev/null; ls -la /workspace/ 2>/dev/null",
+          "exit_code": 0,
+          "summary": "total 12\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 ..\n-rw-r--r-- 1 docode docode  148 Jul 10 10:41 __init__.py\ntotal 20\ndrwxr-xr-x 4 docode docode 4096 Jul 10 10:41 .\ndrwxr-xr-x 1 root   root   4096 Jul 10 10:41 ..\ndrwxr-xr-x 8 docode docode 4096 Jul 10 10:42 .git\n-rw-r--r-- 1 docode docode  618 Jul 10 10:41 README.md\ndrwxr-xr-x 2 docode docode 4096 Jul 10 10:41 nexora"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/lib/python3.12/unittest/__main__.py\", line 18, in <module>\n    main(module=None)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 104, in __init__\n    self.parseArgs(argv)\n  File \"/usr/lib/python3.12/unittest/main.py\", line 130, in parseArgs\n    self._do_discovery(argv[2:])\n  File \"/usr/lib/python3.12/unittest/main.py\", line 253, in _do_disco"
+        }
+      ]
+    },
+    {
+      "case": "cobalt_span",
+      "language": "TypeScript",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "failed",
+      "failure_reason": "max_iterations_exceeded",
+      "iterations": 36,
+      "llm_decisions": 36,
+      "tool_calls": 5,
+      "commands_run": 1,
+      "successful_commands": 0,
+      "repair_actions": 1,
+      "final_candidate_attempted": false,
+      "verifier_result": null,
+      "quality_gate_result": null,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "successful_edits": 0,
+      "successful_reads": 35,
+      "artifact_export_result": true,
+      "changed_files": [],
+      "functionally_correct": false,
+      "independent_failures": [
+        "independent command failed: npm test: artSubtest (node:internal/test_runner/harness:214:3)\u001b[39m {\r\n    generatedMessage: \u001b[33mtrue\u001b[39m,\r\n    code: \u001b[32m'ERR_ASSERTION'\u001b[39m,\r\n    actual: \u001b[32m'import type { EnvelopeInput, EnvelopeView } from \"./axiom.js\";\\n\\nexport function buildEnvelope(input: EnvelopeInput): EnvelopeView {\\n  return {\\n    caption: input.title,\\n    total: input.samples.reduce((sum, value) => sum + value, 0),\\n  };\\n}\\n'\u001b[39m,\r\n    expected: \u001b[31m/input\\.title/\u001b[39m,\r\n    operator: \u001b[32m'doesNotMatch'\u001b[39m\r\n  }\r\n"
+      ],
+      "category": "repository_understanding_failure",
+      "short_reason": "max_iterations_exceeded",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/cobalt_span-run1-job_c7a0c235f13340b1ae8f21fa9db2aea9.json",
+      "commands": [
+        {
+          "command": "npm test",
+          "exit_code": 1,
+          "summary": "\n> test\n> node --test test/contract-check.mjs\n\n\u001b[31m\u2716 the public API and shared input contract agree \u001b[90m(3.620875ms)\u001b[39m\u001b[39m\n  AssertionError [ERR_ASSERTION]: The input was expected to not match the regular expression /input\\.title/. Input:\n  \n  'import type { EnvelopeInput, EnvelopeView } from \"./axiom.js\";\\n' +\n    '\\n' +\n    'export function buildEnvelope(input: EnvelopeInput): EnvelopeView {\\n' +\n    '  return {\\n' +\n    '    caption: input.title,\\n' +\n    '    total: input.samples.reduc"
+        }
+      ]
+    },
+    {
+      "case": "verdant_port",
+      "language": "Go",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "succeeded",
+      "failure_reason": null,
+      "iterations": 30,
+      "llm_decisions": 30,
+      "tool_calls": 17,
+      "commands_run": 4,
+      "successful_commands": 1,
+      "repair_actions": 3,
+      "final_candidate_attempted": true,
+      "verifier_result": true,
+      "quality_gate_result": true,
+      "read_before_edit": true,
+      "whole_file_rewrite": true,
+      "successful_edits": 3,
+      "successful_reads": 22,
+      "artifact_export_result": true,
+      "changed_files": [
+        "internal/relay/router.go"
+      ],
+      "functionally_correct": true,
+      "independent_failures": [],
+      "category": "success",
+      "short_reason": "Completed the requested changes in internal/relay/router.go.",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/verdant_port-run1-job_f36e75083eda4a1cb159ba9dc21b1118.json",
+      "commands": [
+        {
+          "command": "go test ./...",
+          "exit_code": 1,
+          "summary": "?   \texample.test/verdant-port/cmd/relay\t[no test files]\n--- FAIL: TestQuorinAcceptsValidJSON (0.00s)\n    router_test.go:26: status = 404; body = 404 page not found\n--- FAIL: TestQuorinRejectsInvalidPayloads (0.00s)\n    router_test.go:46: payload \"{\\\"signal\\\":\\\"\\\",\\\"weight\\\":2}\": status = 404\nFAIL\nFAIL\texample.test/verdant-port/internal/relay\t0.001s\nFAIL"
+        },
+        {
+          "command": "go test ./...",
+          "exit_code": 1,
+          "summary": "?   \texample.test/verdant-port/cmd/relay\t[no test files]\n--- FAIL: TestQuorinAcceptsValidJSON (0.00s)\n    router_test.go:36: body = struct { Accepted bool \"json:\\\"accepted\\\"\"; Code string \"json:\\\"code\\\"\" }{Accepted:true, Code:\"opal:\\a\"}\nFAIL\nFAIL\texample.test/verdant-port/internal/relay\t0.002s\nFAIL"
+        },
+        {
+          "command": "go test ./...",
+          "exit_code": 1,
+          "summary": "# example.test/verdant-port/internal/relay\ninternal/relay/router.go:40:31: undefined: strconv\nFAIL\texample.test/verdant-port/cmd/relay [build failed]\nFAIL\texample.test/verdant-port/internal/relay [build failed]\nFAIL"
+        },
+        {
+          "command": "go test ./...",
+          "exit_code": 0,
+          "summary": "?   \texample.test/verdant-port/cmd/relay\t[no test files]\nok  \texample.test/verdant-port/internal/relay\t0.002s"
+        }
+      ]
+    },
+    {
+      "case": "amber_depth",
+      "language": "Python",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "succeeded",
+      "failure_reason": null,
+      "iterations": 7,
+      "llm_decisions": 7,
+      "tool_calls": 6,
+      "commands_run": 2,
+      "successful_commands": 1,
+      "repair_actions": 1,
+      "final_candidate_attempted": true,
+      "verifier_result": true,
+      "quality_gate_result": true,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "successful_edits": 1,
+      "successful_reads": 3,
+      "artifact_export_result": true,
+      "changed_files": [
+        "zephyr_lattice.py"
+      ],
+      "functionally_correct": true,
+      "independent_failures": [],
+      "category": "success",
+      "short_reason": "Completed the requested changes in zephyr_lattice.py.",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/amber_depth-run1-job_b42118c15ee741269892d2feda62e6a7.json",
+      "commands": [
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "FF.\n======================================================================\nFAIL: test_above_band_uses_high (test_zephyr.ResolveBandTests.test_above_band_uses_high)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/checks/test_zephyr.py\", line 14, in test_above_band_uses_high\n    self.assertEqual(resolve_band(19, 2, 8), 8)\nAssertionError: 2 != 8\n\n======================================================================\nFAIL: "
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 0,
+          "summary": "...\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK"
+        }
+      ]
+    },
+    {
+      "case": "silver_source",
+      "language": "Python/HTTP",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "succeeded",
+      "failure_reason": null,
+      "iterations": 10,
+      "llm_decisions": 10,
+      "tool_calls": 8,
+      "commands_run": 3,
+      "successful_commands": 2,
+      "repair_actions": 1,
+      "final_candidate_attempted": true,
+      "verifier_result": true,
+      "quality_gate_result": true,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "successful_edits": 1,
+      "successful_reads": 4,
+      "artifact_export_result": true,
+      "changed_files": [
+        "harvest_adapter.py",
+        "mosaic-result.json"
+      ],
+      "functionally_correct": true,
+      "independent_failures": [],
+      "category": "success",
+      "short_reason": "Completed the requested changes in harvest_adapter.py, mosaic-result.json.",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/silver_source-run1-job_5ef3e1bf67ae46e8a5583f5be93ed035.json",
+      "commands": [
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "F\n======================================================================\nFAIL: test_local_http_records_are_written_with_requested_schema (test_adapter.AdapterTests.test_local_http_records_are_written_with_requested_schema)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/checks/test_adapter.py\", line 26, in test_local_http_records_are_written_with_requested_schema\n    self.assertEqual(completed.returncode, 0, completed.s"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 0,
+          "summary": ".\n----------------------------------------------------------------------\nRan 1 test in 0.548s\n\nOK"
+        },
+        {
+          "command": "python local_probe.py",
+          "exit_code": 0,
+          "summary": ""
+        }
+      ]
+    },
+    {
+      "case": "indigo_block",
+      "language": "Node.js",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "succeeded",
+      "failure_reason": null,
+      "iterations": 4,
+      "llm_decisions": 4,
+      "tool_calls": 5,
+      "commands_run": 2,
+      "successful_commands": 2,
+      "repair_actions": 0,
+      "final_candidate_attempted": true,
+      "verifier_result": true,
+      "quality_gate_result": true,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "successful_edits": 1,
+      "successful_reads": 2,
+      "artifact_export_result": true,
+      "changed_files": [
+        "morrow_mesh.mjs"
+      ],
+      "functionally_correct": true,
+      "independent_failures": [],
+      "category": "success",
+      "short_reason": "Completed the requested changes in morrow_mesh.mjs.",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/indigo_block-run1-job_1a3de642f2f24427842b0849753832bc.json",
+      "commands": [
+        {
+          "command": "node --test checks/morrow.test.mjs",
+          "exit_code": 0,
+          "summary": "\u001b[32m\u2714 foldSignals totals signed values \u001b[90m(0.629083ms)\u001b[39m\u001b[39m\n\u001b[34m\u2139 tests 1\u001b[39m\n\u001b[34m\u2139 suites 0\u001b[39m\n\u001b[34m\u2139 pass 1\u001b[39m\n\u001b[34m\u2139 fail 0\u001b[39m\n\u001b[34m\u2139 cancelled 0\u001b[39m\n\u001b[34m\u2139 skipped 0\u001b[39m\n\u001b[34m\u2139 todo 0\u001b[39m\n\u001b[34m\u2139 duration_ms 86.40875\u001b[39m"
+        },
+        {
+          "command": "node <<'NODE'\nconst assert = require('node:assert/strict');\n(async () => {\n  const { foldSignals } = await import('./morrow_mesh.mjs');\n  assert.equal(foldSignals([5, 8, -3]), 10);\n  console.log(JSON.stringify({morrow: 'verified', total: 10}));\n})().catch((error) => { console.error(error); process.exit(1); });\nNODE",
+          "exit_code": 0,
+          "summary": "{\"morrow\":\"verified\",\"total\":10}"
+        }
+      ]
+    },
+    {
+      "case": "sable_manual",
+      "language": "Markdown",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "succeeded",
+      "failure_reason": null,
+      "iterations": 15,
+      "llm_decisions": 15,
+      "tool_calls": 8,
+      "commands_run": 2,
+      "successful_commands": 1,
+      "repair_actions": 1,
+      "final_candidate_attempted": true,
+      "verifier_result": true,
+      "quality_gate_result": true,
+      "read_before_edit": true,
+      "whole_file_rewrite": true,
+      "successful_edits": 2,
+      "successful_reads": 10,
+      "artifact_export_result": true,
+      "changed_files": [
+        "guidebook.md"
+      ],
+      "functionally_correct": true,
+      "independent_failures": [],
+      "category": "success",
+      "short_reason": "Completed the requested changes in guidebook.md.",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/sable_manual-run1-job_6fee40d4886046669aeb654c6694a380.json",
+      "commands": [
+        {
+          "command": "python checks/check_sections.py",
+          "exit_code": 1,
+          "summary": "Traceback (most recent call last):\n  File \"/workspace/checks/check_sections.py\", line 11, in <module>\n    assert \"```text\" in text and \"request>\" in lower and \"response>\" in lower\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError"
+        },
+        {
+          "command": "python checks/check_sections.py",
+          "exit_code": 0,
+          "summary": "semantic documentation checks passed"
+        }
+      ]
+    },
+    {
+      "case": "crimson_ladder",
+      "language": "Python",
+      "mode": "real_dobox",
+      "run": 1,
+      "status": "succeeded",
+      "failure_reason": null,
+      "iterations": 11,
+      "llm_decisions": 11,
+      "tool_calls": 10,
+      "commands_run": 3,
+      "successful_commands": 1,
+      "repair_actions": 2,
+      "final_candidate_attempted": true,
+      "verifier_result": true,
+      "quality_gate_result": true,
+      "read_before_edit": true,
+      "whole_file_rewrite": false,
+      "successful_edits": 2,
+      "successful_reads": 5,
+      "artifact_export_result": true,
+      "changed_files": [
+        "lumen_quota.py"
+      ],
+      "functionally_correct": true,
+      "independent_failures": [],
+      "category": "success",
+      "short_reason": "Completed the requested changes in lumen_quota.py.",
+      "trace_path": ".docode/evals/runtime-verification-repair-v1/traces/crimson_ladder-run1-job_9221411acdab4cd49db29b142fb7352f.json",
+      "commands": [
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": "E\n======================================================================\nERROR: test_lumen (unittest.loader._FailedTest.test_lumen)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_lumen\nTraceback (most recent call last):\n  File \"/usr/lib/python3.12/unittest/loader.py\", line 394, in _find_test_path\n    module = self._get_module_from_name(name)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/unittest/l"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 1,
+          "summary": ".F\n======================================================================\nFAIL: test_reservation_is_capped_at_ceiling (test_lumen.LumenQuotaTests.test_reservation_is_capped_at_ceiling)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/checks/test_lumen.py\", line 12, in test_reservation_is_capped_at_ceiling\n    self.assertEqual(reserve_slots(4, 9), 4)\nAssertionError: 13 != 4\n\n-----------------------------------------------"
+        },
+        {
+          "command": "python -m unittest discover -s checks",
+          "exit_code": 0,
+          "summary": "..\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK"
+        }
+      ]
+    }
+  ]
+}
