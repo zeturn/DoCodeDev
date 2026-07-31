@@ -1094,7 +1094,7 @@ class CodingAgentLoop:
         self.sync_llm_usage(state)
         await self.repository.add_step(job.id, "verifier", verification_to_dict(verification))
         stop = self.stop_policy.evaluate(state)
-        if stop.should_stop and stop.reason != "max_iterations_exceeded":
+        if stop.should_stop and stop.reason not in BUDGET_EXHAUSTION_STOP_REASONS:
             return await self.fail(job.id, stop.reason or "stopped")
         if not verification.passed:
             if requires_non_empty_diff_repair(verification):
