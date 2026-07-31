@@ -20,6 +20,7 @@ class FailureCategory(str, Enum):
     HARNESS_FAILURE = "harness_failure"
     ENVIRONMENT_FAILURE = "environment_failure"
     SOURCE_UNAVAILABLE = "source_unavailable"
+    TASK_UNSATISFIABLE = "task_unsatisfiable"
     SUCCESS = "success"
 
 
@@ -40,6 +41,8 @@ class TerminalResult:
 
 def category_for_reason(reason: str) -> FailureCategory:
     lowered = (reason or "").lower()
+    if "unsatisfiable" in lowered or lowered.startswith("blocked"):
+        return FailureCategory.TASK_UNSATISFIABLE
     if "non_convergent" in lowered or "repeated_zero_record" in lowered:
         return FailureCategory.REPAIR_NON_CONVERGENT
     if any(token in lowered for token in ("llm", "provider", "apicred", "auth_failed")):

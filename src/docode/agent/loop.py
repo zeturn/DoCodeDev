@@ -83,6 +83,20 @@ CONTEXT_HEAVY_REPAIR_CATEGORIES = {
     "parser_record_count_mismatch",
 }
 MIN_CONTEXT_REPAIR_INSPECTION_BUDGET = 3
+BUDGET_EXHAUSTION_STOP_REASONS = frozenset(
+    {
+        "max_iterations_exceeded",
+        "max_consecutive_failures_exceeded",
+        "max_tool_calls_exceeded",
+        "max_runtime_exceeded",
+    }
+)
+"""Stop reasons that mean "the agent ran out of budget", not "the work is wrong".
+
+When any of these fire while the workspace is already FINAL_READY, the completed
+work must be submitted for verification instead of discarded. Budget exhaustion is
+a controller-side limit; it carries no evidence that the diff is incorrect.
+"""
 FAILED_REQUIRED_COMMAND_ALLOWED_TOOLS = [
     "read_file",
     "read_file_range",
@@ -318,7 +332,22 @@ class CodingAgentLoop:
             await self.repository.add_step(job.id, "llm", decision_to_step(decision, self.usage_meter))
             stop = self.stop_policy.evaluate(state)
             if stop.should_stop:
+                if decision.type == "final_candidate":
+                    # The model just produced a submission. Budget exhaustion must not
+                    # discard it before the verifier has had a chance to judge it.
+                    finalized = await self.handle_final_candidate(state, decision)
+                    if finalized is not None:
+                        return finalized
+                finalized = await self.maybe_auto_finalize_before_stop(state, stop.reason or "stopped")
+                if finalized is not None:
+                    return finalized
                 return await self.fail(job.id, stop.reason or "stopped")
+
+            if decision.type == "blocked":
+                blocked = await self.handle_blocked(state, decision)
+                if blocked is not None:
+                    return blocked
+                continue
 
             if decision.type == "tool_call" and decision.tool_name:
                 current_workflow = workflow_snapshot(state, state.latest_git_status.output if state.latest_git_status else "")
@@ -863,7 +892,7 @@ class CodingAgentLoop:
         )
 
     async def maybe_auto_finalize_before_stop(self, state: AgentState, stop_reason: str) -> CodingJob | None:
-        if stop_reason != "max_iterations_exceeded":
+        if stop_reason not in BUDGET_EXHAUSTION_STOP_REASONS:
             return None
         status = await self.tools.git_status()
         state.latest_git_status = status
@@ -875,8 +904,77 @@ class CodingAgentLoop:
         return await self.auto_finalize_ready_workflow(
             state,
             reason="final_ready_stop_policy_auto_finalized",
-            detail="max_iterations_exceeded reached after the workspace became FINAL_READY; submitting final_candidate from workflow evidence.",
+            detail=(
+                f"{stop_reason} reached after the workspace became FINAL_READY; "
+                "submitting final_candidate from workflow evidence instead of discarding completed work."
+            ),
             workflow_state=current_workflow.to_dict(),
+        )
+
+    async def handle_blocked(self, state: AgentState, decision: AgentDecision) -> CodingJob | None:
+        """Terminate a job the model has proven cannot be satisfied as stated.
+
+        This exists so that an impossible premise has an honest exit. Without it the
+        model's only terminal move is final_candidate, which pushes it to fabricate a
+        premise in order to look complete. A blocked job is recorded as STOPPED, not
+        FAILED: refusing an unsatisfiable task is correct behaviour, not a defect.
+        """
+        job = state.job
+        cancelled = await self.cancelled_job(job.id)
+        if cancelled is not None:
+            return cancelled
+
+        summary = (decision.summary or "").strip()
+        if not summary:
+            await self.record_model_failure(
+                state,
+                "blocked_summary_missing",
+                "blocked must include a non-empty summary explaining which premise of the task is false",
+            )
+            return None
+
+        evidence = [item for item in (decision.evidence or []) if item.strip()]
+        if not evidence:
+            await self.record_rejected_decision(
+                state,
+                reason="blocked_evidence_missing",
+                detail=(
+                    "blocked requires an 'evidence' list citing concrete tool output that proves the "
+                    "task premise is false (e.g. a search or read_file result showing the referenced "
+                    "symbol does not exist). Gather that evidence with a tool call first."
+                ),
+            )
+            return None
+
+        status = await self.tools.git_status()
+        state.latest_git_status = status
+        blocked_reason = (decision.blocked_reason or "task_unsatisfiable").strip() or "task_unsatisfiable"
+        reason = f"blocked:{blocked_reason}"
+        terminal = TerminalResult(
+            "stopped",
+            FailureCategory.TASK_UNSATISFIABLE,
+            reason,
+            functionally_correct=None,
+            strict_success=False,
+            harness_valid=True,
+        )
+        await self.repository.add_step(
+            job.id,
+            "system",
+            {
+                "type": "blocked_decision",
+                "blocked_reason": blocked_reason,
+                "summary": truncate_text(summary, 2000),
+                "evidence": [truncate_text(item, 600) for item in evidence],
+                "git_status": truncate_text(status.output, 1200),
+            },
+        )
+        await self.repository.add_step(job.id, "system", {"type": "terminal_result", **terminal.to_dict()})
+        return await self.repository.update_job(
+            job.id,
+            status=JobStatus.STOPPED,
+            failure_reason=reason,
+            terminal_result=terminal.to_dict(),
         )
 
     async def handle_final_candidate(self, state: AgentState, decision: AgentDecision) -> CodingJob | None:
@@ -996,7 +1094,7 @@ class CodingAgentLoop:
         self.sync_llm_usage(state)
         await self.repository.add_step(job.id, "verifier", verification_to_dict(verification))
         stop = self.stop_policy.evaluate(state)
-        if stop.should_stop and stop.reason != "max_iterations_exceeded":
+        if stop.should_stop and stop.reason not in BUDGET_EXHAUSTION_STOP_REASONS:
             return await self.fail(job.id, stop.reason or "stopped")
         if not verification.passed:
             if requires_non_empty_diff_repair(verification):
