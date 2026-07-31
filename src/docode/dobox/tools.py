@@ -21,6 +21,7 @@ from .source_inspection import (
     inspect_source_validation_error,
 )
 from .source_cache import SourceResponseCache, cached_source_result
+from .patch_normalize import normalize_model_patch
 from .types import FileResult, ToolResult
 from docode.git_changes import filter_diff_output, filter_status_output
 
@@ -388,32 +389,62 @@ class DoBoxTools:
         )
     async def apply_patch(self, patch: str) -> ToolResult:
         if not isinstance(patch, str) or not patch.strip():
-            return ToolResult(tool="apply_patch", output="patch must be a non-empty unified diff string", exit_code=2)
+            return ToolResult(tool="apply_patch", output="patch must be a non-empty diff string", exit_code=2)
+        # Normalize model output: strip code fences and convert OpenAI/Codex
+        # '*** Begin Patch' envelopes into unified diffs. Plain unified diffs
+        # pass through unchanged.
+        normalized = normalize_model_patch(patch)
+        if not normalized.strip():
+            return ToolResult(tool="apply_patch", output="patch is empty after normalization", exit_code=2)
+        # git requires a trailing newline; normalization may have stripped it.
+        if not normalized.endswith("\n"):
+            normalized += "\n"
         patch_path = ".docode_apply_patch.diff"
-        await self.client.write_file(self.project_id, patch_path, patch, agent_session_id=self.agent_session_id)
-        command = (
-            f"git apply --check {patch_path} && "
-            f"git apply {patch_path} && "
-            f"rm -f {patch_path} && "
-            "git --no-pager diff --stat && git --no-pager diff -- "
-        )
-        result = await self.run_command(command, "/workspace")
-        if result.exit_code != 0:
+        await self.client.write_file(self.project_id, patch_path, normalized, agent_session_id=self.agent_session_id)
+        # Try progressively lenient application strategies. The model may emit a
+        # plain unified diff, a Codex envelope (handled above), or a diff with
+        # whitespace/context drift that --ignore-whitespace/--recount fixes.
+        strategies = [
+            "git apply --check --ignore-whitespace --recount {p} && git apply --ignore-whitespace --recount {p}",
+            "git apply --check --unidiff-zero --ignore-whitespace {p} && git apply --unidiff-zero --ignore-whitespace {p}",
+            # --3way still needs a --check guard: without it a rejected patch would
+            # report success and silently mask a genuine apply failure.
+            "git apply --check --3way --ignore-whitespace {p} && git apply --3way --ignore-whitespace {p}",
+        ]
+        last_output = ""
+        last_code = 1
+        applied = False
+        result = None
+        for strategy in strategies:
+            command = strategy.format(p=patch_path) + (
+                f" && rm -f {patch_path} && git --no-pager diff --stat && git --no-pager diff -- "
+            )
+            result = await self.run_command(command, "/workspace")
+            if result.exit_code == 0:
+                applied = True
+                last_output = result.output
+                last_code = 0
+                break
+            last_output = result.output
+            last_code = result.exit_code
+        if not applied:
             await self.run_command(f"rm -f {patch_path}", "/workspace")
         paths = []
-        for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+)$", patch, flags=re.MULTILINE):
+        for match in re.finditer(r"^\+\+\+\s+(?:b/)?(.+)$", normalized, flags=re.MULTILINE):
             path = match.group(1).strip()
             if path != "/dev/null" and path not in paths:
                 paths.append(path)
-        metadata = {"patch_bytes": len(patch.encode("utf-8"))}
+        metadata = {"patch_bytes": len(normalized.encode("utf-8"))}
         if paths:
             metadata["paths"] = paths
+        if not applied:
+            metadata["patch_normalized_preview"] = normalized[:500]
         return ToolResult(
             tool="apply_patch",
-            output=result.output,
-            exit_code=result.exit_code,
+            output=last_output,
+            exit_code=last_code,
             metadata=metadata,
-            truncated=result.truncated,
+            truncated=bool(result.truncated) if result is not None else False,
         )
 
     async def list_files(self, path: str = ".") -> ToolResult:

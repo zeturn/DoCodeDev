@@ -45,6 +45,8 @@ class AgentDecision:
     remaining_risks: list[str] | None = None
     reasoning: str | None = None
     reasoning_records: list[dict[str, object]] | None = None
+    blocked_reason: str | None = None
+    evidence: list[str] | None = None
 
 
 class DecisionLLM(Protocol):
@@ -72,21 +74,36 @@ class DoCodeDecisionAdapter:
         return decision
 
     def _format_prompt(self, system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> str:
-        tool_specs = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema(),
-            }
-            for tool in tools
-        ]
-        return (
-            f"{system}\n\nAvailable tools JSON schema:\n{json.dumps(tool_specs, ensure_ascii=False)}\n\n"
-            "Respond as JSON: {\"type\":\"tool_call\",\"tool_name\":\"...\",\"args\":{...}} "
-            "or {\"type\":\"final_candidate\",\"summary\":\"...\",\"verification\":\"...\","
-            "\"no_test_reason\":null,\"remaining_risks\":[]}.\n\n"
-            f"Context:\n{context}"
-        )
+        return format_decision_prompt(system, messages, tools, context)
+
+
+def format_decision_prompt(system: str, messages: list[dict[str, Any]], tools: list[ToolDefinition], context: str) -> str:
+    """Render the model-facing decision prompt.
+
+    Extracted as a module-level function so non-DecisionLLM transports (e.g. the
+    external filesystem relay provider) can reuse the exact same prompt shape
+    that DoCodeDecisionAdapter feeds to a real model.
+    """
+    tool_specs = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.input_schema(),
+        }
+        for tool in tools
+    ]
+    return (
+        f"{system}\n\nAvailable tools JSON schema:\n{json.dumps(tool_specs, ensure_ascii=False)}\n\n"
+        "Respond as JSON: {\"type\":\"tool_call\",\"tool_name\":\"...\",\"args\":{...}} "
+        "or {\"type\":\"final_candidate\",\"summary\":\"...\",\"verification\":\"...\","
+        "\"no_test_reason\":null,\"remaining_risks\":[]}.\n"
+        "If the task cannot be satisfied as stated -- the referenced file, symbol, API, or "
+        "behaviour does not exist, or the requirement is self-contradictory -- respond with "
+        "{\"type\":\"blocked\",\"blocked_reason\":\"task_unsatisfiable\",\"summary\":\"...\","
+        "\"evidence\":[\"tool output proving the premise is false\"]}. "
+        "Never invent a plausible-looking premise to make an impossible task appear complete.\n\n"
+        f"Context:\n{context}"
+    )
 
 
 WeavDecisionLLM = DoCodeDecisionAdapter
@@ -115,6 +132,18 @@ def parse_decision(raw: str) -> AgentDecision:
             verification=str(data.get("verification") or ""),
             no_test_reason=str(no_test_reason) if no_test_reason else None,
             remaining_risks=[str(risk) for risk in risks if str(risk)],
+            reasoning=reasoning,
+            reasoning_records=reasoning_records,
+        )
+    if decision_type == "blocked":
+        evidence = data.get("evidence") or []
+        if not isinstance(evidence, list):
+            evidence = [str(evidence)]
+        return AgentDecision(
+            type="blocked",
+            summary=str(data.get("summary") or data.get("reason") or ""),
+            blocked_reason=str(data.get("blocked_reason") or data.get("category") or "task_unsatisfiable"),
+            evidence=[str(item) for item in evidence if str(item)],
             reasoning=reasoning,
             reasoning_records=reasoning_records,
         )

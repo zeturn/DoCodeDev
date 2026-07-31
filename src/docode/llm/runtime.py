@@ -50,6 +50,18 @@ from .runtime_builder import (
     registered_provider,
     resolve_model_async,
 )
+from .relay_provider import (
+    ExternalRelayProvider,
+    RELAY_ISOLATION_LEVELS,
+    RELAY_SCHEMA_VERSION,
+    RelayBlocked,
+    RelayConfig,
+    RelayError,
+    RelayFatal,
+    RelayProviderUnavailable,
+    make_relay_response,
+    resolve_relay_config,
+)
 from .usage import LLMUsageMeter, estimate_tokens
 from .verifier_judge import WeavVerifierJudge, clamp_confidence, parse_verifier_judgement, tool_result_for_prompt, truncate_for_prompt
 
@@ -58,11 +70,21 @@ __all__ = [
     "DecisionLLM",
     "DoCodeDecisionAdapter",
     "DocodeRuntime",
+    "ExternalRelayProvider",
     "LLMUsageMeter",
+    "RELAY_ISOLATION_LEVELS",
+    "RELAY_SCHEMA_VERSION",
+    "RelayBlocked",
+    "RelayConfig",
+    "RelayError",
+    "RelayFatal",
+    "RelayProviderUnavailable",
     "WeavDecisionLLM",
     "WeavVerifierJudge",
     "build_docode_llm",
     "build_docode_runtime",
+    "make_relay_response",
+    "resolve_relay_config",
 ]
 
 LEGACY_RUNTIME_EXPORTS = [

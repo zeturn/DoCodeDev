@@ -64,6 +64,8 @@ class APICredCredentialResolver:
         sandbox_network_mode: str | None = None,
         artifact_mode: str | None = None,
     ) -> RuntimeAuthorization:
+        if is_external_relay_provider(provider):
+            return RuntimeAuthorization(allowed=True, reason="external_relay_no_apicred", raw={"provider": provider, "model": model})
         local = self._local_credential(provider)
         if local is not None:
             return RuntimeAuthorization(allowed=True, reason=f"local_direct_credential:{provider}", raw={"provider": provider, "model": model})
@@ -107,6 +109,8 @@ class APICredCredentialResolver:
         )
 
     async def resolve(self, *, user_id: str, provider: str, model: str) -> ProviderCredential:
+        if is_external_relay_provider(provider):
+            return ProviderCredential(provider=provider, model=model or provider)
         local = self._local_credential(provider, model=model)
         if local is not None:
             return local
@@ -287,6 +291,17 @@ def model_id(value: object) -> str | None:
 
 def is_local_scripted_runtime(provider: str, model: str) -> bool:
     return provider in {"scripted", "dev"} or model == "scripted"
+
+
+# External filesystem relay providers do not use APICred at all: the model
+# response is produced by a stateless external responder (e.g. Codex) that the
+# runtime talks to over a shared directory. Authorize/resolve short-circuit so
+# no APICred network call is attempted for these providers.
+EXTERNAL_RELAY_PROVIDERS = {"external_relay", "relay"}
+
+
+def is_external_relay_provider(provider: str) -> bool:
+    return provider in EXTERNAL_RELAY_PROVIDERS
 
 
 def normalize_apicred_mode(value: str | None) -> str:
